@@ -1,0 +1,935 @@
+"""Run orchestrator (D7): locate -> verify -> read -> target -> extract ->
+validate -> write, per asset/period.
+
+Design points:
+  * SQLite work (locate, cache writes) stays on the main thread; document
+    I/O (verify peeks, hashing, reading, OCR, extraction) runs in a thread
+    pool capped at config.extraction.workers — it is a network share.
+    Worker threads that need the cache open their own read-only connection.
+  * Results are written in (client, deal) order whatever order the pool
+    finishes in, so memo numbering and workbook content are deterministic.
+  * Memo-level cache: sha256(file) + schema version + extractor version.
+    A cache hit skips re-extraction; rows are still appended when the output
+    copy does not already contain the memo (fresh template), and skipped
+    when it does (cumulative re-run -> idempotent, no duplicate rows).
+  * Graceful per-memo failure isolation: one bad file becomes a qa_fail row
+    plus flags; the run continues.
+  * --dry-run stops after locate+verify and only returns the coverage table.
+  * Phase-3 escalation: per memo, fields below extraction.confidence_threshold
+    plus required-but-empty fields become an EscalationPlan. When an asset
+    QA-FAILS (e.g. the engine recognized nothing and found no valuation value)
+    OR llm_settings.force_assist is set, the plan ALSO broadens to every empty
+    LLM-extractable field (excludes IDENTIFICATION/QA/THRESHOLD bands, computed
+    fields per rule 7, and positional slots) — so a memo the deterministic
+    engine could not parse still gets a real LLM second pass instead of an empty
+    plan. force_assist additionally bypasses the deterministic result cache (a
+    cached memo carries the OLD narrow plan) and is never written back to it.
+    When LLM settings are supplied (CLI default unless --no-llm), the plans are executed through
+    hidden local Claude Code sessions (llm/escalate.py) AFTER the deterministic
+    result cache is populated and BEFORE rows/audits are written — merged
+    values land in the workbook, attempts/costs land in the audit record and
+    the run's cost ledger, session ids land in the Run Log "Batch Sessions"
+    column. Without settings (library callers, Phase-2 tests) the plans are
+    only serialized and the run behaves exactly like Phase 2.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+import threading
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from pathlib import Path
+
+from pv_extractor.config import Config
+from pv_extractor.extract import cache as result_cache
+from pv_extractor.extract.derived import derived_specs
+from pv_extractor.extract.engine import (
+    EngineResult,
+    extract_memo,
+    load_band_routing,
+    load_schema_fields,
+)
+from pv_extractor.indexer import db
+from pv_extractor.indexer.periods import period_label
+from pv_extractor.llm.escalate import LlmRunSummary, LlmSettings, process_memos
+from pv_extractor.locator.locate import locate
+from pv_extractor.locator.verify import verify_and_rerank
+from pv_extractor.logging_setup import log_event
+from pv_extractor.models import (
+    AssetExtraction,
+    DocType,
+    DocTypeSpec,
+    EscalationField,
+    EscalationPlan,
+    FieldHit,
+    FlagSeverity,
+    LocateQuery,
+    LocateResult,
+    MemoResult,
+    QaStatus,
+    ResolutionStatus,
+    ReviewFlag,
+    SchemaField,
+    VerifyResult,
+    VerifyStatus,
+)
+from pv_extractor.validate import load_rules, validate_asset
+from pv_extractor.write import WorkbookWriter, copy_template, write_audit
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RunControl:
+    """Phase-4 GUI seam: optional progress events and graceful cancellation.
+
+    Both default off — a run without a control behaves exactly like the CLI.
+    Events carry identifiers and counters only (client/deal/stage/status/
+    file name), never memo content (hard rule 5 applies to the GUI event
+    stream too). Cancellation is cooperative: it is checked before each
+    memo's verify/extract work starts and between assembly steps, so the
+    in-flight memo always finishes and unprocessed memos are marked
+    DEFERRED in the coverage table. The LLM phase is skipped entirely when
+    cancellation arrives before it starts; once started it completes its
+    in-flight calls (the budget tracker bounds its cost)."""
+
+    on_event: Callable[[str, dict], None] | None = None
+    cancel_event: threading.Event | None = None
+
+    def emit(self, event: str, **fields: object) -> None:
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(event, fields)
+        except Exception:  # noqa: BLE001 — an observer must never kill the run
+            logger.exception("run observer failed for event %r", event)
+
+    @property
+    def cancelled(self) -> bool:
+        return self.cancel_event is not None and self.cancel_event.is_set()
+
+
+@dataclass(frozen=True)
+class RunSlot:
+    """One firm/deal/period/doc-type slot for a multi-firm run (Phase C.1a).
+
+    A run() driven by a list of RunSlot spans MANY firms, each slot carrying
+    its OWN period and doc_type, instead of the single run-wide period/doc_type
+    of the legacy (slots=None) path. The slot is consumed ONLY at the locate
+    step (one LocateQuery + locate(..., doc_type_spec=) per slot); everything
+    after locate (verify/extract/write/audit/coverage/LLM/cache) is unchanged
+    and already keys off each memo's resolved as_of, so per-slot periods work
+    transparently. The caller resolves a Smart Search profile slug to a
+    DocTypeSpec and passes it as doc_type_spec (run.py never imports
+    pv_extractor.search — it only CONSUMES a spec, mirroring locate())."""
+
+    client: str
+    deal: str
+    period: str
+    doc_type: DocType = DocType.any_client_valuation_doc
+    doc_type_spec: DocTypeSpec | None = None  # Smart Search profile; None = builtin doc_type
+    firm: str | None = None  # event-grouping label; defaults to client
+    restrict_to_client_sourced: bool = True  # False = allow HL/non-client sources (rank-only)
+
+    @property
+    def group(self) -> str:
+        return self.firm or self.client
+
+
+@dataclass
+class CoverageEntry:
+    client: str
+    deal: str
+    status: str  # ResolutionStatus value, ERROR, or DEFERRED (cancelled)
+    detail: str = ""
+
+
+@dataclass
+class RunReport:
+    run_id: str
+    run_dir: Path | None
+    workbook_path: Path | None
+    dry_run: bool
+    coverage: list[CoverageEntry] = field(default_factory=list)
+    memos: list[MemoResult] = field(default_factory=list)
+    rows_added: int = 0
+    flags_added: int = 0
+    cache_hits: int = 0
+    duration_minutes: float = 0.0
+    started_at: str = ""  # ISO wall-clock run start
+    finished_at: str = ""  # ISO wall-clock run finish
+    llm: LlmRunSummary | None = None
+
+    def qa_counts(self) -> dict[str, int]:
+        counts = {status.value: 0 for status in QaStatus}
+        for memo in self.memos:
+            for asset in memo.assets:
+                counts[asset.qa_status.value] += 1
+        return counts
+
+
+@dataclass
+class _WorkItem:
+    client: str
+    deal: str
+    locate_result: LocateResult
+    verify: VerifyResult | None = None
+    engine: EngineResult | None = None
+    cached: MemoResult | None = None
+    sha256: str = ""
+    error: str | None = None
+    deferred: bool = False  # cancelled before this memo was processed
+    timings_ms: dict[str, float] = field(default_factory=dict)
+    group: str | None = None  # multi-firm event-lane label; None = run-wide path (no 'group' field emitted)
+
+
+def _group_kw(item: _WorkItem) -> dict[str, str]:
+    """Extra emit kwargs for the multi-firm lane label. Empty for the
+    run-wide path (item.group is None) so its emitted event fields stay
+    byte-for-byte identical to the legacy behavior."""
+    return {"group": item.group} if item.group is not None else {}
+
+
+def _resolve_pairs(
+    conn: sqlite3.Connection,
+    scope: str,
+    client: str | None,
+    deal: str | None,
+    exclude: set[tuple[str, str]] | None = None,
+) -> list[tuple[str, str]]:
+    """In-scope (client, deal) pairs, minus any explicitly excluded slots.
+
+    `exclude` is the Phase-4 "Confirm documents" removal set (the analyst
+    dropped a slot before launch); it never changes CLI behavior because the
+    CLI never passes one."""
+    if scope == "deal":
+        if not client or not deal:
+            raise ValueError("scope=deal requires --client and --deal")
+        pairs = [(client, deal)]
+    elif scope == "client":
+        if not client:
+            raise ValueError("scope=client requires --client")
+        pairs = [(client, d) for d in db.deals_for_client(conn, client)]
+    elif scope == "all":
+        pairs = [
+            (c, d) for c in db.distinct_clients(conn) for d in db.deals_for_client(conn, c)
+        ]
+    else:
+        raise ValueError(f"unknown scope {scope!r} (expected client|deal|all)")
+    if exclude:
+        pairs = [pair for pair in pairs if pair not in exclude]
+    return pairs
+
+
+def _verify_and_extract(
+    item: _WorkItem, config: Config, schema_fields: list[SchemaField],
+    routing: dict[str, list[str]], force: bool, db_path: Path,
+    control: RunControl,
+) -> _WorkItem:
+    """Thread-pool worker: content verification, cache lookup, extraction."""
+    if control.cancelled:
+        item.deferred = True
+        return item
+    started = time.perf_counter()
+    gkw = _group_kw(item)
+    control.emit("stage", client=item.client, deal=item.deal, stage="verify", status="started", **gkw)
+    reranked, verdicts = verify_and_rerank(item.locate_result, config)
+    item.locate_result = reranked
+    item.timings_ms["verify"] = round((time.perf_counter() - started) * 1000, 1)
+    control.emit(
+        "stage", client=item.client, deal=item.deal, stage="verify",
+        status=reranked.status.value,
+        file_name=reranked.winner.record.file_name if reranked.winner else None,
+        file_path=reranked.winner.record.file_path if reranked.winner else None,
+        **gkw,
+    )
+    if reranked.status is not ResolutionStatus.FOUND or reranked.winner is None:
+        return item
+    winner_path = reranked.winner.record.file_path
+    item.verify = verdicts.get(winner_path)
+
+    item.sha256 = result_cache.file_sha256(winner_path)
+    if config.extraction.cache_enabled and not force:
+        worker_conn = sqlite3.connect(str(db_path))
+        try:
+            result_cache.init_cache(worker_conn)
+            schema_ver = result_cache.schema_version(_schema_json_path())
+            cached = result_cache.get_cached(
+                worker_conn, result_cache.cache_key(item.sha256, schema_ver)
+            )
+        finally:
+            worker_conn.close()
+        if cached is not None and cached.file_path == winner_path:
+            item.cached = cached
+            control.emit(
+                "stage", client=item.client, deal=item.deal, stage="extract", status="cached",
+                **gkw,
+            )
+            return item
+
+    started = time.perf_counter()
+    control.emit("stage", client=item.client, deal=item.deal, stage="read", status="started", **gkw)
+    item.engine = extract_memo(winner_path, config, schema_fields, routing)
+    item.timings_ms["extract"] = round((time.perf_counter() - started) * 1000, 1)
+    control.emit(
+        "stage", client=item.client, deal=item.deal, stage="extract", status="done",
+        pages=item.engine.page_count if item.engine else None,
+        **gkw,
+    )
+    return item
+
+
+def _schema_json_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "schema" / "master_schema.json"
+
+
+def _metadata_hits(
+    schema_by_header: dict[str, SchemaField],
+    values: dict[str, object],
+    already_populated: set[str],
+) -> list[FieldHit]:
+    hits = []
+    for header, value in values.items():
+        if value is None or header in already_populated:
+            continue
+        schema_field = schema_by_header.get(header)
+        if schema_field is None:
+            continue
+        hits.append(
+            FieldHit(
+                field=header, col_index=schema_field.col_index, band=schema_field.band,
+                value=value, method="metadata", confidence=1.0,
+                evidence="run metadata (locator/identification)",
+            )
+        )
+    return hits
+
+
+# Bands that are never extracted from the document (run identity, QA verdicts,
+# threshold flags) and so are never escalated to the LLM. Derived/computed
+# fields (rule 7) are excluded separately, by header, via derived_headers.
+_NON_EXTRACTABLE_BANDS = frozenset({"IDENTIFICATION", "QA", "THRESHOLD FLAGS"})
+
+
+def _is_llm_extractable(field: SchemaField, derived_headers: set[str]) -> bool:
+    """A field the LLM could plausibly read off the document: not run identity /
+    QA / threshold bands, not a Python-computed field (rule 7), and not a
+    positional comp/cap-structure slot (the merge is scalar-by-header, not
+    positional — broad escalation of N empty slots only bloats the payload)."""
+    if field.band in _NON_EXTRACTABLE_BANDS:
+        return False
+    if field.header in derived_headers:
+        return False
+    if field.slot_group is not None:
+        return False
+    return True
+
+
+def _build_escalation(
+    memo_id: str,
+    assets: list[AssetExtraction],
+    schema_by_header: dict[str, SchemaField],
+    page_band_map: dict[str, list[int]],
+    threshold: float,
+    *,
+    force_assist: bool = False,
+    derived_headers: set[str] | None = None,
+) -> EscalationPlan:
+    """Build the per-memo escalation plan.
+
+    Always escalates below-confidence hits and required-but-empty fields. When
+    an asset QA-FAILED (e.g. the deterministic engine recognized nothing and
+    found no valuation value) OR force_assist is set, ALSO escalates every empty
+    LLM-extractable field for that asset — so a memo the engine could not parse
+    still gets a real LLM second pass instead of silently coming back empty.
+    force_assist applies this to every asset regardless of QA outcome (the
+    analyst chose 'use the LLM to extract')."""
+    derived_headers = derived_headers or set()
+    fields: list[EscalationField] = []
+    seen: set[tuple[str, str]] = set()
+    for asset in assets:
+        populated = {hit.field for hit in asset.hits if hit.value is not None}
+        # Broaden when the analyst forced LLM extraction, or when this asset
+        # failed QA — the case the IBMG memo hit, where the engine produced no
+        # value hits and nothing was 'required', so the plan was empty.
+        broad = force_assist or asset.qa_status is QaStatus.qa_fail
+        for hit in asset.hits:
+            if hit.method in ("metadata", "computed") or hit.confidence >= threshold:
+                continue
+            key = (asset.row_memo_id, hit.field)
+            if key in seen:
+                continue
+            seen.add(key)
+            fields.append(
+                EscalationField(
+                    field=hit.field, col_index=hit.col_index, band=hit.band,
+                    reason="below_confidence", confidence=hit.confidence,
+                    candidate_pages=page_band_map.get(hit.band, []),
+                )
+            )
+        for schema_field in schema_by_header.values():
+            if schema_field.header in populated:
+                continue
+            if schema_field.required:
+                reason = "required_empty"
+            elif broad and _is_llm_extractable(schema_field, derived_headers):
+                reason = "force_llm_assist" if force_assist else "qa_fail_rescue"
+            else:
+                continue
+            key = (asset.row_memo_id, schema_field.header)
+            if key in seen:
+                continue
+            seen.add(key)
+            fields.append(
+                EscalationField(
+                    field=schema_field.header, col_index=schema_field.col_index,
+                    band=schema_field.band, reason=reason,
+                    candidate_pages=page_band_map.get(schema_field.band, []),
+                )
+            )
+    return EscalationPlan(
+        memo_id=memo_id, confidence_threshold=threshold,
+        fields=fields, page_band_map=page_band_map,
+    )
+
+
+def run(
+    config: Config,
+    *,
+    scope: str,
+    period: str,
+    client: str | None = None,
+    deal: str | None = None,
+    doc_type: DocType = DocType.any_client_valuation_doc,
+    template: str | Path | None = None,
+    dry_run: bool = False,
+    force: bool = False,
+    now: datetime | None = None,
+    llm_settings: LlmSettings | None = None,
+    llm_client=None,
+    control: RunControl | None = None,
+    exclude: set[tuple[str, str]] | None = None,
+    slots: list[RunSlot] | None = None,
+    restrict_to_client_sourced: bool = True,
+) -> RunReport:
+    """Execute one extraction run. See module docstring for the pipeline.
+    llm_settings=None keeps pure Phase-2 behavior (escalation plans are
+    serialized but never executed); the CLI builds settings from config.llm
+    plus the --llm-* flags. llm_client overrides the Claude Code subprocess
+    client (tests inject fakes — no test launches the real CLI). control
+    is the Phase-4 GUI seam (progress events + graceful cancel); None
+    keeps exact CLI behavior. exclude drops specific (client, deal) slots from
+    the scope (the GUI "Confirm documents" step's removals); None/empty =
+    every in-scope pair, exactly like the CLI.
+
+    slots (Phase C.1a, multi-firm): when None — EVERY existing caller (CLI and
+    the current GUI start_run) — behavior is byte-for-byte identical to today:
+    _resolve_pairs(scope, client, deal, exclude) yields the in-scope pairs and
+    the single run-wide period/doc_type drives every locate. When a list of
+    RunSlot is provided, it BYPASSES _resolve_pairs and the run-wide
+    period/doc_type entirely: one _WorkItem per slot, located via
+    LocateQuery(client, deal, period=slot.period, doc_type=slot.doc_type) and
+    locate(..., doc_type_spec=slot.doc_type_spec). scope/client/deal/period/
+    doc_type/exclude are then ignored for pairing (slots is purely additive —
+    the signature stays backward-compatible). One workbook covers the whole
+    batch (the existing write phase over the items list). IMPORTANT semantic
+    difference vs the run-wide path: there a ValueError from locate (e.g. a bad
+    period) propagates and ABORTS the whole run before any processing; in the
+    slots path that same ValueError is caught PER SLOT and marks only that slot
+    ERROR, so one bad period never kills the rest of the batch. Each slot's
+    progress events carry a 'group' field (slot.firm or slot.client) so the GUI
+    can lane by firm; the run-wide path emits no 'group' field (byte-for-byte)."""
+    started = time.perf_counter()
+    now = now or datetime.now()
+    run_id = f"RUN_{now:%Y%m%d_%H%M%S}"
+    control = control or RunControl()
+
+    conn = db.open_db(config.db_path, config.pv_root)
+    try:
+        result_cache.init_cache(conn)
+
+        items: list[_WorkItem] = []
+        coverage: list[CoverageEntry] = []
+
+        if slots is None:
+            # ---- run-wide path (legacy; byte-for-byte unchanged) ----
+            pairs = _resolve_pairs(conn, scope, client, deal, exclude)
+            log_event(logger, "run started", run_id=run_id, scope=scope, period=period,
+                      pairs=len(pairs), dry_run=dry_run)
+
+            # ---- locate (main thread: SQLite) ----
+            control.emit("run_started", run_id=run_id, scope=scope, period=period,
+                         pairs=len(pairs), dry_run=dry_run)
+            for pair_client, pair_deal in pairs:
+                query = LocateQuery(
+                    client=pair_client, deal=pair_deal, period=period, doc_type=doc_type,
+                    restrict_to_client_sourced=restrict_to_client_sourced,
+                )
+                located = locate(conn, config, query)  # ValueError (bad period) aborts before any processing
+                items.append(_WorkItem(client=pair_client, deal=pair_deal, locate_result=located))
+                control.emit(
+                    "stage", client=pair_client, deal=pair_deal, stage="locate",
+                    status=located.status.value,
+                    file_name=located.winner.record.file_name if located.winner else None,
+                )
+        else:
+            # ---- multi-firm slots path (Phase C.1a) ----
+            firms = {slot.group for slot in slots}
+            log_event(logger, "run started", run_id=run_id, scope="slots",
+                      slots=len(slots), firms=len(firms), dry_run=dry_run)
+            control.emit("run_started", run_id=run_id, scope="slots",
+                         slots=len(slots), firms=len(firms), dry_run=dry_run)
+            for slot in slots:
+                query = LocateQuery(client=slot.client, deal=slot.deal,
+                                    period=slot.period, doc_type=slot.doc_type,
+                                    restrict_to_client_sourced=slot.restrict_to_client_sourced)
+                try:
+                    # Unlike the run-wide path, a per-slot ValueError (e.g. a
+                    # bad period) is contained: only this slot is marked ERROR
+                    # so one bad slot never aborts the whole batch.
+                    located = locate(conn, config, query, doc_type_spec=slot.doc_type_spec)
+                    item = _WorkItem(client=slot.client, deal=slot.deal,
+                                     locate_result=located, group=slot.group)
+                    control.emit(
+                        "stage", client=slot.client, deal=slot.deal, stage="locate",
+                        status=located.status.value,
+                        file_name=located.winner.record.file_name if located.winner else None,
+                        group=slot.group,
+                    )
+                except ValueError as exc:
+                    located = LocateResult(
+                        status=ResolutionStatus.NOT_FOUND, query=query,
+                        evidence=f"locate failed: {type(exc).__name__}: {exc}",
+                    )
+                    item = _WorkItem(client=slot.client, deal=slot.deal,
+                                     locate_result=located, group=slot.group,
+                                     error=f"{type(exc).__name__}: {exc}")
+                    logger.exception("locate failed for slot %s/%s", slot.client, slot.deal)
+                    control.emit(
+                        "stage", client=slot.client, deal=slot.deal, stage="locate",
+                        status="ERROR", file_name=None, group=slot.group,
+                    )
+                items.append(item)
+
+        report = RunReport(run_id=run_id, run_dir=None, workbook_path=None, dry_run=dry_run)
+        report.started_at = now.isoformat(timespec="seconds")
+
+        schema_fields = load_schema_fields()
+        routing = load_band_routing()
+        schema_by_header = {f.header: f for f in schema_fields}
+        ruleset = load_rules(config.validation.rules_path)
+        # Computed/derived headers (rule 7) are never escalated to the LLM even
+        # under force_assist; cache the set once for _build_escalation.
+        derived_headers = {spec.header for spec in derived_specs(config.validation)}
+        # force_assist makes the LLM the primary extractor: bypass the
+        # deterministic result cache so the broad escalation plan is actually
+        # rebuilt (a cached memo carries the OLD, narrow plan).
+        force_assist = bool(llm_settings is not None and llm_settings.force_assist)
+        effective_force = force or force_assist
+
+        # ---- verify (+extract unless dry-run) in the worker pool ----
+        # AMBIGUOUS results are verified too: content verification is what
+        # disambiguates same-score candidates (D3 re-rank).
+        candidates = [
+            item
+            for item in items
+            if item.locate_result.status in (ResolutionStatus.FOUND, ResolutionStatus.AMBIGUOUS)
+        ]
+        with ThreadPoolExecutor(max_workers=max(config.extraction.workers, 1)) as pool:
+            if dry_run:
+                futures = {
+                    pool.submit(_dry_verify, item, config, control): item for item in candidates
+                }
+            else:
+                futures = {
+                    pool.submit(
+                        _verify_and_extract, item, config, schema_fields, routing, effective_force,
+                        config.db_path, control,
+                    ): item
+                    for item in candidates
+                }
+            for future, item in futures.items():
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001 — isolation: one memo never kills the run
+                    item.error = f"{type(exc).__name__}: {exc}"
+                    logger.exception("memo processing failed for %s/%s", item.client, item.deal)
+
+        for item in items:
+            result = item.locate_result
+            detail = (
+                result.winner.record.file_name
+                if result.winner is not None
+                else result.evidence[:160]
+            )
+            if item.deferred:
+                status, detail = "DEFERRED", "run cancelled before this memo was processed"
+            elif item.error:
+                status, detail = "ERROR", item.error
+            else:
+                status = result.status.value
+            coverage.append(
+                CoverageEntry(client=item.client, deal=item.deal, status=status, detail=detail)
+            )
+        report.coverage = coverage
+
+        if dry_run:
+            report.duration_minutes = round((time.perf_counter() - started) / 60.0, 2)
+            report.finished_at = datetime.now().isoformat(timespec="seconds")
+            log_event(logger, "dry run complete", run_id=run_id,
+                      coverage={c.status: sum(1 for x in coverage if x.status == c.status) for c in coverage})
+            control.emit("run_complete", run_id=run_id, dry_run=True,
+                         coverage={c.status: sum(1 for x in coverage if x.status == c.status) for c in coverage})
+            return report
+
+        # ---- write phase (main thread), deterministic (client, deal) order ----
+        run_dir = Path(config.output_dir) / run_id
+        template_path = Path(template) if template else _default_template()
+        workbook_path = run_dir / f"master_index_{run_id}.xlsx"
+        copy_template(template_path, workbook_path, config.pv_root)
+        writer = WorkbookWriter(workbook_path, schema_fields, config.pv_root)
+        report.run_dir = run_dir
+        report.workbook_path = workbook_path
+
+        # Assemble every memo first (and populate the deterministic result
+        # cache) so the LLM second pass can run over the whole batch before
+        # any row/audit is written.
+        memo_counter = 0
+        schema_ver = result_cache.schema_version(_schema_json_path())
+        assembled: list[tuple[_WorkItem, MemoResult]] = []
+        for item in sorted(items, key=lambda i: (i.client.lower(), i.deal.lower())):
+            if item.deferred or item.locate_result.status is not ResolutionStatus.FOUND or item.locate_result.winner is None:
+                continue
+            if control.cancelled:
+                item.deferred = True
+                _mark_coverage_deferred(report, item)
+                continue
+            try:
+                if item.cached is not None:
+                    memo = item.cached
+                    report.cache_hits += 1
+                else:
+                    memo_counter += 1
+                    memo = _assemble_memo(
+                        item, config, schema_by_header, ruleset, routing, writer,
+                        run_id=run_id, memo_seq=memo_counter, now=now,
+                        force_assist=force_assist, derived_headers=derived_headers,
+                    )
+                    # Never persist a force_assist memo: its escalation plan is
+                    # intentionally broad and would poison a later normal run.
+                    if (
+                        config.extraction.cache_enabled and not force_assist
+                        and item.engine is not None and not item.engine.fatal
+                    ):
+                        result_cache.put_cached(
+                            conn, result_cache.cache_key(item.sha256, schema_ver), schema_ver, memo
+                        )
+                assembled.append((item, memo))
+                control.emit(
+                    "stage", client=item.client, deal=item.deal, stage="validate",
+                    status="done", memo_id=memo.memo_id,
+                    qa={a.row_memo_id: a.qa_status.value for a in memo.assets},
+                    escalated_fields=len(memo.escalation.fields) if memo.escalation else 0,
+                    **_group_kw(item),
+                )
+            except Exception as exc:  # noqa: BLE001 — isolation
+                logger.exception("assembly failed for %s/%s", item.client, item.deal)
+                _mark_coverage_error(report, item, exc)
+
+        # Phase-3 second pass: Claude Code CLI fallback over the escalation
+        # plans (merged hits mutate the memos before rows/audits are written).
+        # A cancellation that arrived before this point skips the LLM phase
+        # entirely (plans stay serialized in the audits, exactly like --no-llm).
+        if llm_settings is not None and llm_settings.enabled and not control.cancelled:
+            control.emit("llm_phase", status="started",
+                         memos=sum(1 for _, m in assembled if m.escalation and m.escalation.fields))
+            report.llm = process_memos(
+                [memo for _, memo in assembled], config, llm_settings, schema_fields,
+                run_id=run_id, run_dir=run_dir, client=llm_client,
+            )
+            control.emit(
+                "llm_phase", status="done", attempts=report.llm.attempts,
+                cache_hits=report.llm.cache_hits, deferred=report.llm.memos_deferred,
+                total_cost_usd=report.llm.total_cost_usd,
+                cost_source="actual+estimated" if report.llm.any_actual_costs else "estimated",
+            )
+
+        for item, memo in assembled:
+            try:
+                report.memos.append(memo)
+                report.rows_added += _write_memo(writer, memo)
+                report.flags_added += _write_flags(writer, memo)
+                write_audit(memo, run_dir, config.pv_root)
+                control.emit(
+                    "stage", client=item.client, deal=item.deal, stage="write",
+                    status="done", memo_id=memo.memo_id,
+                    **_group_kw(item),
+                )
+            except Exception as exc:  # noqa: BLE001 — isolation
+                logger.exception("write phase failed for %s/%s", item.client, item.deal)
+                _mark_coverage_error(report, item, exc)
+
+        duration_minutes = round((time.perf_counter() - started) / 60.0, 2)
+        report.duration_minutes = duration_minutes
+        report.finished_at = datetime.now().isoformat(timespec="seconds")
+        qa = report.qa_counts()
+        llm = report.llm
+        if llm is None or not llm.enabled:
+            notes = "Deterministic run; LLM fallback disabled"
+        elif not llm.executed:
+            notes = f"LLM fallback unavailable: {llm.detail}"
+        else:
+            label = "actual+estimated" if llm.any_actual_costs else "ESTIMATED"
+            notes = (
+                f"Claude Code fallback: {llm.memos_escalated} memo(s) escalated, "
+                f"{llm.attempts} call(s) ({llm.cache_hits} cached), "
+                f"{llm.memos_deferred} deferred, ${llm.total_cost_usd:.4f} ({label})"
+            )
+        writer.append_run_log(
+            {
+                "Run ID": run_id,
+                "Run Date": now.date().isoformat(),
+                "Memos Processed": len(report.memos),
+                "Assets Extracted": sum(len(m.assets) for m in report.memos),
+                "QA Pass": qa[QaStatus.qa_pass.value],
+                "QA Pass with Flags": qa[QaStatus.qa_pass_with_flags.value],
+                "QA Fail": qa[QaStatus.qa_fail.value],
+                "Records Added to Index": report.rows_added,
+                "Total Flags": report.flags_added,
+                "Reviewer Attention Items": sum(
+                    1
+                    for memo in report.memos
+                    for asset in memo.assets
+                    for flag in asset.flags
+                    if flag.reviewer_attention
+                ),
+                "Run Duration (mins)": duration_minutes,
+                # Claude Code session identifiers (job id[:session id]) — not
+                # API batch ids; there is no Batch API in this architecture.
+                "Batch Sessions": "; ".join(llm.session_labels) if llm and llm.session_labels else None,
+                "Notes": notes,
+            }
+        )
+        writer.save()
+        log_event(
+            logger, "run complete", run_id=run_id, memos=len(report.memos),
+            rows_added=report.rows_added, flags=report.flags_added,
+            cache_hits=report.cache_hits,
+            llm_fallback="enabled" if llm and llm.enabled else "disabled",
+            llm_cost_usd=llm.total_cost_usd if llm else None,
+        )
+        control.emit(
+            "run_complete", run_id=run_id, dry_run=False, memos=len(report.memos),
+            rows_added=report.rows_added, flags=report.flags_added,
+            cache_hits=report.cache_hits, qa=report.qa_counts(),
+            cancelled=control.cancelled,
+            llm_cost_usd=llm.total_cost_usd if llm else None,
+        )
+        return report
+    finally:
+        conn.close()
+
+
+def _mark_coverage_error(report: RunReport, item: _WorkItem, exc: Exception) -> None:
+    coverage_entry = next(
+        c for c in report.coverage if c.client == item.client and c.deal == item.deal
+    )
+    coverage_entry.status = "ERROR"
+    coverage_entry.detail = f"{type(exc).__name__}: {exc}"
+
+
+def _mark_coverage_deferred(report: RunReport, item: _WorkItem) -> None:
+    coverage_entry = next(
+        c for c in report.coverage if c.client == item.client and c.deal == item.deal
+    )
+    coverage_entry.status = "DEFERRED"
+    coverage_entry.detail = "run cancelled before this memo was processed"
+
+
+def _dry_verify(item: _WorkItem, config: Config, control: RunControl) -> _WorkItem:
+    if control.cancelled:
+        item.deferred = True
+        return item
+    reranked, verdicts = verify_and_rerank(item.locate_result, config)
+    item.locate_result = reranked
+    if reranked.winner is not None:
+        item.verify = verdicts.get(reranked.winner.record.file_path)
+    control.emit(
+        "stage", client=item.client, deal=item.deal, stage="verify",
+        status=reranked.status.value,
+        file_name=reranked.winner.record.file_name if reranked.winner else None,
+        file_path=reranked.winner.record.file_path if reranked.winner else None,
+        **_group_kw(item),
+    )
+    return item
+
+
+def _default_template() -> Path:
+    return Path(__file__).resolve().parents[2] / "reference" / "master_index_v4.xlsx"
+
+
+def _assemble_memo(
+    item: _WorkItem,
+    config: Config,
+    schema_by_header: dict[str, SchemaField],
+    ruleset,
+    routing: dict[str, list[str]],
+    writer: WorkbookWriter,
+    *,
+    run_id: str,
+    memo_seq: int,
+    now: datetime,
+    force_assist: bool = False,
+    derived_headers: set[str] | None = None,
+) -> MemoResult:
+    winner = item.locate_result.winner
+    assert winner is not None
+    record = winner.record
+    as_of = item.locate_result.query.as_of_date
+    memo_id = f"MEMO_{now:%Y%m%d_%H%M%S}_{memo_seq:03d}"
+    reporting = period_label(as_of, config.client_period_style(item.client)) if as_of else ""
+
+    memo = MemoResult(
+        memo_id=memo_id, run_id=run_id, client=item.client, deal=item.deal,
+        file_path=record.file_path, file_name=record.file_name, file_sha256=item.sha256,
+        as_of_date=as_of, reporting_period=reporting,
+        locate_status=item.locate_result.status, locate_evidence=item.locate_result.evidence,
+        locator_breakdown=winner.breakdown, verify=item.verify,
+        timings_ms=item.timings_ms,
+    )
+    # An explicit analyst override ran a file the peek-verifier would have
+    # rejected (HL work product, wrong period/asset). Never silent: flag it so
+    # the row is reviewable, but the chosen file was still extracted.
+    if item.locate_result.from_override and item.verify is not None and item.verify.status is VerifyStatus.REJECTED:
+        memo.memo_flags.append(
+            ReviewFlag(
+                category="locator",
+                description=(
+                    f"MANUAL OVERRIDE: ran analyst-selected file despite content verification "
+                    f"({item.verify.reason}) — review that this is the intended source"
+                ),
+                severity=FlagSeverity.warning, reviewer_attention=True,
+            )
+        )
+    engine = item.engine
+    if engine is None:
+        memo.error = item.error or "extraction did not run"
+        memo.memo_flags.append(
+            ReviewFlag(category="run", description=memo.error, severity=FlagSeverity.hard_fail,
+                       reviewer_attention=True)
+        )
+    else:
+        memo.reader = engine.reader
+        memo.page_count = engine.page_count
+        memo.page_classes = engine.page_classes
+        memo.page_band_map = engine.page_band_map
+        memo.memo_flags.extend(engine.memo_flags)
+
+    asset_sources = (
+        engine.assets if engine is not None and engine.assets else [(None, [], [])]
+    )
+    for index, (asset_name, hits, extraction_flags) in enumerate(asset_sources, start=1):
+        row_memo_id = memo_id if index == 1 else f"{memo_id}-A{index}"
+        populated = {hit.field for hit in hits if hit.value is not None}
+        resolved_asset = asset_name or (item.verify.asset_names[0] if item.verify and item.verify.asset_names else None)
+        metadata = _metadata_hits(
+            schema_by_header,
+            {
+                "\U0001f511 Memo ID": row_memo_id,
+                "Run ID": run_id,
+                "Source Filename": record.file_name,
+                "Extraction Date": now.date().isoformat(),
+                "Valuation Date": as_of.isoformat() if as_of else None,
+                "Reporting Period": reporting,
+                "Fund Manager": item.client,
+                "Portfolio Company": asset_name or resolved_asset or item.deal,
+            },
+            populated,
+        )
+        all_hits = [*metadata, *hits]
+
+        company = next((h.value for h in all_hits if h.field == "Portfolio Company"), None)
+        fund = next((h.value for h in all_hits if h.field == "Fund Name"), None)
+        prior_row = (
+            writer.find_prior_row(str(company) if company else None, str(fund) if fund else None, as_of)
+            if as_of
+            else None
+        )
+
+        memo_level = list(memo.memo_flags) if index == 1 else []
+        validated = validate_asset(
+            hits=all_hits,
+            extraction_flags=[*memo_level, *extraction_flags],
+            schema_by_header=schema_by_header,
+            config=config,
+            ruleset=ruleset,
+            routing_table=routing,
+            as_of_date=as_of,
+            verify=item.verify,
+            prior_row=prior_row,
+        )
+        memo.assets.append(
+            AssetExtraction(
+                asset_name=asset_name or resolved_asset,
+                row_memo_id=row_memo_id,
+                hits=validated.hits,
+                flags=validated.flags,
+                qa_status=validated.qa_status,
+            )
+        )
+
+    memo.escalation = _build_escalation(
+        memo_id, memo.assets, schema_by_header,
+        memo.page_band_map, config.extraction.confidence_threshold,
+        force_assist=force_assist, derived_headers=derived_headers,
+    )
+    if memo.escalation.fields:
+        log_event(
+            logger, "escalation plan built", memo_id=memo_id,
+            fields=len(memo.escalation.fields),
+            force_assist=force_assist,
+        )
+    return memo
+
+
+def _existing_row_memo_ids(writer: WorkbookWriter) -> set[str]:
+    sheet = writer.workbook["Index"]
+    ids: set[str] = set()
+    for row in range(4, sheet.max_row + 1):  # Memo ID is column 1, data starts row 4
+        value = sheet.cell(row=row, column=1).value
+        if value:
+            ids.add(str(value))
+    return ids
+
+
+def _write_memo(writer: WorkbookWriter, memo: MemoResult) -> int:
+    existing = _existing_row_memo_ids(writer)
+    rows = 0
+    for asset in memo.assets:
+        if asset.row_memo_id in existing:
+            continue  # cumulative re-run: row already present (idempotent)
+        writer.append_index_row(asset.hits)
+        rows += 1
+    return rows
+
+
+def _write_flags(writer: WorkbookWriter, memo: MemoResult) -> int:
+    added = 0
+    for asset in memo.assets:
+        values = {hit.field: hit.value for hit in asset.hits}
+        added += writer.append_review_flags(
+            run_id=memo.run_id,
+            memo_id=asset.row_memo_id,
+            source_filename=memo.file_name,
+            fund_manager=str(values.get("Fund Manager") or memo.client),
+            portfolio_company=str(values.get("Portfolio Company") or memo.deal),
+            valuation_date=memo.as_of_date,
+            qa_status=asset.qa_status,
+            flags=asset.flags,
+        )
+    return added

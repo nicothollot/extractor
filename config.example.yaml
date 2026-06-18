@@ -1,0 +1,402 @@
+# PV Extractor configuration TEMPLATE.
+#
+# This file (config.example.yaml) is the version-controlled template. The real
+# config.yaml is git-IGNORED so each machine keeps its own paths without merge
+# conflicts on pull. `python scripts/bootstrap.py` copies this to config.yaml on
+# first run if it's missing — then edit config.yaml (NOT this file) for your
+# machine: at minimum set output_dir to a local writable folder.
+#
+# Every tunable lives here; nothing is hardcoded inline.
+# Relative paths are resolved against this file's directory.
+
+pv_root: '//hlhz/dfs/nyfva/PV'   # NEVER written to. All opens under here are read-only.
+output_dir: ./output             # logs, databases, exports — point at a local writable folder
+db_path: ./output/pv_index.db
+
+first_run:
+  install_missing_deps: true     # bootstrap may pip-install missing packages into .venv
+
+# --- Phase 4: local web GUI ---
+gui:
+  host: 127.0.0.1                # loopback ONLY (no auth system; non-loopback hosts are refused)
+  port: 8765
+  open_browser: true             # `pv-extractor gui` opens the default browser
+  evidence_dpi: 144              # review-queue page render resolution
+  frontend_dist:                 # built frontend dir (default: <repo>/src/frontend/dist)
+
+claude_code:
+  command: claude                # executable name or full path
+  command_args: []               # extra argv before claude's own args. Windows without a
+                                 # native claude can bridge into WSL's claude:
+                                 #   command: wsl
+                                 #   command_args: [-e, claude]
+  auto_update_on_start: true     # when true, startup runs `claude update` (read-only otherwise)
+  default_timeout_seconds: 120
+  allow_cli_usage: true          # master switch; Phase 1 only runs auth/version checks, never sends memo data
+
+indexer:
+  batch_size: 5000               # executemany chunk size for bulk ingest
+  follow_symlinks: false         # never follow symlinks/junctions while scanning
+  quick_rescan_margin_seconds: 300  # quick rescan: clock-skew margin before a leaf
+                                 # folder's mtime counts as "unchanged since last scan"
+
+# Per-client overrides. `default` applies when a client has no entry.
+# period_style: quarterly_calendar | monthly | fiscal(<month-end 1..12>)
+clients:
+  default:
+    period_style: quarterly_calendar
+  Angelo Gordon:
+    period_style: monthly        # observed 11.30 / 1.31 month-end folders
+
+# Smart deal-folder discovery (runs after every scan/ingest). Deal folders are
+# NOT assumed to sit directly under the client folder: discovery classifies
+# every path segment (period / structural / admin / neutral) and finds the
+# folders adjacent to the date folders, with a confidence score per deal.
+# Results land in the deal_folders table and rewrite files.deal.
+deal_discovery:
+  enabled: true                  # false = legacy behavior (deal = first folder under the client)
+  min_confidence: 0.0            # drop deals scoring below this (0 = keep all, ranked by confidence)
+  review_confidence: 0.45        # below this a deal is flagged low-confidence in CLI/GUI
+  display_min_confidence: 0.70   # GUI only: hide discovered deals below this (storage keeps all; raise/lower in Settings)
+  shared_bucket_enabled: true            # one neutral folder holding memos for many DIFFERENT investments -> one deal per cluster
+  shared_bucket_min_clusters: 2          # min distinct asset clusters to treat a folder as a shared bucket
+  shared_bucket_name_match_threshold: 85 # rapidfuzz floor to assign a file to a cluster-deal
+  cluster_ratio_threshold: 80            # rapidfuzz floor that groups two file stems into the same asset cluster
+  # A folder name like 'PBC (12.31.2023)' is the deal 'PBC' observed at a period
+  # (the date is split off the name and folders sharing the base name merge into
+  # ONE deal across periods). A folder whose date-stripped name is ENTIRELY
+  # generic ('Research (2020.10.31)', 'Q4 2025 Reports', 'Prior Period') is a
+  # document bucket, never a deal:
+  exclude_generic_deal_names: true       # drop generically-named leaf folders from the deal list
+  deal_name_stopwords:                   # extra generic words (combined with structural/grouping/admin)
+    - prior
+    - current
+    - latest
+    - period
+    - periods
+    - ytd
+    - ltm
+    - ntm
+    - monitor
+    - monitoring
+    - summary
+    - update
+    - updates
+    - overview
+    - snapshot
+    - package
+    - materials
+    - general
+    - misc
+    - reference
+  # most weights / lexicons (structural_tokens, grouping_tokens, ...) are tunable —
+  # see DealDiscoveryConfig defaults; override any of them here. New additive weights:
+  weights:
+    admin_container: -0.10       # deal surfaced by recursing into an admin container (unusual placement)
+    shared_bucket: 0.30          # per-cluster synthetic deal carved out of a shared mixed-investment folder
+  llm:
+    enabled: false               # auto Claude Code assist when heuristics are weak (manual opt-in)
+    model: sonnet                # ALIAS from config/models.yaml — floats to the newest cheap tier
+    effort: low
+    trigger_confidence: 0.45     # auto-assist (when enabled) if the best deal scores below this
+    timeout_seconds: 300
+    max_folders: 500             # folder-inventory cap in the prompt
+  learning:
+    enabled: true                # per-client learned overrides + priors (Phase A)
+    prior_bump: 0.25             # max confidence nudge a learned prior contributes
+  layout_priors: {}              # LIVE priors are auto-maintained in the index DB at runtime
+                                 # (Phase A3), NOT here. This is only an optional manual
+                                 # override / documented default — do NOT hand-edit it
+                                 # expecting it to be authoritative.
+
+# --- Search & Selection Revamp, Phase B: Smart Search ---
+# Free-text document search over the index. BM25 base relevance + intent-rule
+# boosts; works WITHOUT the LLM (heuristics primary). The Claude Code CLI only
+# assists ambiguous queries (no SDK, no API key — same hard rules as Phase 3).
+smart_search:
+  enabled: true
+  use_cli_fallback: true         # optional Claude Code assist for ambiguous queries
+  cli_model: sonnet              # ALIAS from config/models.yaml — floats to current cheap tier
+  cli_effort: low
+  bm25_k1: 1.2                   # BM25 term-frequency saturation
+  bm25_b: 0.75                   # BM25 length normalization
+  min_score: 8.0                 # results below this are dropped
+  top_n: 25                      # max results returned
+  learning_weight: 0.3           # weight of learned per-query priors on ranking
+  # Per-component additive rank weights (transparent, like the locator).
+  rank_weights:
+    filename_match: 30.0          # scaled by the BM25/fuzzy lexical relevance (0..1)
+    folder_context: 8.0           # a folder_include anchor hit on the folder path
+    extension_prior: 4.0          # the file's extension is in spec.extensions
+    period_evidence: 10.0         # filename/date-folder carries the target period
+    period_missing_penalty: -6.0  # period_required but no period evidence
+    negative_penalty: -25.0       # a filename_exclude/folder_exclude term hit
+  # Intent lexicon: phrase -> DocTypeSpec fragment
+  # (filename_include / filename_regex / folder_include / extensions).
+  intent_rules:
+    quarterly report:
+      filename_include: [quarterly, 10 q, q1, q2, q3, q4]
+      filename_regex: ["10[- ]?q"]
+      folder_include: [filings, quarterly]
+      extensions: [.pdf, .htm, .html]
+    annual report:
+      filename_include: [annual, 10 k]
+      filename_regex: ["10[- ]?k"]
+      folder_include: [filings, annual]
+    cap table:
+      filename_include: [cap table, capitalization table, captable]
+    audited financials:
+      filename_include: [audited, audited financials, audited financial statements, audit report]
+    valuation memo:
+      filename_include: [valuation memo, val memo, valuation write up, valuation summary]
+    ic memo:
+      filename_include: [ic memo, investment committee]
+    portfolio review:
+      filename_include: [portfolio review, quarterly review]
+
+# --- Search & Selection Revamp, Phase C: Multi-Search ---
+# Run one document search across many firms/clients at once.
+multi_search:
+  max_firms: 25                  # cap on firms/clients fanned out in a single multi-search
+  enhanced_period_check_default: false  # default for the stricter in-file period check
+  default_doc_types:
+  - any_client_valuation_doc
+
+locator:
+  aliases_path: ./aliases.yaml
+  fts_candidate_limit: 500       # FTS5 prefilter cap before Python scoring
+  min_accept_score: 45.0         # winner must score at least this for FOUND
+  min_gap: 8.0                   # winner must lead #2 by at least this for FOUND
+  floor_score: 20.0              # below this a candidate does not count at all
+  ambiguous_top_n: 5             # candidates returned for human pick on AMBIGUOUS
+  # When nothing matches the requested doc TYPE but real documents exist for the
+  # target period, offer them as AMBIGUOUS (so the analyst can Replace) instead
+  # of a bare NOT_YET_UPLOADED. Pure-negative files (NDA/invoice/wire) excluded.
+  surface_period_matches_without_doctype: true
+  mtime_window_days: 75          # modified_time in [as-of, as-of + N days] = weak period signal
+  family_ratio_threshold: 92     # rapidfuzz ratio on normalized stems for version-family grouping
+  fuzzy_match_threshold: 80      # token_set_ratio below this = no client/deal match
+
+  weights:
+    client_deal_exact: 30.0
+    client_deal_normalized: 27.0
+    client_deal_fuzzy_max: 22.0        # scaled by (token_set_ratio - threshold) / (100 - threshold)
+    period_folder_exact: 25.0          # date-folder parse equals target as-of date
+    period_folder_mismatch: -20.0      # date folder parses to a DIFFERENT period than target
+    period_in_filename: 15.0           # filename contains the target period
+    period_mtime_window: 3.0           # weak tie-breaker only
+    doctype_keyword: 20.0
+    negative_keyword: -25.0
+    source_class_client_bonus: 25.0
+    source_class_report_penalty: -30.0 # report/analysis = HL work product, not a valid source
+    archive_score_multiplier: 0.4      # is_archive multiplies the (positive) score down
+    do_not_use_penalty: -40.0
+    version_rank_step: 2.0             # final > vN > (00N) copy > undecorated, 2 pts per rank
+    zero_byte_penalty: -10.0
+    extension_prior:
+      .pdf: 5.0
+      .docx: 4.0
+      .pptx: 3.0
+      .xlsx: 2.0
+      .xlsm: 2.0
+      .doc: 1.0
+
+  doc_type_keywords:
+    valuation_memo:
+    - valuation memo
+    - val memo
+    - valuation write up
+    - valuation summary
+    ic_memo:
+    - ic memo
+    - investment committee
+    portfolio_review:
+    - portfolio review
+    - quarterly review
+    # prewritten catalog (Title-Cased labels in search/doc_type_spec._BUILTIN_LABELS)
+    quarterly_report:
+    - quarterly report
+    - quarterly update
+    - 10 q
+    - 10q
+    annual_report:
+    - annual report
+    - annual update
+    - 10 k
+    - 10k
+    houlihan_valuation:
+    - houlihan
+    - houlihan lokey
+    - hl valuation
+    - third party valuation
+    - independent valuation
+    investor_presentation:
+    - investor presentation
+    - investor deck
+    - lp presentation
+    - investor update
+    fund_report:
+    - fund report
+    - fund update
+    - fund performance
+    - quarterly fund
+    capital_account_statement:
+    - capital account
+    - capital account statement
+    - statement of capital
+    financial_statements:
+    - financial statements
+    - income statement
+    - balance sheet
+    - audited financials
+    board_materials:
+    - board deck
+    - board materials
+    - board presentation
+    - board meeting
+    # any_client_valuation_doc = union of the above at runtime
+
+  negative_keywords:
+  - nda
+  - engagement
+  - proposal
+  - invoice
+  - wire
+  - agenda
+  - minutes
+  - draft request list
+  - kyc
+
+# --- Phase 2: deterministic extraction engine ---
+extraction:
+  workers: 4                       # thread pool size; it's a network share, don't hammer it
+  top_k_pages_per_band: 4          # each band extractor sees its top-K pages...
+  summary_pages: 3                 # ...plus pages 1..N (summary pages) always
+  confidence_threshold: 0.75       # below this a field lands in the Phase-3 EscalationPlan
+  vocab_fuzzy_threshold: 90        # controlled-vocab mapping floor; below = empty + flag
+  max_evidence_chars: 200          # verbatim evidence snippet cap
+  cache_enabled: true              # sha256+schema+extractor version result cache
+
+  ocr:
+    enabled: true
+    engine: rapidocr               # rapidocr (default, pip-only) | tesseract (optional extra)
+    dpi: 300                       # page render resolution for OCR
+    tesseract_cmd:                 # explicit tesseract binary path when engine: tesseract
+
+  page_classification:             # TEXT / SCANNED / IMAGE_TABLE / MIXED thresholds
+    min_text_chars: 64             # text layer below this is 'negligible' -> SCANNED
+    image_area_threshold: 0.35     # image area / page area above this -> image-driven page
+    image_table_min_area_ratio: 0.10   # one image block this big may be a pasted table...
+    image_table_min_aspect: 0.8        # ...if it is wide (w/h >= aspect)
+    image_table_min_width_ratio: 0.45  # ...and spans enough of the page width
+
+  confidence:                      # multiplicative FieldHit confidence components
+    label_exact: 1.0
+    label_fuzzy_floor: 0.70        # fuzzy label matches scale from floor up to exact
+    parse_clean: 1.0
+    parse_lenient: 0.85            # value needed repair (footnote marks, odd spacing)
+    page_class_text: 1.0
+    page_class_ocr: 0.70           # x mean OCR word confidence of the page
+    table_factor: 1.0
+    prose_factor: 0.85
+    ambiguity_penalty: 0.60        # applied when conflicting candidates were found
+
+  band_anchor_overrides: {}        # extra per-band anchor terms merged with schema-seeded lexicons
+
+# --- Phase 2: peek-verifier (D3) ---
+peek_verify:
+  pages: 3                         # leading pages inspected
+  min_confidence: 0.5
+  client_doc_keywords:             # valuation-document vocabulary
+  - valuation memo
+  - valuation memorandum
+  - investment committee
+  - ic memo
+  - portfolio review
+  - quarterly review
+  - valuation summary
+  - fair value
+  - valuation as of
+  - concluded value
+  - enterprise value
+  - net asset value
+  hl_work_product_markers:         # Houlihan Lokey letterhead/disclaimer language
+  - houlihan lokey
+  - prepared by hl
+  - hl financial advisors
+  - this report is confidential and was prepared exclusively
+  hl_addressee_exceptions:         # client docs ADDRESSED TO HL stay client docs
+  - prepared for houlihan lokey
+  - delivered to houlihan lokey
+  asset_name_labels:               # label lines whose value is an asset name
+  - portfolio company
+  - company
+  - asset
+  - investment
+  - subject company
+  - operating company
+  - issuer
+  - borrower
+  - project
+
+# --- Phase 3: Claude Code CLI fallback (LLM second pass) ---
+# No Anthropic SDK, no ANTHROPIC_API_KEY: hidden local `claude -p` sessions
+# reuse the operator's one-time `claude auth login`. The deterministic engine
+# stays primary; only escalated fields (below extraction.confidence_threshold
+# or required-but-empty) reach Claude Code, and only their candidate pages are
+# sent (plus pages 1-3) — never whole documents.
+llm:
+  enabled: true                    # --no-llm at run time gives pure Phase-2 behavior
+  mode: manual                     # auto = route by task | manual = one forced model+effort
+  manual_model: sonnet             # used when mode: manual (alias or full id from config/models.yaml)
+  manual_effort: low
+  allow_fable: false               # Fable is the most expensive tier: explicit opt-in only
+  budget_usd: 25.0                 # hard per-run cap; past it memos are marked LLM_DEFERRED
+  workers: 2                       # hidden Claude Code session concurrency (don't hammer CLI/share)
+  models_path: ./config/models.yaml  # model menu + editable pricing assumptions
+  cache_enabled: true              # response cache keyed on prompt+payload+fields+model+effort
+  timeout_seconds: 600             # per extraction call
+  max_pages_per_memo: 20           # payload cap: candidate pages + pages 1-3
+  image_max_long_edge: 1080        # SCANNED/IMAGE_TABLE pages render to PNG at most this long edge
+  quote_match_threshold: 85        # fuzzy quote-grounding floor for OCR'd pages
+  band_batched: true               # focused per-band LLM calls (relevance-ordered) vs one giant call
+  band_relevance_floor: 0.0        # band page-anchor score strictly above this counts as "has evidence"
+  max_fields_per_call: 50          # split a band's call when it carries more fields than this
+  no_evidence_effort: low          # effort for the single sweep over bands with no page evidence
+  exclude_dynamic_system_prompt_sections: true  # better prompt-cache reuse when the CLI supports it
+  confidence_scores:               # LLM self-reported confidence -> FieldHit.confidence
+    high: 0.85
+    medium: 0.60
+    low: 0.35
+  chars_per_token: 4.0             # ESTIMATED-token heuristics (used when no usage reported)
+  image_tokens_per_megapixel: 1500
+  output_tokens_per_field: 80
+  output_tokens_base: 300
+  auto:                            # AUTO-mode routing table (aliases resolve via models.yaml)
+    classification_model: haiku    # cheap classification only
+    classification_effort: low
+    extraction_model: sonnet       # normal escalated-field extraction
+    extraction_effort: medium
+    ocr_hostile_model: opus        # memos whose payload contains SCANNED/IMAGE_TABLE pages
+    ocr_hostile_effort: high
+    retry_model: opus              # second pass when fields still fail
+    retry_effort: high
+    retry_effort_bump: xhigh       # retry effort when the same model tier repeats
+    fable_effort: high             # final pass, only when allow_fable is true
+
+# --- Phase 2: validation & QA (D5) ---
+validation:
+  rules_path: ./rules.yaml         # table-driven cross-field rules
+  equity_bridge_tolerance: 0.02    # |EV - Net Debt - Equity| / |Equity|
+  weights_sum_tolerance: 1.0       # method weights sum to 100 +/- this
+  bridge_tolerance_ratio: 0.05     # QoQ bridge deltas vs NAV Change Abs
+  computed_crosscheck_tolerance: 0.02  # extracted vs computed disagreement => flag
+  percent_range: [-100.0, 200.0]   # default % sanity range unless schema narrows it
+  date_year_min: 2000
+  date_max_years_after_asof: 1
+  wacc_qoq_threshold_bps: 50.0     # THRESHOLD FLAGS: WACC >50bps QoQ
+  multiple_qoq_threshold_x: 0.5    # THRESHOLD FLAGS: Multiple >0.5x QoQ
+  nav_qoq_threshold_pct: 5.0       # THRESHOLD FLAGS: NAV >5% QoQ
+
+logging:
+  level: INFO

@@ -1,0 +1,939 @@
+"""Escalation executor (D4 + D5): consumes each memo's EscalationPlan,
+assembles the page payload, runs hidden Claude Code sessions through the
+worker queue, quote-grounds the answers and merges them into the row.
+
+Cost principles enforced here:
+  * LOCAL FIRST — only fields the deterministic pass scored below threshold
+    (or left empty while required) ever reach Claude Code (the plan was
+    built that way in run.py).
+  * ONE CALL PER MEMO PER TIER — all of a memo's escalated fields ride in a
+    single band-grouped schema; the router decides the tier ladder.
+  * SESSION WORKER QUEUE — a small thread pool (config.llm.workers, default
+    1-2) launches hidden `claude -p` processes named pv-<run_id>-<memo_id>-tN;
+    stdout/exit/usage/session ids are captured per attempt.
+  * HARD BUDGET — projected spend is reserved before any call; once the cap
+    would be passed the memo is marked LLM_DEFERRED and the run finishes
+    cleanly.
+  * RESULT CACHE — responses are cached on sha256(static prompt + payload +
+    field set + model + effort); unchanged memos never re-pay (rule 10).
+
+Merge policy: a Claude Code value NEVER overwrites a deterministic value
+with confidence >= threshold. It fills empty fields, or replaces a below-
+threshold deterministic value (the old value is preserved as a conflict
+entry). Every merge, overwrite and rejection lands in the plan's merge_log
+inside the audit record; ungrounded quotes discard the value and raise
+UNGROUNDED_LLM_VALUE. Fields that survive every tier are flagged
+NOT_EXTRACTABLE (required) / LLM_UNCONFIRMED (low-confidence) with
+reviewer_attention — values are never invented.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field as dataclass_field
+from pathlib import Path
+
+from rapidfuzz import fuzz
+
+from pv_extractor.config import Config
+from pv_extractor.extract.targeting import _page_score, build_band_lexicons
+from pv_extractor.io_guard import guarded_open_write
+from pv_extractor.llm import cache as llm_cache
+from pv_extractor.llm.claude_code_client import ClaudeCodeClient
+from pv_extractor.llm.costs import (
+    LEDGER_FILENAME,
+    BudgetExceeded,
+    BudgetTracker,
+    CostLedger,
+    estimate_usage,
+)
+from pv_extractor.llm.model_registry import ModelRegistry, ModelSelection
+from pv_extractor.llm.payload import MemoPayload, PayloadError, assemble_payload
+from pv_extractor.llm.schema_builder import (
+    build_response_schema,
+    build_static_prompt,
+    schema_json_bytes,
+    sorted_fields,
+)
+from pv_extractor.logging_setup import log_event
+from pv_extractor.models import (
+    AssetExtraction,
+    ConflictingCandidate,
+    EscalationField,
+    FieldHit,
+    FlagSeverity,
+    LlmAttempt,
+    MemoResult,
+    ReviewFlag,
+    SchemaField,
+)
+from pv_extractor.normalize import normalize_text
+
+logger = logging.getLogger(__name__)
+
+_NUMERIC_DTYPES = {"number", "percent", "basis_points", "multiple_x", "years", "integer"}
+
+
+@dataclass
+class LlmSettings:
+    """Resolved llm runtime settings (config defaults + CLI overrides)."""
+
+    enabled: bool
+    mode: str
+    manual_model: str
+    manual_effort: str
+    allow_fable: bool
+    budget_usd: float
+    workers: int
+    force: bool = False
+    # force_assist: escalate EVERY empty extractable field (not just low-conf /
+    # required ones) so the LLM does the extraction instead of trusting the
+    # deterministic engine. Implies a deterministic-cache bypass in run() so the
+    # broad plan is actually rebuilt. enabled must still be True.
+    force_assist: bool = False
+
+
+def resolve_settings(
+    config: Config,
+    *,
+    no_llm: bool = False,
+    mode: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    budget: float | None = None,
+    force: bool = False,
+    force_assist: bool = False,
+    allow_fable: bool | None = None,
+) -> LlmSettings:
+    """--llm-model without --llm-mode implies manual (the user forced one
+    model); everything else falls back to config.llm. force_assist turns the
+    LLM into the primary extractor for this run (see LlmSettings)."""
+    llm = config.llm
+    resolved_mode = mode or ("manual" if model else llm.mode)
+    return LlmSettings(
+        enabled=llm.enabled and not no_llm,
+        mode=resolved_mode,
+        manual_model=model or llm.manual_model,
+        manual_effort=effort or llm.manual_effort,
+        allow_fable=llm.allow_fable if allow_fable is None else allow_fable,
+        budget_usd=budget if budget is not None else llm.budget_usd,
+        workers=max(1, llm.workers),
+        force=force,
+        force_assist=force_assist,
+    )
+
+
+@dataclass
+class LlmRunSummary:
+    enabled: bool = False
+    executed: bool = False
+    memos_escalated: int = 0
+    memos_deferred: int = 0
+    memos_failed: int = 0
+    attempts: int = 0
+    cache_hits: int = 0
+    total_cost_usd: float = 0.0
+    any_actual_costs: bool = False
+    session_labels: list[str] = dataclass_field(default_factory=list)
+    ledger_path: Path | None = None
+    detail: str = ""
+
+
+# ---------------------------------------------------------------------------
+# quote grounding (rule 5)
+# ---------------------------------------------------------------------------
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
+def quote_grounding(
+    quote: str, page: int | None, payload: MemoPayload, fuzzy_threshold: int
+) -> str:
+    """'grounded' | 'ungrounded' | 'unverifiable'. Exact normalized substring
+    on text pages; fuzzy >= threshold against local OCR text on image pages
+    (OCR noise must not reject a correct reading); no local text at all =>
+    unverifiable (merged with a flag — never silently)."""
+    if not quote.strip() or page is None or page not in payload.page_texts:
+        return "ungrounded"
+    page_text = _normalize(payload.page_texts[page])
+    needle = _normalize(quote)
+    if not page_text:
+        return "unverifiable"
+    if needle in page_text:
+        return "grounded"
+    kind = next((p.kind for p in payload.pages if p.number == page), "text")
+    if kind == "image" and fuzz.partial_ratio(needle, page_text) >= fuzzy_threshold:
+        return "grounded"
+    return "ungrounded"
+
+
+# ---------------------------------------------------------------------------
+# value coercion
+# ---------------------------------------------------------------------------
+
+
+def _coerce_value(value, schema_field: SchemaField):
+    """(ok, coerced). Light typing only — full range/vocab validation already
+    ran in Phase 2 and the merge must never invent or repair values."""
+    if schema_field.dtype in _NUMERIC_DTYPES:
+        if isinstance(value, bool):
+            return False, None
+        if isinstance(value, (int, float)):
+            number = value
+        elif isinstance(value, str):
+            text = value.replace(",", "").replace("%", "").replace("x", "").strip()
+            if text.startswith("(") and text.endswith(")"):
+                text = "-" + text[1:-1]
+            try:
+                number = float(text)
+            except ValueError:
+                return False, None
+        else:
+            return False, None
+        if schema_field.dtype == "integer":
+            return True, int(number)
+        return True, float(number)
+    if schema_field.dtype == "boolean":
+        if isinstance(value, bool):
+            return True, value
+        if isinstance(value, str) and value.strip().lower() in ("yes", "no", "true", "false"):
+            return True, value.strip().lower() in ("yes", "true")
+        return False, None
+    if schema_field.dtype == "date":
+        if isinstance(value, str) and len(value.strip()) >= 8:
+            return True, value.strip()
+        return False, None
+    if isinstance(value, (str, int, float, bool)):
+        return True, value
+    return False, None
+
+
+def _match_vocab(value, vocab: list[str]):
+    """(ok, canonical). Exact case-insensitive only — fuzzy vocab repair is
+    the deterministic layer's job; an off-vocabulary LLM answer is rejected."""
+    text = str(value).strip().lower()
+    for allowed in vocab:
+        if text == allowed.strip().lower():
+            return True, allowed
+    return False, None
+
+
+# ---------------------------------------------------------------------------
+# merging
+# ---------------------------------------------------------------------------
+
+
+def _qualifying_assets(
+    memo: MemoResult, header: str, threshold: float
+) -> list[tuple[AssetExtraction, FieldHit | None]]:
+    """Assets where a Claude Code value may land: the field is missing,
+    empty, or a below-threshold deterministic hit. Confident deterministic /
+    computed / metadata values are untouchable."""
+    out: list[tuple[AssetExtraction, FieldHit | None]] = []
+    for asset in memo.assets:
+        existing = next((h for h in asset.hits if h.field == header), None)
+        if existing is None or existing.value is None:
+            out.append((asset, existing))
+        elif existing.method == "deterministic" and existing.confidence < threshold:
+            out.append((asset, existing))
+    return out
+
+
+def _merge_field(
+    memo: MemoResult,
+    schema_field: SchemaField,
+    result: dict,
+    selection: ModelSelection,
+    payload: MemoPayload,
+    config: Config,
+) -> str:
+    """Apply one field's LLM answer. Returns the disposition recorded in the
+    merge log: merged | not_found | rejected:<reason>."""
+    plan = memo.escalation
+    assert plan is not None
+    header = schema_field.header
+    method = f"claude-code:{selection.entry.alias}:{selection.effort}"
+
+    if result.get("not_found") is True or result.get("value") is None:
+        return "not_found"
+
+    ok, value = _coerce_value(result.get("value"), schema_field)
+    if not ok:
+        _flag_first_asset(
+            memo,
+            ReviewFlag(
+                category="llm",
+                description=f"{header}: Claude Code value {result.get('value')!r} failed "
+                f"{schema_field.dtype} typing — discarded",
+                severity=FlagSeverity.warning, field=header,
+            ),
+        )
+        return "rejected:type_mismatch"
+
+    if schema_field.controlled_vocab:
+        ok, value = _match_vocab(value, schema_field.controlled_vocab)
+        if not ok:
+            _flag_first_asset(
+                memo,
+                ReviewFlag(
+                    category="llm",
+                    description=f"{header}: Claude Code value outside controlled vocabulary — discarded",
+                    severity=FlagSeverity.warning, field=header,
+                ),
+            )
+            return "rejected:vocab"
+
+    quote = str(result.get("verbatim_quote") or "")
+    page = result.get("page") if isinstance(result.get("page"), int) else None
+    grounding = quote_grounding(quote, page, payload, config.llm.quote_match_threshold)
+    if grounding == "ungrounded":
+        _flag_first_asset(
+            memo,
+            ReviewFlag(
+                category="llm",
+                description=f"UNGROUNDED_LLM_VALUE: {header} — quote not found on cited "
+                f"page {page}; value discarded",
+                severity=FlagSeverity.warning, reviewer_attention=True, field=header,
+            ),
+        )
+        return "rejected:ungrounded"
+
+    targets = _qualifying_assets(memo, header, plan.confidence_threshold)
+    if not targets:
+        return "rejected:protected"  # deterministic value is confident — never overwrite
+
+    asset, existing = targets[0]
+    confidence = config.llm.confidence_scores.get(str(result.get("confidence")), 0.35)
+    hit = FieldHit(
+        field=header, col_index=schema_field.col_index, band=schema_field.band,
+        raw_text=str(result.get("value")), value=value,
+        unit=result.get("unit") or schema_field.unit, page=page,
+        method=method, confidence=confidence,
+        evidence=quote[: config.extraction.max_evidence_chars],
+        confidence_components={"llm_self_reported": confidence},
+    )
+    if existing is not None:
+        if existing.value is not None:
+            hit.conflicts = [
+                *existing.conflicts,
+                ConflictingCandidate(
+                    raw_text=existing.raw_text, value=existing.value, page=existing.page,
+                    confidence=existing.confidence, evidence=existing.evidence,
+                ),
+            ]
+            plan.merge_log.append(
+                f"{header}: overwrote below-threshold deterministic value "
+                f"(conf {existing.confidence:.2f}) with {method} (conf {confidence:.2f}) "
+                f"[{asset.row_memo_id}]"
+            )
+            asset.flags.append(
+                ReviewFlag(
+                    category="llm",
+                    description=f"{header}: low-confidence deterministic value replaced by "
+                    f"{method}; prior value kept as conflict",
+                    severity=FlagSeverity.info, field=header,
+                )
+            )
+        else:
+            plan.merge_log.append(f"{header}: filled empty field via {method} [{asset.row_memo_id}]")
+        asset.hits[asset.hits.index(existing)] = hit
+    else:
+        plan.merge_log.append(f"{header}: filled missing field via {method} [{asset.row_memo_id}]")
+        asset.hits.append(hit)
+
+    if grounding == "unverifiable":
+        asset.flags.append(
+            ReviewFlag(
+                category="llm",
+                description=f"{header}: quote could not be machine-verified "
+                f"(no local text for page {page}) — review against the document",
+                severity=FlagSeverity.warning, reviewer_attention=True, field=header,
+            )
+        )
+    if len(targets) > 1:
+        asset.flags.append(
+            ReviewFlag(
+                category="llm",
+                description=f"{header}: multi-asset memo — Claude Code value applied to "
+                f"{asset.row_memo_id} only; review remaining assets manually",
+                severity=FlagSeverity.warning, reviewer_attention=True, field=header,
+            )
+        )
+    plan.merged_fields.append(header)
+    return "merged"
+
+
+def _flag_first_asset(memo: MemoResult, flag: ReviewFlag) -> None:
+    if memo.assets:
+        memo.assets[0].flags.append(flag)
+    else:
+        memo.memo_flags.append(flag)
+
+
+# ---------------------------------------------------------------------------
+# band batching: focused, relevance-ordered calls (one band's pages + schema)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FieldGroup:
+    """One unit of LLM work: a band's escalated fields, scored for how strongly
+    the document shows evidence for that band, with the pages that band needs."""
+
+    label: str
+    fields: list[EscalationField]
+    pages: list[int]
+    relevance: float
+    has_evidence: bool  # page-anchor evidence OR an image page (can't text-score)
+    ocr_hostile: bool
+    priority: bool  # full tier ladder vs a single cheap sweep pass
+    must_try: bool  # contains a required-empty / below-confidence field
+
+    def sort_key(self) -> tuple:
+        # Required/low-confidence bands first, then by descending evidence, then
+        # by label for determinism.
+        return (0 if self.must_try else 1, -self.relevance, self.label)
+
+
+_ALWAYS_TRY_REASONS = frozenset({"below_confidence", "required_empty"})
+
+
+def _band_relevance(
+    band: str,
+    pages: list[int],
+    payload: MemoPayload,
+    lexicons: dict[str, list[str]],
+) -> float:
+    """Sum the band's page-anchor score over its candidate pages' local text
+    (reuses the Phase-2 targeting scorer). Image pages contribute no text but
+    are handled separately as evidence."""
+    anchors = lexicons.get(band)
+    if not anchors:
+        return 0.0
+    total = 0.0
+    for number in pages:
+        text = payload.page_texts.get(number)
+        if text:
+            total += _page_score(f" {normalize_text(text)} ", anchors)
+    return total
+
+
+def _chunk(fields: list[EscalationField], size: int) -> list[list[EscalationField]]:
+    if size <= 0 or len(fields) <= size:
+        return [fields]
+    return [fields[i : i + size] for i in range(0, len(fields), size)]
+
+
+def _build_groups(
+    plan_fields: list[EscalationField],
+    payload: MemoPayload,
+    schema_by_header: dict[str, SchemaField],
+    config: Config,
+) -> list[_FieldGroup]:
+    """Split a plan's unique fields into LLM work groups.
+
+    band_batched=True: one priority group per band that has page evidence (or a
+    required/low-confidence field), ordered by relevance, plus ONE cheap sweep
+    group for the bands the document shows no evidence for. band_batched=False:
+    a single group over the whole payload (legacy one-call-per-memo behavior)."""
+    # De-duplicate (the plan repeats a field per asset; the call is per memo).
+    unique: dict[str, EscalationField] = {}
+    for escalated in plan_fields:
+        if escalated.field in schema_by_header:
+            unique.setdefault(escalated.field, escalated)
+    fields = list(unique.values())
+    payload_pages = set(payload.page_blocks)
+
+    if not config.llm.band_batched:
+        all_pages = sorted(payload_pages)
+        return [
+            _FieldGroup(
+                label="memo", fields=fields, pages=all_pages, relevance=1.0,
+                has_evidence=True, ocr_hostile=payload.ocr_hostile,
+                priority=True, must_try=True,
+            )
+        ]
+
+    lexicons = build_band_lexicons(list(schema_by_header.values()), config.extraction)
+    summary = sorted(p for p in payload_pages if p <= config.extraction.summary_pages)
+
+    by_band: dict[str, list[EscalationField]] = {}
+    for escalated in fields:
+        by_band.setdefault(escalated.band, []).append(escalated)
+
+    priority: list[_FieldGroup] = []
+    sweep_fields: list[EscalationField] = []
+    for band, band_fields in by_band.items():
+        band_pages = sorted(
+            {p for f in band_fields for p in f.candidate_pages if p in payload_pages}
+            | set(summary)
+        )
+        relevance = _band_relevance(band, band_pages, payload, lexicons)
+        has_image = payload.scoped_image_count(band_pages) > 0
+        must_try = any(f.reason in _ALWAYS_TRY_REASONS for f in band_fields)
+        has_evidence = relevance > config.llm.band_relevance_floor or has_image
+        if must_try or has_evidence:
+            for chunk in _chunk(band_fields, config.llm.max_fields_per_call):
+                priority.append(
+                    _FieldGroup(
+                        label=band, fields=chunk, pages=band_pages, relevance=relevance,
+                        has_evidence=has_evidence, ocr_hostile=has_image,
+                        priority=True, must_try=must_try,
+                    )
+                )
+        else:
+            sweep_fields.extend(band_fields)
+
+    priority.sort(key=lambda g: g.sort_key())
+
+    groups = priority
+    if sweep_fields:
+        # The bands the document shows no evidence for: one cheap sweep over the
+        # summary pages, so a forced/qa-fail-rescue plan still gets a single look
+        # without expanding every empty field across every tier.
+        sweep_pages = summary or sorted(payload_pages)[: config.extraction.summary_pages]
+        for chunk in _chunk(sweep_fields, config.llm.max_fields_per_call):
+            groups.append(
+                _FieldGroup(
+                    label="no-evidence sweep", fields=chunk, pages=sweep_pages,
+                    relevance=0.0, has_evidence=False,
+                    ocr_hostile=payload.scoped_image_count(sweep_pages) > 0,
+                    priority=False, must_try=False,
+                )
+            )
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# one tier = one Claude Code call (rule 4)
+# ---------------------------------------------------------------------------
+
+
+def _run_tier(
+    *,
+    memo: MemoResult,
+    payload: MemoPayload,
+    fields: list[SchemaField],
+    selection: ModelSelection,
+    tier: int,
+    slug: str,
+    dynamic_prompt: str,
+    image_count: int,
+    scope_key: str,
+    config: Config,
+    settings: LlmSettings,
+    client: ClaudeCodeClient,
+    registry: ModelRegistry,
+    budget: BudgetTracker,
+    run_id: str,
+) -> tuple[LlmAttempt, dict | None]:
+    job_id = f"pv-{run_id}-{memo.memo_id}-{slug}"
+    static_prompt = build_static_prompt(fields)
+    schema_path = payload.directory / f"schema_{slug}.json"
+    with guarded_open_write(schema_path, config.pv_root, mode="wb") as fh:
+        fh.write(schema_json_bytes(build_response_schema(fields)))
+    with guarded_open_write(
+        payload.directory / f"prompt_static_{slug}.txt", config.pv_root
+    ) as fh:
+        fh.write(static_prompt)
+    prompt = static_prompt + "\n" + dynamic_prompt
+
+    headers = [f.header for f in fields]
+    # Fold the band's page scope into the cache key so a field asked over a
+    # different page set is not served a stale answer (LLM_VERSION also bumped).
+    key = llm_cache.cache_key(
+        static_prompt, payload.payload_hash, [*headers, f"::scope::{scope_key}"],
+        selection.entry.id, selection.effort,
+    )
+    attempt = LlmAttempt(
+        job_id=job_id, tier=tier, model_alias=selection.entry.alias,
+        model_id=selection.entry.id, effort=selection.effort,
+        fields_requested=len(fields),
+    )
+
+    if config.llm.cache_enabled and not settings.force:
+        conn = sqlite3.connect(str(config.db_path), timeout=30)
+        try:
+            llm_cache.init_cache(conn)
+            cached = llm_cache.get_cached(conn, key)
+        finally:
+            conn.close()
+        if cached is not None:
+            attempt.from_cache = True
+            attempt.session_id = cached["session_id"]
+            attempt.usage = cached["usage"] or attempt.usage
+            attempt.cost_usd = 0.0  # no new spend on a cache hit
+            attempt.cost_source = "cache"
+            return attempt, cached["structured"]
+
+    estimated = estimate_usage(
+        prompt_chars=len(prompt), image_count=image_count,
+        field_count=len(fields), cfg=config.llm,
+    )
+    estimated_cost = registry.cost_usd(estimated, selection.entry)
+    budget.reserve(estimated_cost)  # BudgetExceeded propagates: memo deferred, no call made
+
+    result = client.extract_json(
+        job_id=job_id, prompt=prompt, schema_path=schema_path,
+        model=selection.entry.cli_model_arg(), effort=selection.effort,
+        cwd=payload.directory, allow_read_tool=True,
+    )
+    attempt.exit_code = result.exit_code
+    attempt.duration_seconds = result.duration_seconds
+    attempt.session_id = result.session_id
+    attempt.usage = result.usage or estimated
+    if result.total_cost_usd is not None:
+        attempt.cost_usd, attempt.cost_source = round(result.total_cost_usd, 6), "actual"
+    elif result.usage is not None:
+        attempt.cost_usd = registry.cost_usd(result.usage, selection.entry)
+        attempt.cost_source = "actual"  # actual tokens, configured prices
+    else:
+        attempt.cost_usd, attempt.cost_source = estimated_cost, "estimated"
+    budget.settle(estimated_cost, attempt.cost_usd)
+
+    if not result.ok or result.structured is None:
+        attempt.error = result.error or "no structured output"
+        return attempt, None
+
+    conn = sqlite3.connect(str(config.db_path), timeout=30)
+    try:
+        llm_cache.init_cache(conn)
+        llm_cache.put_cached(
+            conn, key, model_id=selection.entry.id, effort=selection.effort,
+            structured=result.structured, session_id=result.session_id,
+            usage=result.usage, cost_usd=attempt.cost_usd, cost_source=attempt.cost_source,
+        )
+    finally:
+        conn.close()
+    return attempt, result.structured
+
+
+def _flatten_response(structured: dict) -> dict[str, dict]:
+    """Band-grouped response -> {header: field object} (defensive)."""
+    flat: dict[str, dict] = {}
+    for band_obj in structured.values():
+        if not isinstance(band_obj, dict):
+            continue
+        for header, result in band_obj.items():
+            if isinstance(result, dict):
+                flat[header] = result
+    return flat
+
+
+# ---------------------------------------------------------------------------
+# per-memo job
+# ---------------------------------------------------------------------------
+
+
+def _escalate_memo(
+    memo: MemoResult,
+    *,
+    config: Config,
+    settings: LlmSettings,
+    schema_by_header: dict[str, SchemaField],
+    client: ClaudeCodeClient,
+    registry: ModelRegistry,
+    budget: BudgetTracker,
+    ledger: CostLedger,
+    run_id: str,
+    run_dir: Path,
+) -> None:
+    plan = memo.escalation
+    assert plan is not None and plan.fields
+
+    try:
+        payload = assemble_payload(
+            file_path=memo.file_path, fields=plan.fields, config=config,
+            payload_dir=run_dir / "llm" / memo.memo_id,
+        )
+    except (PayloadError, OSError) as exc:
+        plan.status = "llm_failed"
+        _flag_first_asset(
+            memo,
+            ReviewFlag(
+                category="llm", description=f"LLM payload assembly failed: {exc}",
+                severity=FlagSeverity.warning, reviewer_attention=True,
+            ),
+        )
+        return
+
+    groups = _build_groups(plan.fields, payload, schema_by_header, config)
+    # Every unique unresolved field across the memo — leftovers are surfaced
+    # once at the end (each field belongs to exactly one group).
+    unresolved: dict[str, EscalationField] = {}
+    for group in groups:
+        for escalated in group.fields:
+            unresolved.setdefault(escalated.field, escalated)
+    log_event(
+        logger, "memo escalation plan", memo_id=memo.memo_id, fields=len(unresolved),
+        groups=len(groups),
+        priority_groups=sum(1 for g in groups if g.priority),
+    )
+
+    deferred = False
+    any_merged = False
+    any_ok_attempt = False
+    for gi, group in enumerate(groups):
+        if deferred:
+            break
+        remaining = {f.field: f for f in group.fields if f.field in unresolved}
+        if not remaining:
+            continue
+        tiers = registry.extraction_tiers(
+            mode=settings.mode, auto=config.llm.auto,
+            manual_model=settings.manual_model, manual_effort=settings.manual_effort,
+            ocr_hostile=group.ocr_hostile, allow_fable=settings.allow_fable,
+        )
+        # The no-evidence sweep gets ONE cheap pass, never the expensive retry
+        # ladder — the document showed no anchor evidence for these bands.
+        if not group.priority and tiers:
+            base = tiers[0]
+            tiers = [
+                ModelSelection(
+                    entry=base.entry, effort=config.llm.no_evidence_effort or base.effort,
+                    reason="no_evidence",
+                )
+            ]
+        dynamic_prompt = payload.scoped_prompt(group.pages)
+        image_count = payload.scoped_image_count(group.pages)
+        scope_key = ",".join(str(p) for p in group.pages)
+
+        for tier, selection in enumerate(tiers):
+            if not remaining:
+                break
+            fields = sorted_fields(
+                [schema_by_header[h] for h in remaining if h in schema_by_header]
+            )
+            if not fields:
+                break
+            slug = f"g{gi}t{tier}"
+            try:
+                attempt, structured = _run_tier(
+                    memo=memo, payload=payload, fields=fields, selection=selection,
+                    tier=tier, slug=slug, dynamic_prompt=dynamic_prompt,
+                    image_count=image_count, scope_key=scope_key,
+                    config=config, settings=settings, client=client,
+                    registry=registry, budget=budget, run_id=run_id,
+                )
+            except BudgetExceeded as exc:
+                deferred = True
+                plan.merge_log.append(
+                    f"{group.label} [{slug}] ({selection.entry.alias}): deferred — {exc}"
+                )
+                _flag_first_asset(
+                    memo,
+                    ReviewFlag(
+                        category="llm",
+                        description=f"LLM_DEFERRED: run budget reached before "
+                        f"{memo.memo_id} {group.label} — fields left for a later run",
+                        severity=FlagSeverity.warning, reviewer_attention=True,
+                    ),
+                )
+                break
+
+            if structured is None:
+                plan.merge_log.append(
+                    f"{group.label} [{slug}] ({selection.entry.alias}:{selection.effort}): "
+                    f"failed — {attempt.error}"
+                )
+            else:
+                any_ok_attempt = True
+                flat = _flatten_response(structured)
+                attempt.fields_returned = sum(1 for h in remaining if h in flat)
+                for header in list(remaining):
+                    schema_field = schema_by_header.get(header)
+                    result = flat.get(header)
+                    if schema_field is None or result is None:
+                        continue
+                    disposition = _merge_field(memo, schema_field, result, selection, payload, config)
+                    if disposition == "merged":
+                        attempt.fields_merged += 1
+                        any_merged = True
+                        del remaining[header]
+                        unresolved.pop(header, None)
+                    elif disposition == "not_found":
+                        attempt.fields_not_found += 1
+                    else:
+                        attempt.fields_rejected += 1
+                        plan.merge_log.append(f"{header}: {disposition} ({slug})")
+            plan.attempts.append(attempt)
+            ledger.append(run_id=run_id, memo_id=memo.memo_id, attempt=attempt)
+
+    # Leftovers after every group: surface, never invent (D5).
+    if not deferred:
+        for header, escalated in unresolved.items():
+            if escalated.reason == "required_empty":
+                plan.not_extractable.append(header)
+                _flag_first_asset(
+                    memo,
+                    ReviewFlag(
+                        category="llm",
+                        description=f"NOT_EXTRACTABLE: {header} — deterministic extraction "
+                        f"and all Claude Code passes failed",
+                        severity=FlagSeverity.warning, reviewer_attention=True, field=header,
+                    ),
+                )
+            else:
+                _flag_first_asset(
+                    memo,
+                    ReviewFlag(
+                        category="llm",
+                        description=f"LLM_UNCONFIRMED: {header} — low-confidence value "
+                        f"could not be improved by Claude Code",
+                        severity=FlagSeverity.warning, reviewer_attention=True, field=header,
+                    ),
+                )
+
+    if deferred:
+        plan.status = "llm_deferred_budget"
+    elif not any_ok_attempt and plan.attempts:
+        plan.status = "llm_failed"
+    elif unresolved and any_merged:
+        plan.status = "llm_partial"
+    elif unresolved:
+        plan.status = "llm_partial" if any_ok_attempt else "llm_failed"
+    else:
+        plan.status = "llm_completed"
+    log_event(
+        logger, "memo escalation finished", memo_id=memo.memo_id, status=plan.status,
+        attempts=len(plan.attempts), merged=len(plan.merged_fields),
+        not_extractable=len(plan.not_extractable),
+    )
+
+
+# ---------------------------------------------------------------------------
+# run-level entry point (rule 7 worker queue)
+# ---------------------------------------------------------------------------
+
+
+def process_memos(
+    memos: list[MemoResult],
+    config: Config,
+    settings: LlmSettings,
+    schema_fields: list[SchemaField],
+    *,
+    run_id: str,
+    run_dir: Path,
+    client: ClaudeCodeClient | None = None,
+    registry: ModelRegistry | None = None,
+) -> LlmRunSummary:
+    """Execute the Phase-3 second pass for one run. Mutates the MemoResults
+    in place (merged hits, plan attempts/status, flags) and returns the
+    run-level summary for the Run Log and the CLI."""
+    summary = LlmRunSummary(enabled=settings.enabled)
+    if not settings.enabled:
+        return summary
+
+    eligible: list[MemoResult] = []
+    for memo in memos:
+        plan = memo.escalation
+        if plan is None:
+            continue
+        if not plan.fields:
+            plan.status = "not_needed"
+        elif memo.error is None:
+            eligible.append(memo)
+    if not eligible:
+        summary.executed = True
+        summary.detail = "no memos required escalation"
+        return summary
+
+    try:
+        registry = registry or ModelRegistry.load(config.llm.models_path)
+    except (OSError, ValueError) as exc:
+        summary.detail = f"models.yaml unusable: {exc}"
+        _fail_all(eligible, summary.detail)
+        return summary
+
+    client = client or ClaudeCodeClient(config)
+    if client.binary_path() is None:
+        summary.detail = (
+            f"claude CLI ({config.claude_code.command!r}) not found on PATH — "
+            "install Claude Code or set claude_code.command in config.yaml"
+        )
+        _fail_all(eligible, summary.detail)
+        return summary
+    auth_ok, auth_detail = client.auth_status()
+    if not auth_ok:
+        summary.detail = auth_detail
+        _fail_all(eligible, summary.detail)
+        return summary
+    if config.claude_code.auto_update_on_start:
+        client.update()
+    registry.refresh_cli_status(client)
+
+    ledger = CostLedger(run_dir / "llm" / LEDGER_FILENAME, config.pv_root)
+    budget = BudgetTracker(settings.budget_usd)
+    schema_by_header = {f.header: f for f in schema_fields}
+    log_event(
+        logger, "llm escalation started", run_id=run_id, memos=len(eligible),
+        mode=settings.mode, budget_usd=settings.budget_usd, workers=settings.workers,
+    )
+
+    with ThreadPoolExecutor(max_workers=settings.workers) as pool:
+        futures = {
+            pool.submit(
+                _escalate_memo, memo, config=config, settings=settings,
+                schema_by_header=schema_by_header, client=client, registry=registry,
+                budget=budget, ledger=ledger, run_id=run_id, run_dir=run_dir,
+            ): memo
+            for memo in eligible
+        }
+        for future, memo in futures.items():
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001 — isolation: one memo never kills the run
+                logger.exception("escalation failed for %s", memo.memo_id)
+                if memo.escalation is not None:
+                    memo.escalation.status = "llm_failed"
+                _flag_first_asset(
+                    memo,
+                    ReviewFlag(
+                        category="llm",
+                        description=f"LLM escalation error: {type(exc).__name__}: {exc}",
+                        severity=FlagSeverity.warning, reviewer_attention=True,
+                    ),
+                )
+
+    summary.executed = True
+    summary.ledger_path = ledger.path
+    for memo in eligible:
+        plan = memo.escalation
+        assert plan is not None
+        summary.memos_escalated += 1
+        if plan.status == "llm_deferred_budget":
+            summary.memos_deferred += 1
+        if plan.status == "llm_failed":
+            summary.memos_failed += 1
+        for attempt in plan.attempts:
+            summary.attempts += 1
+            summary.cache_hits += 1 if attempt.from_cache else 0
+            summary.total_cost_usd += attempt.cost_usd
+            summary.any_actual_costs = summary.any_actual_costs or attempt.cost_source == "actual"
+            label = attempt.job_id + (f":{attempt.session_id}" if attempt.session_id else "")
+            summary.session_labels.append(label)
+    summary.total_cost_usd = round(summary.total_cost_usd, 4)
+    log_event(
+        logger, "llm escalation complete", run_id=run_id,
+        memos=summary.memos_escalated, attempts=summary.attempts,
+        deferred=summary.memos_deferred, failed=summary.memos_failed,
+        cache_hits=summary.cache_hits, total_cost_usd=summary.total_cost_usd,
+    )
+    return summary
+
+
+def _fail_all(memos: list[MemoResult], detail: str) -> None:
+    for memo in memos:
+        if memo.escalation is not None:
+            memo.escalation.status = "llm_failed"
+        _flag_first_asset(
+            memo,
+            ReviewFlag(
+                category="llm", description=f"LLM fallback unavailable: {detail}",
+                severity=FlagSeverity.warning, reviewer_attention=True,
+            ),
+        )

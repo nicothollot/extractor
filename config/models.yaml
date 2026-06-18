@@ -1,0 +1,84 @@
+# Claude Code model menu — the single source of truth for which models the
+# Phase-3 LLM fallback may launch through local `claude` CLI sessions, and the
+# editable price-per-1M-token assumptions the cost ledger uses.
+#
+# These prices are ESTIMATES / config defaults, not sacred constants. Review
+# them against https://claude.com/pricing and update `last_reviewed` when you
+# do. When Claude Code reports actual token usage the ledger uses it; when it
+# does not, costs are computed from these numbers and labeled ESTIMATED.
+#
+# Fields per entry:
+#   alias                    short name used in config/CLI (--llm-model sonnet)
+#   id                       full model id passed to `claude --model` when pinned
+#   latest_alias             true => pass the ALIAS to Claude Code so it floats
+#                            to the newest model of that tier as the CLI updates
+#   pinned                   true => always pass the full id (never float)
+#   requires_explicit_enable true => the AUTO router never selects this model
+#                            unless the user opted in (llm.allow_fable / CLI);
+#                            naming it in MANUAL mode counts as explicit opt-in
+#   default_effort           effort used when nothing else specifies one
+#   pricing_per_mtok         USD per 1M tokens (input / output / cache hit /
+#                            5-minute cache write / 1-hour cache write)
+
+last_reviewed: "2026-06-11"
+
+models:
+  - alias: fable
+    id: claude-fable-5
+    display_name: Claude Fable 5
+    context_window: 1000000
+    default_effort: high
+    latest_alias: true
+    pinned: false
+    requires_explicit_enable: true   # highest-cost tier: explicit user opt-in only
+    pricing_per_mtok:
+      input: 10.00
+      output: 50.00
+      cache_hit: 1.00
+      cache_write_5m: 12.50
+      cache_write_1h: 20.00
+
+  - alias: opus
+    id: claude-opus-4-8
+    display_name: Claude Opus 4.8
+    context_window: 1000000
+    default_effort: high
+    latest_alias: true
+    pinned: false
+    requires_explicit_enable: false
+    pricing_per_mtok:
+      input: 5.00
+      output: 25.00
+      cache_hit: 0.50
+      cache_write_5m: 6.25
+      cache_write_1h: 10.00
+
+  - alias: sonnet
+    id: claude-sonnet-4-6
+    display_name: Claude Sonnet 4.6
+    context_window: 1000000
+    default_effort: medium
+    latest_alias: true
+    pinned: false
+    requires_explicit_enable: false
+    pricing_per_mtok:
+      input: 3.00
+      output: 15.00
+      cache_hit: 0.30
+      cache_write_5m: 3.75
+      cache_write_1h: 6.00
+
+  - alias: haiku
+    id: claude-haiku-4-5
+    display_name: Claude Haiku 4.5
+    context_window: 200000
+    default_effort: low
+    latest_alias: true
+    pinned: false
+    requires_explicit_enable: false
+    pricing_per_mtok:
+      input: 1.00
+      output: 5.00
+      cache_hit: 0.10
+      cache_write_5m: 1.25
+      cache_write_1h: 2.00

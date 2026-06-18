@@ -1,0 +1,127 @@
+"""Validation & QA assembly (D5): runs on the assembled row before writing.
+
+validate_asset chains the layers —
+
+  1. schema checks: type / controlled vocab / range (checks.py)
+  2. table-driven cross-field rules from rules.yaml (rules.py)
+  3. QoQ continuity vs the prior-period row -> THRESHOLD FLAGS (qoq.py)
+  4. hard failures: no valuation value found, in-file as-of mismatch
+  5. QA verdict: qa_fail (any hard failure) / qa_pass_with_flags / qa_pass,
+     plus the QA band cells (QA Status, Extraction Flags Count, Reviewer
+     Attention) appended as computed hits
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+
+from pv_extractor.config import Config
+from pv_extractor.models import (
+    FieldHit,
+    FlagSeverity,
+    QaStatus,
+    ReviewFlag,
+    SchemaField,
+    VerifyResult,
+)
+from pv_extractor.validate.checks import check_hits
+from pv_extractor.validate.qoq import qoq_checks
+from pv_extractor.validate.rules import RuleSet, load_rules, run_rules
+
+__all__ = ["ValidatedAsset", "load_rules", "RuleSet", "validate_asset"]
+
+# A memo with NONE of these populated has no valuation value -> qa_fail.
+_VALUATION_VALUE_HEADERS = (
+    "Fund Share Equity Value ($M)",
+    "Implied Equity Value 100% ($M)",
+    "Implied EV ($M)",
+    "WF Selected Value ($M)",
+    "Cap Implied Asset Value ($M, USD)",
+    "Cap Implied Asset Value ($M, local)",
+    "Yield Cost + Accrued ($M, local)",
+)
+
+
+@dataclass
+class ValidatedAsset:
+    hits: list[FieldHit]  # including THRESHOLD FLAGS + QA band cells
+    flags: list[ReviewFlag]
+    qa_status: QaStatus
+
+
+def validate_asset(
+    *,
+    hits: list[FieldHit],
+    extraction_flags: list[ReviewFlag],
+    schema_by_header: dict[str, SchemaField],
+    config: Config,
+    ruleset: RuleSet,
+    routing_table: dict[str, list[str]],
+    as_of_date: date | None,
+    verify: VerifyResult | None,
+    prior_row: dict[str, object] | None,
+) -> ValidatedAsset:
+    validation = config.validation
+    flags: list[ReviewFlag] = list(extraction_flags)
+
+    flags.extend(check_hits(hits, schema_by_header, validation, as_of_date, ruleset.ranges))
+    flags.extend(run_rules(hits, ruleset, routing_table))
+
+    threshold_hits, qoq_flags = qoq_checks(hits, prior_row, schema_by_header, validation)
+    flags.extend(qoq_flags)
+    all_hits = [*hits, *threshold_hits]
+
+    # --- hard failures ---
+    populated = {hit.field for hit in all_hits if hit.value is not None}
+    if not populated & set(_VALUATION_VALUE_HEADERS):
+        flags.append(
+            ReviewFlag(
+                category="qa",
+                description="no valuation value found (none of the headline/methodology value fields populated)",
+                severity=FlagSeverity.hard_fail,
+                reviewer_attention=True,
+            )
+        )
+    if (
+        verify is not None
+        and verify.asof_date is not None
+        and as_of_date is not None
+        and verify.asof_date != as_of_date
+    ):
+        flags.append(
+            ReviewFlag(
+                category="qa",
+                description=(
+                    f"as-of date inside the document ({verify.asof_date.isoformat()}) does not match "
+                    f"the target period ({as_of_date.isoformat()})"
+                ),
+                severity=FlagSeverity.hard_fail,
+                reviewer_attention=True,
+            )
+        )
+
+    if any(flag.severity is FlagSeverity.hard_fail for flag in flags):
+        qa_status = QaStatus.qa_fail
+    elif flags:
+        qa_status = QaStatus.qa_pass_with_flags
+    else:
+        qa_status = QaStatus.qa_pass
+
+    for header, value in (
+        ("QA Status", qa_status.value),
+        ("Extraction Flags Count", len(flags)),
+        ("Reviewer Attention", "Y" if any(f.reviewer_attention for f in flags) else "N"),
+    ):
+        field = schema_by_header.get(header)
+        if field is not None:
+            all_hits.append(
+                FieldHit(
+                    field=header, col_index=field.col_index, band=field.band,
+                    value=value, method="computed", confidence=1.0,
+                    evidence="QA assembly",
+                )
+            )
+
+    all_hits.sort(key=lambda hit: hit.col_index)
+    return ValidatedAsset(hits=all_hits, flags=flags, qa_status=qa_status)

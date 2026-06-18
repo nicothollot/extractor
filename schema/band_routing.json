@@ -1,0 +1,36 @@
+{
+  "derived_from": "Primary Methodology / Secondary Methodology controlled vocab (METHODOLOGY ROUTING band)",
+  "routing": {
+    "DCF": [
+      "METHODOLOGY: DCF"
+    ],
+    "Multiple-Market": [
+      "METHODOLOGY: MULTIPLE",
+      "TRADING COMPS (POSITIONAL SLOTS)"
+    ],
+    "Multiple-Transaction": [
+      "METHODOLOGY: MULTIPLE",
+      "TRANSACTION COMPS (POSITIONAL SLOTS)"
+    ],
+    "Cap Rate": [
+      "METHODOLOGY: CAP RATE"
+    ],
+    "Yield/Spread": [
+      "METHODOLOGY: YIELD / CREDIT"
+    ],
+    "Waterfall": [
+      "METHODOLOGY: WATERFALL / STRUCTURED EQUITY"
+    ],
+    "Cost+Accrued": [
+      "METHODOLOGY: YIELD / CREDIT"
+    ],
+    "Recent Tx Price": [
+      "CALIBRATION (ENTRY-PRICE ANCHOR)"
+    ],
+    "Cost": [
+      "RETURNS",
+      "CALIBRATION (ENTRY-PRICE ANCHOR)",
+      "METHODOLOGY: YIELD / CREDIT"
+    ]
+  }
+}

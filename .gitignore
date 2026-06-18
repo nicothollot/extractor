@@ -1,0 +1,9 @@
+.venv/
+output/
+# Machine-specific config: each checkout keeps its own. Seed it from
+# config.example.yaml (scripts/bootstrap.py does this on first run).
+config.yaml
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/

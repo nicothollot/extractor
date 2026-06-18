@@ -1,0 +1,84 @@
+# Cross-field validation rules (D5) — table-driven; the engine in
+# src/pv_extractor/validate/rules.py interprets `type`. Field names are the
+# schema row-2 headers, verbatim. Tolerances here override the validation.*
+# defaults in config.yaml for the specific rule.
+#
+# Rule types:
+#   weights_sum           sum of present fields == target +/- tolerance
+#   linear_equation       "A - B = C" (or +) within relative_tolerance
+#   ratio                 result == numerator / denominator * scale
+#   min_value             field must be > / >= a bound when present
+#   flag_when_false       boolean field False => flag
+#   routing_consistency   populated methodology bands must match the
+#                         Primary/Secondary Methodology routing table
+
+rules:
+  - name: method_weights_sum_100
+    type: weights_sum
+    fields:
+      - "Primary Method Weight %"
+      - "Secondary Method Weight %"
+      - "Tertiary Method Weight %"
+    target: 100.0
+    tolerance: 1.0                  # 100 +/- 1
+    severity: warning
+    reviewer_attention: true
+
+  - name: equity_bridge
+    type: linear_equation
+    expression: "Implied EV ($M) - Net Debt ($M) = Implied Equity Value 100% ($M)"
+    relative_tolerance: 0.02        # default from validation.equity_bridge_tolerance
+    severity: warning
+    reviewer_attention: true
+
+  - name: ebitda_margin_consistency
+    type: ratio
+    numerator: "EBITDA ($M)"
+    denominator: "Revenue ($M)"
+    result: "EBITDA Margin %"
+    scale: 100.0
+    relative_tolerance: 0.02
+    severity: warning
+
+  - name: fx_rate_positive
+    type: min_value
+    field: "FX Rate (Current)"
+    min: 0.0
+    exclusive: true                 # rate must be strictly > 0
+    severity: warning
+
+  - name: fx_rate_prior_positive
+    type: min_value
+    field: "FX Rate (Prior Qtr)"
+    min: 0.0
+    exclusive: true
+    severity: warning
+
+  - name: ownership_non_negative
+    type: min_value
+    field: "Ownership %"
+    min: 0.0
+    severity: warning
+
+  - name: bridge_reconciles
+    type: flag_when_false
+    field: "Bridge Reconciles Y/N"
+    description: "QoQ bridge deltas do not sum to NAV Change Abs within tolerance"
+    severity: warning
+    reviewer_attention: true
+
+  - name: methodology_routing_consistency
+    type: routing_consistency
+    severity: warning
+    reviewer_attention: true
+
+# Per-field range overrides for the generic schema checks (extends the
+# defaults: percents in validation.percent_range, weights >= 0, dates in
+# [validation.date_year_min, as-of + validation.date_max_years_after_asof]).
+ranges:
+  "DLOM %": { min: 0.0, max: 60.0 }
+  "DLOC %": { min: 0.0, max: 60.0 }
+  "Primary Method Weight %": { min: 0.0, max: 100.0 }
+  "Secondary Method Weight %": { min: 0.0, max: 100.0 }
+  "Tertiary Method Weight %": { min: 0.0, max: 100.0 }
+  "Capacity Utilization %": { min: 0.0, max: 120.0 }

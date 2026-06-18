@@ -1,0 +1,70 @@
+/* ============================================================================
+   PV Extractor — Houlihan Lokey design tokens
+   SINGLE SOURCE OF TRUTH for color/spacing/typography custom properties.
+   Tailwind maps onto these in src/index.css (@theme inline); components must
+   never hardcode hex values.
+
+   Palette is the official Houlihan Lokey brand (2025 brand guide /
+   company-brand skill). Oxford Blue is the anchor; Sapphire & Tufts blues are
+   restrained accents; Roman Silver & Independence drive neutral UI.
+   ========================================================================== */
+
+:root {
+  /* --- brand: Oxford Blue anchor + blue accents --- */
+  --hl-navy: #002855;          /* Oxford Blue — anchor: sidebar, headers, primary buttons */
+  --hl-navy-deep: #001a39;     /* deeper Oxford for gradients / pressed states */
+  --hl-blue: #0067a5;          /* Sapphire Blue — primary accent (active, links, progress) */
+  --hl-blue-bright: #24a4f2;   /* Azure Blue — sparing bright highlight */
+  --hl-globe: #4f8bc9;         /* Tufts Blue — matches the logo globe; accents on dark navy */
+
+  /* --- neutral cool-gray ramp (anchored to Roman Silver / Independence) --- */
+  --hl-gray-50: #f5f7f9;
+  --hl-gray-100: #eaeef2;
+  --hl-gray-200: #d9dfe6;      /* default borders */
+  --hl-gray-300: #bcc5cf;
+  --hl-gray-400: #99a3b0;
+  --hl-gray-500: #7e8597;      /* Roman Silver */
+  --hl-gray-600: #525766;      /* Independence */
+  --hl-gray-700: #3b414f;
+  --hl-gray-800: #272f3b;
+  --hl-gray-900: #16202b;
+
+  /* --- status (HL secondary palette: green / sunburst / rust / sapphire) --- */
+  --hl-success: #508225;       /* Maximum Green */
+  --hl-success-soft: #eaf1e1;
+  --hl-warning: #8c7337;       /* Metallic Sunburst */
+  --hl-warning-soft: #f3ecdc;
+  --hl-error: #b54e15;         /* Rust */
+  --hl-error-soft: #f6e7dc;
+  --hl-info: #0067a5;          /* Sapphire Blue */
+  --hl-info-soft: #e2eef5;
+
+  /* --- surfaces --- */
+  --hl-paper: #ffffff;
+  --hl-surface: #f4f6f9;
+  --hl-border: var(--hl-gray-200);
+  --hl-border-strong: var(--hl-gray-300);
+
+  /* --- typography: Segoe UI is the HL app default; Inter (self-hosted) is the
+         cross-platform fallback so non-Windows still renders cleanly --- */
+  --hl-font-sans: "Segoe UI", "Inter Variable", "Inter", system-ui, -apple-system, sans-serif;
+  --hl-font-mono: ui-monospace, "Cascadia Mono", "Consolas", "Segoe UI Mono", monospace;
+
+  /* --- 8px spacing grid --- */
+  --hl-space-1: 8px;
+  --hl-space-2: 16px;
+  --hl-space-3: 24px;
+  --hl-space-4: 32px;
+  --hl-space-6: 48px;
+
+  /* --- elevation: 1px borders by default; shadow only on interactive lift,
+         tinted with Oxford Blue for a cohesive enterprise feel --- */
+  --hl-shadow-lift: 0 2px 10px rgba(0, 40, 85, 0.10), 0 1px 2px rgba(0, 40, 85, 0.06);
+  --hl-radius: 6px;
+  --hl-radius-lg: 10px;
+
+  /* --- motion (≤200ms; gated by prefers-reduced-motion in index.css) --- */
+  --hl-ease: cubic-bezier(0.2, 0, 0, 1);
+  --hl-dur-fast: 120ms;
+  --hl-dur: 180ms;
+}

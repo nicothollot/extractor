@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 --version)",
+      "Read(//usr/bin/**)",
+      "Bash(python3 -m venv /home/nthollo26/dev/pv-extractor/.venv)",
+      "Bash(/home/nthollo26/dev/pv-extractor/.venv/bin/pip install *)",
+      "Bash(/home/nthollo26/dev/pv-extractor/.venv/bin/python -c \"import openpyxl; print\\('openpyxl', openpyxl.__version__\\)\")",
+      "Bash(/home/nthollo26/dev/pv-extractor/.venv/bin/python /tmp/inspect_refs.py)",
+      "Bash(sed -i 's/dims={ws.dimensions} //; s/dims={ws.dimensions}//' inspect_refs.py)",
+      "Bash(/home/nthollo26/dev/pv-extractor/.venv/bin/python inspect_refs.py)",
+      "Bash(/home/nthollo26/dev/pv-extractor/.venv/bin/pv-extractor --help)",
+      "Bash(claude auth *)"
+    ]
+  }
+}

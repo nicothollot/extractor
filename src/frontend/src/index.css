@@ -1,0 +1,96 @@
+@import "tailwindcss";
+@import "./theme/tokens.css";
+
+/* Map Tailwind utilities onto the HL tokens — tokens.css stays the single
+   source of truth; nothing below defines a new color. */
+@theme inline {
+  --color-navy: var(--hl-navy);
+  --color-navy-deep: var(--hl-navy-deep);
+  --color-accent: var(--hl-blue);
+  --color-accent-bright: var(--hl-blue-bright);
+  --color-globe: var(--hl-globe);
+  --color-paper: var(--hl-paper);
+  --color-surface: var(--hl-surface);
+  --color-line: var(--hl-border);
+  --color-line-strong: var(--hl-border-strong);
+  --color-ink-50: var(--hl-gray-50);
+  --color-ink-100: var(--hl-gray-100);
+  --color-ink-200: var(--hl-gray-200);
+  --color-ink-300: var(--hl-gray-300);
+  --color-ink-400: var(--hl-gray-400);
+  --color-ink-500: var(--hl-gray-500);
+  --color-ink-600: var(--hl-gray-600);
+  --color-ink-700: var(--hl-gray-700);
+  --color-ink-800: var(--hl-gray-800);
+  --color-ink-900: var(--hl-gray-900);
+  --color-ok: var(--hl-success);
+  --color-ok-soft: var(--hl-success-soft);
+  --color-warn: var(--hl-warning);
+  --color-warn-soft: var(--hl-warning-soft);
+  --color-err: var(--hl-error);
+  --color-err-soft: var(--hl-error-soft);
+  --color-info: var(--hl-info);
+  --color-info-soft: var(--hl-info-soft);
+  --font-sans: var(--hl-font-sans);
+  --font-mono: var(--hl-font-mono);
+  --radius-card: var(--hl-radius);
+  --radius-panel: var(--hl-radius-lg);
+  --shadow-lift: var(--hl-shadow-lift);
+}
+
+html {
+  font-family: var(--hl-font-sans);
+  background: var(--hl-surface);
+  color: var(--hl-gray-900);
+  font-size: 14px;
+}
+
+/* Determinate, restrained skeletons (tables never show spinners). */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--hl-gray-100) 25%,
+    var(--hl-gray-200) 50%,
+    var(--hl-gray-100) 75%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-sweep 1.4s ease-in-out infinite;
+  border-radius: 4px;
+}
+
+@keyframes skeleton-sweep {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+/* HL loading mark: the official globe sits still while a Sapphire arc orbits
+   it. Brand-safe — the logo itself is never rotated or distorted. */
+.hl-spin-ring {
+  animation: hl-spin 0.9s linear infinite;
+  transform-origin: center;
+}
+.hl-mark-pulse {
+  animation: hl-mark-pulse 1.8s var(--hl-ease) infinite;
+  transform-origin: center;
+}
+@keyframes hl-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes hl-mark-pulse {
+  0%, 100% { opacity: 0.85; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton { animation: none; }
+  .hl-spin-ring, .hl-mark-pulse { animation: none; }
+  * { transition-duration: 0.01ms !important; }
+}
+
+/* Interactive elevation: 1px borders at rest, shadow only on hover lift. */
+.lift {
+  transition: box-shadow var(--hl-dur) var(--hl-ease), transform var(--hl-dur) var(--hl-ease);
+}
+.lift:hover {
+  box-shadow: var(--hl-shadow-lift);
+}

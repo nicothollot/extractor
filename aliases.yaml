@@ -1,0 +1,28 @@
+# Alias table for client and deal/asset name matching (user-extensible).
+# Keys are canonical folder names as they appear on the PV share; values are
+# known operating names, short names, and codenames. Matching is normalized
+# (lowercase, punctuation stripped) and fuzzy (token_set_ratio) on top of this.
+
+clients:
+  Angelo Gordon:
+    - AG
+    - TPG Angelo Gordon
+  Angeles Investments:
+    - Angeles
+  Apollo Global Management:
+    - Apollo
+    - AGM
+
+deals:
+  T.D. Williamson:
+    - TDW
+    - TD Williamson
+  Summit Ridge Energy:
+    - SRE
+  Digital Edge:
+    - DE
+  AIOF II ANRP III:
+    - AIOF II / ANRP III
+    - AIOF ANRP
+    - AIOF II
+    - ANRP III

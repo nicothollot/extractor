@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pv-extractor"
+version = "0.1.0"
+description = "Locate client-provided valuation documents on the PV share and extract structured fields into a master Excel index. Phase 1: schema compiler, file index, document locator."
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl==3.1.5",
+    "pymupdf==1.27.2.3",
+    "rapidfuzz==3.14.5",
+    "pydantic==2.13.4",
+    "typer==0.26.7",
+    "python-dateutil==2.9.0.post0",
+    "rich==15.0.0",
+    "PyYAML==6.0.3",
+    # Phase 2: document readers + local OCR (models ship locally; no cloud calls)
+    "pdfplumber==0.11.9",
+    "python-docx==1.2.0",
+    "python-pptx==1.0.2",
+    "rapidocr==3.8.3",
+    "onnxruntime==1.26.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.0.3", "httpx==0.28.1"]
+# Optional alternative OCR engine (requires a system tesseract install).
+tesseract = ["pytesseract"]
+# Phase 4: local analyst GUI (FastAPI on 127.0.0.1 + built React frontend).
+gui = [
+    "fastapi==0.121.3",
+    "uvicorn[standard]==0.34.0",
+    "ruamel.yaml==0.18.10",
+]
+
+[project.scripts]
+pv-extractor = "pv_extractor.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "perf: performance smoke tests (larger synthetic index)",
+    "live: hits the real local Claude Code CLI (skipped unless PV_LIVE_CLAUDE_CODE_TESTS=1 and `claude auth status` passes)",
+]

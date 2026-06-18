@@ -1,0 +1,610 @@
+"""Background job manager for the GUI.
+
+Every long operation is a job with an id, persisted in
+output_dir/gui/jobs.sqlite (jobs + events tables) so the app is
+refresh-safe: reopening the browser reattaches to a running job by
+replaying its event log and subscribing to the live stream.
+
+Pipeline jobs (kind="run") execute pv_extractor.run.run — the exact
+function the CLI calls — on a dedicated single-slot executor, so at most
+one pipeline run is active at a time (the PV share and the local CPU are
+both contended resources). Progress arrives through two channels:
+
+  * the RunControl seam (structured stage events per memo lane), and
+  * a logging bridge that forwards pv_extractor.* JSONL log records as
+    "log" events (the GUI log tail) and turns escalation milestones into
+    "cost_tick" events by re-reading the run's cost ledger.
+
+Events carry identifiers and counters only — never memo content, client
+document text, or page payload (hard rule: INFO-level redaction applies to
+the GUI event stream too; client/deal names are workbook metadata, not
+document content).
+
+Cancellation is graceful by construction: it sets the RunControl cancel
+event, the in-flight memo finishes, the rest are marked DEFERRED, and the
+run still writes its workbook/audits for everything completed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import logging
+import sqlite3
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+
+from pv_extractor.api.schemas import (
+    JobEvent,
+    JobInfo,
+    LlmRunOptions,
+    MultiSearchRunRequest,
+    RunRequest,
+)
+from pv_extractor.config import Config
+from pv_extractor.indexer import db
+from pv_extractor.io_guard import assert_write_allowed, guarded_open_write
+from pv_extractor.llm.costs import LEDGER_FILENAME, read_ledger, summarize_ledger
+from pv_extractor.run import RunControl, RunReport, run as run_pipeline
+
+logger = logging.getLogger(__name__)
+
+_PIPELINE_KINDS = {"run", "multi_run"}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class _JobLogBridge(logging.Handler):
+    """Forwards pv_extractor log records emitted during a pipeline job to
+    the job's event stream (log tail + cost ticks). Attached for the
+    duration of one job only; pipeline jobs are serialized so records
+    cannot belong to another run."""
+
+    def __init__(self, manager: "JobManager", job_id: str, run_dir: Path | None) -> None:
+        super().__init__(level=logging.INFO)
+        self.manager = manager
+        self.job_id = job_id
+        self.run_dir = run_dir
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D102
+        try:
+            fields = getattr(record, "extra_fields", None)
+            payload = {
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            }
+            if isinstance(fields, dict):
+                payload.update({k: v for k, v in fields.items() if _json_safe(v)})
+            self.manager.emit_event(self.job_id, "log", payload)
+            if (
+                record.name == "pv_extractor.llm.escalate"
+                and record.getMessage() in ("memo escalation finished", "llm escalation complete")
+                and self.run_dir is not None
+            ):
+                ledger_path = self.run_dir / "llm" / LEDGER_FILENAME
+                if ledger_path.exists():
+                    summary = summarize_ledger(read_ledger(ledger_path))
+                    self.manager.emit_event(self.job_id, "cost_tick", summary)
+        except Exception:  # noqa: BLE001 — the bridge must never break the run
+            pass
+
+
+def _json_safe(value: object) -> bool:
+    try:
+        json.dumps(value, default=str)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+class JobManager:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.db_path = Path(config.output_dir) / "gui" / "jobs.sqlite"
+        assert_write_allowed(self.db_path, config.pv_root)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._db_lock = threading.Lock()
+        self._init_schema()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._listeners: dict[str, set[asyncio.Queue]] = {}
+        self._listeners_lock = threading.Lock()
+        self._cancel_events: dict[str, threading.Event] = {}
+        # One slot: at most one pipeline run at a time (share + CPU contention).
+        self._pipeline_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pv-gui-run")
+        self._utility_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pv-gui-util")
+        self._mark_stale_jobs()
+
+    # ------------------------------------------------------------------
+    # persistence
+    # ------------------------------------------------------------------
+
+    def _init_schema(self) -> None:
+        with self._db_lock:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    run_id TEXT,
+                    params_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS job_events (
+                    job_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    ts TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (job_id, seq)
+                );
+                """
+            )
+            self._conn.commit()
+
+    def _mark_stale_jobs(self) -> None:
+        """Jobs left 'running' by a previous process can no longer finish."""
+        with self._db_lock:
+            self._conn.execute(
+                "UPDATE jobs SET status = 'interrupted', finished_at = ? "
+                "WHERE status IN ('queued', 'running', 'cancelling')",
+                (_now(),),
+            )
+            self._conn.commit()
+
+    def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def _update(self, job_id: str, **cols: object) -> None:
+        sets = ", ".join(f"{k} = ?" for k in cols)
+        with self._db_lock:
+            self._conn.execute(f"UPDATE jobs SET {sets} WHERE id = ?", (*cols.values(), job_id))
+            self._conn.commit()
+
+    def get(self, job_id: str) -> JobInfo | None:
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT id, kind, status, created_at, started_at, finished_at, run_id, "
+                "params_json, result_json, error FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            seq_row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM job_events WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return JobInfo(
+            id=row[0], kind=row[1], status=row[2], created_at=row[3], started_at=row[4],
+            finished_at=row[5], run_id=row[6], params=json.loads(row[7]),
+            result=json.loads(row[8]) if row[8] else None, error=row[9],
+            last_seq=seq_row[0],
+        )
+
+    def list_jobs(self, *, kind: str | None = None, limit: int = 50) -> list[JobInfo]:
+        sql = (
+            "SELECT id FROM jobs"
+            + (" WHERE kind = ?" if kind else "")
+            + " ORDER BY created_at DESC LIMIT ?"
+        )
+        args = (kind, limit) if kind else (limit,)
+        with self._db_lock:
+            ids = [r[0] for r in self._conn.execute(sql, args).fetchall()]
+        return [info for job_id in ids if (info := self.get(job_id)) is not None]
+
+    def events_since(self, job_id: str, since: int = 0, limit: int = 2000) -> list[JobEvent]:
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT seq, ts, type, payload_json FROM job_events "
+                "WHERE job_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+                (job_id, since, limit),
+            ).fetchall()
+        return [JobEvent(seq=r[0], ts=r[1], type=r[2], payload=json.loads(r[3])) for r in rows]
+
+    # ------------------------------------------------------------------
+    # event stream
+    # ------------------------------------------------------------------
+
+    def emit_event(self, job_id: str, event_type: str, payload: dict) -> None:
+        """Persist + broadcast one event. Callable from any thread."""
+        entry = json.dumps(payload, ensure_ascii=False, default=str)
+        with self._db_lock:
+            seq_row = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM job_events WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            seq = seq_row[0]
+            self._conn.execute(
+                "INSERT INTO job_events (job_id, seq, ts, type, payload_json) VALUES (?, ?, ?, ?, ?)",
+                (job_id, seq, _now(), event_type, entry),
+            )
+            self._conn.commit()
+        event = JobEvent(seq=seq, ts=_now(), type=event_type, payload=json.loads(entry))
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        with self._listeners_lock:
+            queues = list(self._listeners.get(job_id, ()))
+        for queue in queues:
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    def subscribe(self, job_id: str) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        with self._listeners_lock:
+            self._listeners.setdefault(job_id, set()).add(queue)
+        return queue
+
+    def unsubscribe(self, job_id: str, queue: asyncio.Queue) -> None:
+        with self._listeners_lock:
+            self._listeners.get(job_id, set()).discard(queue)
+
+    # ------------------------------------------------------------------
+    # job lifecycle
+    # ------------------------------------------------------------------
+
+    def active_pipeline_job(self) -> JobInfo | None:
+        placeholders = ", ".join("?" for _ in _PIPELINE_KINDS)
+        with self._db_lock:
+            row = self._conn.execute(
+                f"SELECT id FROM jobs WHERE kind IN ({placeholders}) "
+                "AND status IN ('queued', 'running', 'cancelling') "
+                "ORDER BY created_at DESC LIMIT 1",
+                tuple(_PIPELINE_KINDS),
+            ).fetchone()
+        return self.get(row[0]) if row else None
+
+    def _create(self, kind: str, params: dict) -> JobInfo:
+        job_id = f"JOB_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}"
+        with self._db_lock:
+            self._conn.execute(
+                "INSERT INTO jobs (id, kind, status, created_at, params_json) VALUES (?, ?, 'queued', ?, ?)",
+                (job_id, kind, _now(), json.dumps(params, ensure_ascii=False, default=str)),
+            )
+            self._conn.commit()
+        info = self.get(job_id)
+        assert info is not None
+        return info
+
+    def start_run(self, request: RunRequest) -> JobInfo:
+        """Queue one pipeline run; refuses while another is active."""
+        if self.active_pipeline_job() is not None:
+            raise JobConflict("a pipeline run is already active")
+        job = self._create("run", request.model_dump(mode="json"))
+        cancel = threading.Event()
+        self._cancel_events[job.id] = cancel
+        self._pipeline_pool.submit(self._execute_run, job.id, request, cancel)
+        return job
+
+    def start_multi_run(self, request: MultiSearchRunRequest) -> JobInfo:
+        """Queue one firm-level batch run (Phase C); refuses while another
+        pipeline run is active (same single-slot guard as start_run). The whole
+        batch is ONE pipeline run / ONE workbook, with events laned by firm."""
+        if self.active_pipeline_job() is not None:
+            raise JobConflict("a pipeline run is already active")
+        job = self._create("multi_run", request.model_dump(mode="json"))
+        cancel = threading.Event()
+        self._cancel_events[job.id] = cancel
+        self._pipeline_pool.submit(self._execute_multi_run, job.id, request, cancel)
+        return job
+
+    def start_utility(self, kind: str, params: dict, fn) -> JobInfo:
+        """Non-pipeline job (claude update, dependency install, index scan).
+        fn() -> dict result; an fn that accepts one argument instead receives
+        emit(event_type, payload) for live progress events; an fn that accepts
+        two also receives should_stop() — a cooperative pause flag set by
+        cancel() (the scan job uses it to commit what it has and stop)."""
+        job = self._create(kind, params)
+        cancel = threading.Event()
+        self._cancel_events[job.id] = cancel
+        self._utility_pool.submit(self._execute_utility, job.id, fn, cancel)
+        return job
+
+    def cancel(self, job_id: str) -> JobInfo | None:
+        job = self.get(job_id)
+        if job is None or job.status not in ("queued", "running"):
+            return job
+        event = self._cancel_events.get(job_id)
+        if event is not None:
+            event.set()
+            self._update(job_id, status="cancelling")
+            self.emit_event(job_id, "cancel_requested", {})
+        else:
+            self._update(job_id, status="cancelled", finished_at=_now())
+        return self.get(job_id)
+
+    # ------------------------------------------------------------------
+    # execution (worker threads)
+    # ------------------------------------------------------------------
+
+    def _execute_utility(self, job_id: str, fn, cancel: threading.Event) -> None:
+        self._update(job_id, status="running", started_at=_now())
+        try:
+            emit = lambda event_type, payload: self.emit_event(job_id, event_type, payload)  # noqa: E731
+            n_params = len(inspect.signature(fn).parameters)
+            if n_params >= 2:
+                result = fn(emit, cancel.is_set)
+            elif n_params == 1:
+                result = fn(emit)
+            else:
+                result = fn()
+            # A cooperative pause still returns a (partial) result worth keeping.
+            status = "cancelled" if cancel.is_set() else "completed"
+            self._update(
+                job_id, status=status, finished_at=_now(),
+                result_json=json.dumps(result, ensure_ascii=False, default=str),
+            )
+            self.emit_event(job_id, "done", {"status": status})
+        except Exception as exc:  # noqa: BLE001 — job isolation
+            logger.exception("utility job %s failed", job_id)
+            self._update(job_id, status="failed", finished_at=_now(), error=f"{type(exc).__name__}: {exc}")
+            self.emit_event(job_id, "done", {"status": "failed", "error": str(exc)})
+        finally:
+            self._cancel_events.pop(job_id, None)
+
+    def _execute_run(self, job_id: str, request: RunRequest, cancel: threading.Event) -> None:
+        from pv_extractor.llm.escalate import resolve_settings
+
+        self._update(job_id, status="running", started_at=_now())
+        now = datetime.now()
+        run_id = f"RUN_{now:%Y%m%d_%H%M%S}"
+        run_dir = None if request.dry_run else Path(self.config.output_dir) / run_id
+        self._update(job_id, run_id=run_id)
+
+        control = RunControl(
+            on_event=lambda event, fields: self.emit_event(job_id, event, dict(fields)),
+            cancel_event=cancel,
+        )
+        bridge = _JobLogBridge(self, job_id, run_dir)
+        pv_logger = logging.getLogger("pv_extractor")
+        pv_logger.addHandler(bridge)
+        try:
+            llm = request.llm
+            settings = resolve_settings(
+                self.config,
+                no_llm=not llm.enabled,
+                mode=llm.mode, model=llm.model, effort=llm.effort,
+                budget=llm.budget_usd, force=llm.force_llm,
+                force_assist=llm.force_llm_assist, allow_fable=llm.allow_fable,
+            )
+            exclude = {(slot.client, slot.deal) for slot in request.exclude}
+            # Multiple doc types and/or periods -> fan out into per-slot work
+            # (one workbook). A single doc type + period stays on the legacy path.
+            from pv_extractor.api import run_slots as _rs
+
+            if _rs.needs_expansion(request.doc_type, request.doc_types, request.period, request.periods):
+                conn = db.open_db(self.config.db_path, self.config.pv_root)
+                try:
+                    slots = _rs.build_run_slots(
+                        conn, self.config,
+                        scope=request.scope, client=request.client, deal=request.deal,
+                        exclude=exclude, doc_type=request.doc_type, doc_types=request.doc_types,
+                        period=request.period, periods=request.periods,
+                        restrict_to_client_sourced=request.restrict_to_client_sourced,
+                    )
+                finally:
+                    conn.close()
+                report = run_pipeline(
+                    self.config, scope=request.scope, period=request.period,
+                    template=request.template, dry_run=request.dry_run, force=request.force,
+                    now=now, llm_settings=settings, control=control, slots=slots,
+                )
+            else:
+                report = run_pipeline(
+                    self.config,
+                    scope=request.scope, period=request.period,
+                    client=request.client, deal=request.deal, doc_type=request.doc_type,
+                    restrict_to_client_sourced=request.restrict_to_client_sourced,
+                    template=request.template, dry_run=request.dry_run, force=request.force,
+                    now=now, llm_settings=settings, control=control, exclude=exclude,
+                )
+            result = _report_summary(report, request)
+            if not request.dry_run and report.run_dir is not None:
+                _write_run_summary(report, request, self.config, cancelled=cancel.is_set())
+            status = "cancelled" if cancel.is_set() else "completed"
+            self._update(
+                job_id, status=status, finished_at=_now(),
+                result_json=json.dumps(result, ensure_ascii=False, default=str),
+            )
+            self.emit_event(job_id, "done", {"status": status})
+        except Exception as exc:  # noqa: BLE001 — job isolation
+            logger.exception("run job %s failed", job_id)
+            self._update(job_id, status="failed", finished_at=_now(), error=f"{type(exc).__name__}: {exc}")
+            self.emit_event(job_id, "done", {"status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            pv_logger.removeHandler(bridge)
+            self._cancel_events.pop(job_id, None)
+
+    def _execute_multi_run(
+        self, job_id: str, request: MultiSearchRunRequest, cancel: threading.Event
+    ) -> None:
+        """Firm-level batch run (Phase C): expand the request into RunSlot,
+        drive ONE pipeline run over them (slots path), reusing the exact
+        event/cancel/cost-bridge machinery as the single-firm run."""
+        from pv_extractor.api import multi_search_service
+        from pv_extractor.llm.escalate import resolve_settings
+
+        self._update(job_id, status="running", started_at=_now())
+        now = datetime.now()
+        run_id = f"RUN_{now:%Y%m%d_%H%M%S}"
+        run_dir = None if request.dry_run else Path(self.config.output_dir) / run_id
+        self._update(job_id, run_id=run_id)
+
+        control = RunControl(
+            on_event=lambda event, fields: self.emit_event(job_id, event, dict(fields)),
+            cancel_event=cancel,
+        )
+        bridge = _JobLogBridge(self, job_id, run_dir)
+        pv_logger = logging.getLogger("pv_extractor")
+        pv_logger.addHandler(bridge)
+        try:
+            conn = db.open_db(self.config.db_path, self.config.pv_root)
+            try:
+                slots = multi_search_service.expand_slots(conn, self.config, request)
+            finally:
+                conn.close()
+            llm = request.llm
+            settings = resolve_settings(
+                self.config,
+                no_llm=not llm.enabled,
+                mode=llm.mode, model=llm.model, effort=llm.effort,
+                budget=llm.budget_usd, force=llm.force_llm,
+                force_assist=llm.force_llm_assist, allow_fable=llm.allow_fable,
+            )
+            # The slots path ignores scope/period/client/deal/doc_type for
+            # pairing (it pairs off `slots`); pass benign placeholders.
+            report = run_pipeline(
+                self.config,
+                scope="all", period="",
+                template=request.template, dry_run=request.dry_run, force=request.force,
+                now=now, llm_settings=settings, control=control, slots=slots,
+            )
+            result = _multi_report_summary(report, request, len(slots))
+            if not request.dry_run and report.run_dir is not None:
+                _write_multi_run_summary(report, request, self.config, len(slots), cancelled=cancel.is_set())
+            status = "cancelled" if cancel.is_set() else "completed"
+            self._update(
+                job_id, status=status, finished_at=_now(),
+                result_json=json.dumps(result, ensure_ascii=False, default=str),
+            )
+            self.emit_event(job_id, "done", {"status": status})
+        except Exception as exc:  # noqa: BLE001 — job isolation
+            logger.exception("multi-run job %s failed", job_id)
+            self._update(job_id, status="failed", finished_at=_now(), error=f"{type(exc).__name__}: {exc}")
+            self.emit_event(job_id, "done", {"status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            pv_logger.removeHandler(bridge)
+            self._cancel_events.pop(job_id, None)
+
+
+class JobConflict(RuntimeError):
+    """A pipeline run is already active (single-slot executor)."""
+
+
+# ---------------------------------------------------------------------------
+# run summaries
+# ---------------------------------------------------------------------------
+
+
+def _report_summary(report: RunReport, request: RunRequest) -> dict:
+    coverage_counts: dict[str, int] = {}
+    for entry in report.coverage:
+        coverage_counts[entry.status] = coverage_counts.get(entry.status, 0) + 1
+    llm = report.llm
+    # Human-readable digest pieces for the Output browser list/preview: the
+    # fund managers and deals that actually produced rows, plus the portfolio
+    # companies named on the extracted assets (all from the run's own memos —
+    # no re-reading of the share).
+    clients = sorted({m.client for m in report.memos if m.client})
+    deals = sorted({m.deal for m in report.memos if m.deal})
+    companies = sorted({
+        str(a.asset_name) for m in report.memos for a in m.assets if a.asset_name
+    })
+    return {
+        "run_id": report.run_id,
+        "dry_run": report.dry_run,
+        "scope": request.scope,
+        "client": request.client,
+        "deal": request.deal,
+        "period": request.period,
+        "doc_type": request.doc_type.value,
+        "coverage": [
+            {"client": c.client, "deal": c.deal, "status": c.status, "detail": c.detail}
+            for c in report.coverage
+        ],
+        "coverage_counts": coverage_counts,
+        "clients": clients,
+        "deals": deals,
+        "companies": companies,
+        "source_files": len([m for m in report.memos if m.file_path]),
+        "sources": [
+            {"file_name": m.file_name, "file_path": m.file_path, "client": m.client, "deal": m.deal}
+            for m in report.memos if m.file_path
+        ],
+        "memos": len(report.memos),
+        "assets": sum(len(m.assets) for m in report.memos),
+        "rows_added": report.rows_added,
+        "flags_added": report.flags_added,
+        "cache_hits": report.cache_hits,
+        "qa_counts": report.qa_counts(),
+        "duration_minutes": report.duration_minutes,
+        "started_at": report.started_at or None,
+        "finished_at": report.finished_at or None,
+        "workbook_path": str(report.workbook_path) if report.workbook_path else None,
+        "llm": {
+            "enabled": llm.enabled if llm else False,
+            "executed": llm.executed if llm else False,
+            "memos_escalated": llm.memos_escalated if llm else 0,
+            "memos_deferred": llm.memos_deferred if llm else 0,
+            "attempts": llm.attempts if llm else 0,
+            "cache_hits": llm.cache_hits if llm else 0,
+            "total_cost_usd": llm.total_cost_usd if llm else 0.0,
+            "cost_source": (
+                ("actual+estimated" if llm.any_actual_costs else "estimated") if llm and llm.executed else None
+            ),
+            "detail": llm.detail if llm else "",
+        },
+    }
+
+
+def _write_run_summary(
+    report: RunReport, request: RunRequest, config: Config, *, cancelled: bool
+) -> None:
+    """Persist the dashboard summary next to the run's audits."""
+    assert report.run_dir is not None
+    summary = _report_summary(report, request)
+    summary["cancelled"] = cancelled
+    summary["created_at"] = _now()
+    summary["source"] = "gui"
+    path = Path(report.run_dir) / "run_summary.json"
+    with guarded_open_write(path, config.pv_root) as fh:
+        json.dump(summary, fh, indent=2, ensure_ascii=False, sort_keys=True)
+        fh.write("\n")
+
+
+def _multi_report_summary(
+    report: RunReport, request: MultiSearchRunRequest, slot_count: int
+) -> dict:
+    """Dashboard digest for a firm-level batch run. Reuses the single-run digest
+    (a multi-firm run is still ONE workbook / ONE coverage list) and overlays the
+    multi-search shape: scope='multi', the requested firms, and slot/firm counts."""
+    proxy = RunRequest(
+        scope="multi",
+        period="",
+        template=request.template,
+        dry_run=request.dry_run,
+        force=request.force,
+        llm=request.llm,
+    )
+    summary = _report_summary(report, proxy)
+    summary["multi_search"] = {
+        "firms": [f.model_dump() for f in request.firms],
+        "firm_count": len(request.firms),
+        "slot_count": slot_count,
+    }
+    return summary
+
+
+def _write_multi_run_summary(
+    report: RunReport, request: MultiSearchRunRequest, config: Config,
+    slot_count: int, *, cancelled: bool,
+) -> None:
+    """Persist the dashboard summary for a firm-level batch run."""
+    assert report.run_dir is not None
+    summary = _multi_report_summary(report, request, slot_count)
+    summary["cancelled"] = cancelled
+    summary["created_at"] = _now()
+    summary["source"] = "gui"
+    path = Path(report.run_dir) / "run_summary.json"
+    with guarded_open_write(path, config.pv_root) as fh:
+        json.dump(summary, fh, indent=2, ensure_ascii=False, sort_keys=True)
+        fh.write("\n")

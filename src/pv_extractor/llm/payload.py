@@ -1,0 +1,261 @@
+"""Payload assembly for one memo's escalation (rules 1 + 8).
+
+PAGES, NOT DOCUMENTS: the payload contains only the pages named by the
+escalated fields' candidate pages (from the Phase-2 page->band map) plus
+pages 1-3 — unless that selection already covers the whole memo, in which
+case the whole (short) memo goes.
+
+PAGE IMAGE ECONOMY: TEXT/MIXED pages travel as extracted text with table
+cells serialized as markdown pipe tables; SCANNED and IMAGE_TABLE pages
+travel as PNG page images rendered at most `llm.image_max_long_edge` pixels
+on the long edge. Scanned pages are also OCR'd locally — that text is NOT
+sent (the image is better), it is kept for quote-grounding (rule 5).
+
+Everything is written into a per-memo payload directory under the run dir
+(payload files, manifest.json, schema.json, prompt files) through the
+io_guard — the share itself is only ever opened read-only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import fitz  # pymupdf
+
+from pv_extractor.config import Config
+from pv_extractor.extract.readers import OcrReader, reader_for_extension
+from pv_extractor.io_guard import guarded_open_write, open_read
+from pv_extractor.logging_setup import log_event
+from pv_extractor.models import EscalationField, PageClass, PageContent, TableData
+
+logger = logging.getLogger(__name__)
+
+_IMAGE_CLASSES = (PageClass.SCANNED, PageClass.IMAGE_TABLE)
+
+
+class PayloadError(RuntimeError):
+    """The document could not be re-read for payload assembly."""
+
+
+@dataclass
+class PayloadPage:
+    number: int
+    page_class: PageClass
+    kind: str  # text | image
+    rel_path: str
+    sha256: str
+
+
+@dataclass
+class MemoPayload:
+    directory: Path
+    pages: list[PayloadPage] = field(default_factory=list)
+    page_texts: dict[int, str] = field(default_factory=dict)  # grounding text per page
+    page_blocks: dict[int, str] = field(default_factory=dict)  # per-page prompt section
+    dynamic_prompt: str = ""
+    payload_hash: str = ""  # sha256 of the canonical manifest (incl. file hashes)
+    image_count: int = 0
+    ocr_hostile: bool = False  # any SCANNED/IMAGE_TABLE page in the payload
+
+    def page_kind(self, number: int) -> str:
+        """'image' | 'text' for a page in this payload (defaults to 'text')."""
+        return next((p.kind for p in self.pages if p.number == number), "text")
+
+    def scoped_prompt(self, pages: list[int]) -> str:
+        """The dynamic prompt restricted to `pages` (band-scoped LLM calls send
+        only the pages relevant to that band — fewer tokens, sharper focus).
+        Falls back to the full prompt when no scoped page has a block."""
+        blocks = [self.page_blocks[n] for n in sorted(set(pages)) if n in self.page_blocks]
+        if not blocks:
+            return self.dynamic_prompt
+        return "== DOCUMENT PAGES ==\n\n" + "\n\n".join(blocks) + "\n"
+
+    def scoped_image_count(self, pages: list[int]) -> int:
+        wanted = set(pages)
+        return sum(1 for p in self.pages if p.number in wanted and p.kind == "image")
+
+
+def select_pages(
+    fields: list[EscalationField], page_count: int, summary_pages: int, max_pages: int
+) -> list[int]:
+    """Candidate pages of the escalated fields + pages 1..summary_pages,
+    capped at max_pages (summary pages first — they carry the headline
+    identity every band needs). A selection covering the memo means the
+    whole memo IS the targeted payload."""
+    wanted: set[int] = set(range(1, min(summary_pages, page_count) + 1))
+    for escalated in fields:
+        wanted.update(p for p in escalated.candidate_pages if 1 <= p <= page_count)
+    ordered = sorted(wanted)
+    if len(ordered) > max_pages:
+        summary = [p for p in ordered if p <= summary_pages]
+        rest = [p for p in ordered if p > summary_pages]
+        ordered = summary + rest[: max_pages - len(summary)]
+    return ordered
+
+
+def _table_to_markdown(table: TableData) -> str:
+    rows = [["" if cell is None else str(cell).replace("|", "\\|").replace("\n", " ") for cell in row]
+            for row in table.rows]
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]
+    lines = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * width]
+    lines.extend("| " + " | ".join(row) + " |" for row in rows[1:])
+    return "\n".join(lines)
+
+
+def _page_text_block(page: PageContent) -> str:
+    parts = [page.text.rstrip()]
+    for table in page.tables:
+        markdown = _table_to_markdown(table)
+        if markdown:
+            parts.append(markdown)
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def _render_page_png(data: bytes, page_number: int, max_long_edge: int) -> bytes | None:
+    """Render one PDF page to PNG, long edge capped at max_long_edge."""
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        return None
+    try:
+        if not 1 <= page_number <= doc.page_count:
+            return None
+        page = doc[page_number - 1]
+        long_edge_points = max(page.rect.width, page.rect.height, 1.0)
+        zoom = max_long_edge / long_edge_points
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        return pix.tobytes("png")
+    except Exception as exc:
+        log_event(logger, "page render failed", page=page_number, error=str(exc))
+        return None
+    finally:
+        doc.close()
+
+
+def _write_payload_file(path: Path, data: bytes, pv_root: str) -> str:
+    with guarded_open_write(path, pv_root, mode="wb") as fh:
+        fh.write(data)
+    return hashlib.sha256(data).hexdigest()
+
+
+def assemble_payload(
+    *,
+    file_path: str,
+    fields: list[EscalationField],
+    config: Config,
+    payload_dir: Path,
+) -> MemoPayload:
+    """Re-read the memo (read-only) and materialize the page payload."""
+    extension = Path(file_path).suffix.lower()
+    reader = reader_for_extension(extension, config.extraction.page_classification)
+    if reader is None:
+        raise PayloadError(f"no reader for {extension!r}")
+    content = reader.summarize(file_path)
+    if content.flags:
+        raise PayloadError(f"document unreadable: {[f.value for f in content.flags]}")
+
+    selected = select_pages(
+        fields, content.page_count,
+        config.extraction.summary_pages, config.llm.max_pages_per_memo,
+    )
+    pages_by_number = {page.page_number: page for page in content.pages}
+    selected = [n for n in selected if n in pages_by_number]
+
+    # Tables for the selected text pages (pass 2, targeted pages only).
+    tables = reader.extract_tables(file_path, selected)
+    for number in selected:
+        page = pages_by_number[number]
+        if number in tables and not page.tables:
+            page.tables = tables[number]
+
+    # Local OCR on selected SCANNED pages — grounding text only, never sent.
+    scanned = [
+        n for n in selected
+        if pages_by_number[n].page_class is PageClass.SCANNED and content.reader == "pdf"
+    ]
+    if scanned and config.extraction.ocr.enabled:
+        ocr = OcrReader(config.extraction.ocr)
+        if ocr.available():
+            for number, result in ocr.ocr_pdf_pages(file_path, scanned).items():
+                pages_by_number[number].text = result.text
+                pages_by_number[number].ocr_engine = result.engine
+
+    pdf_bytes: bytes | None = None
+    if content.reader == "pdf":
+        with open_read(file_path) as fh:
+            pdf_bytes = fh.read()
+
+    payload = MemoPayload(directory=payload_dir)
+    prompt_sections: list[str] = ["== DOCUMENT PAGES =="]
+    block_start = len(prompt_sections)
+    for number in selected:
+        page = pages_by_number[number]
+        as_image = page.page_class in _IMAGE_CLASSES and pdf_bytes is not None
+        png = (
+            _render_page_png(pdf_bytes, number, config.llm.image_max_long_edge)
+            if as_image
+            else None
+        )
+        if png is not None:
+            rel = f"pages/page_{number:03d}.png"
+            digest = _write_payload_file(payload_dir / rel, png, config.pv_root)
+            payload.pages.append(
+                PayloadPage(number=number, page_class=page.page_class, kind="image",
+                            rel_path=rel, sha256=digest)
+            )
+            payload.image_count += 1
+            payload.page_texts[number] = page.text  # OCR text (possibly empty)
+            prompt_sections.append(
+                f"--- page {number} ({page.page_class.value}, image) ---\n"
+                f'This page is an image. View it with the Read tool: "{rel}"'
+            )
+        else:
+            text_block = _page_text_block(page)
+            rel = f"pages/page_{number:03d}.txt"
+            digest = _write_payload_file(
+                payload_dir / rel, text_block.encode("utf-8"), config.pv_root
+            )
+            payload.pages.append(
+                PayloadPage(number=number, page_class=page.page_class, kind="text",
+                            rel_path=rel, sha256=digest)
+            )
+            payload.page_texts[number] = text_block
+            prompt_sections.append(f"--- page {number} ({page.page_class.value}) ---\n{text_block}")
+
+    payload.ocr_hostile = any(
+        pages_by_number[n].page_class in _IMAGE_CLASSES for n in selected
+    )
+    # Per-page sections (everything after the "== DOCUMENT PAGES ==" header)
+    # line up with `selected` in order — keep them so band-scoped calls can
+    # compose a prompt from only the pages a band needs.
+    for offset, number in enumerate(selected):
+        payload.page_blocks[number] = prompt_sections[block_start + offset]
+    payload.dynamic_prompt = "\n\n".join(prompt_sections) + "\n"
+
+    manifest = {
+        "pages": [
+            {"number": p.number, "page_class": p.page_class.value, "kind": p.kind,
+             "file": p.rel_path, "sha256": p.sha256}
+            for p in payload.pages
+        ]
+    }
+    manifest_bytes = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    with guarded_open_write(payload_dir / "manifest.json", config.pv_root, mode="wb") as fh:
+        fh.write(manifest_bytes)
+    payload.payload_hash = hashlib.sha256(manifest_bytes).hexdigest()
+
+    log_event(
+        logger, "llm payload assembled",
+        pages=len(payload.pages), images=payload.image_count,
+        page_count=content.page_count, ocr_hostile=payload.ocr_hostile,
+    )
+    return payload
