@@ -252,12 +252,24 @@ class ModelRegistry:
             except UnknownModelError:
                 entry = None
         if entry is None:
+            model_id = model or ""
+            if model_id == "provider-default":
+                model_id = ""
+            elif model_id:
+                try:
+                    self.resolve(model_id)
+                except UnknownModelError:
+                    pass
+                else:
+                    # A saved Claude alias/id should not become a Codex model id
+                    # merely because the provider changed. Use the CLI default.
+                    model_id = ""
             entry = next(
                 (e for e in self.entries_for_provider(provider) if e.alias == "provider-default"),
                 ModelEntry(
                     provider=provider,
                     alias="provider-default",
-                    id=model or "",
+                    id=model_id,
                     display_name=f"{provider} CLI default",
                     context_window=0,
                     default_effort=checked_effort,

@@ -49,7 +49,7 @@ export default function Settings() {
   const raw = useLoad<RawConfigResponse>("/api/config/raw");
   const overrides = useLoad<{ overrides: OverrideRow[] }>("/api/locator/overrides");
   const setup = useLoad<{ items: SetupItem[]; all_ok: boolean; install_command: string | null; can_auto_install: boolean }>(
-    "/api/setup/status?include_claude=false",
+    "/api/setup/status?include_claude=true",
   );
   const [overrideError, setOverrideError] = useState<string | null>(null);
   const deleteOverride = async (o: OverrideRow) => {
@@ -362,6 +362,8 @@ export default function Settings() {
   const c = config.data;
   const auto = c?.llm.auto as Record<string, string> | undefined;
   const activeProvider = c ? String(value("llm.provider", c.llm.provider ?? "claude")) : "claude";
+  const claudeSetupItems = setup.data?.items.filter((item) => item.name.startsWith("claude ")) ?? [];
+  const claudeNeedsConfig = activeProvider === "claude" && claudeSetupItems.some((item) => !item.ok);
   const dirty = Object.keys(draft).length > 0;
   const rawDirty = rawDraft !== null && rawDraft !== raw.data?.text;
 
@@ -812,6 +814,19 @@ export default function Settings() {
                 };
                 return (
                   <div className="space-y-2">
+                    {claudeNeedsConfig && (
+                      <div className="border border-warn/40 bg-warn-soft rounded-[var(--hl-radius)] px-3 py-2 flex items-center gap-3">
+                        <div className="flex-1">
+                          <p className="text-[12.5px] font-medium text-ink-800">Claude Code needs to be configured for this machine.</p>
+                          <p className="text-[12px] text-ink-600">
+                            Use auto-detect below, pick the working install, then save changes.
+                          </p>
+                        </div>
+                        <Button kind="secondary" onClick={detectSources} disabled={detecting}>
+                          {detecting ? "Detecting…" : "Auto-detect"}
+                        </Button>
+                      </div>
+                    )}
                     <div className="flex items-center gap-2">
                       <p className="text-[12.5px] text-ink-700">
                         Where to run <code className="text-[11px]">claude</code> — pick the install to use for every LLM call,

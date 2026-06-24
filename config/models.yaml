@@ -8,6 +8,9 @@
 # do. When the provider reports actual token usage the ledger uses it. When
 # it does not, costs are computed from these numbers and labeled ESTIMATED.
 # Providers/models without a matching price table show cost as unavailable.
+# Codex uses a runtime provider-default fallback when explicitly selected; the
+# persisted seed menu stays Claude-first so older local installs can still load
+# this file.
 #
 # Fields per entry:
 #   provider                 claude | codex (default: claude for old files)
@@ -123,21 +126,3 @@ models:
       cache_hit: 0.10
       cache_write_5m: 1.25
       cache_write_1h: 2.00
-
-  - alias: provider-default
-    provider: codex
-    id: ""
-    display_name: Codex CLI default
-    context_window: 0
-    default_effort: high
-    latest_alias: false
-    pinned: false
-    requires_explicit_enable: false
-    extraction_profile:
-      default_shape: document
-      deal_pass_max_input_tokens: 80000
-      deal_pass_max_documents: 2
-      deal_pass_max_image_pages: 0
-      deal_pass_max_fields: 180
-      oversized_target_fields: 90
-      max_parallel_document_calls: 2

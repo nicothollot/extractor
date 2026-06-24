@@ -139,7 +139,8 @@ pv-extractor/
   config.yaml            all tunables (the live config; git-IGNORED, per-machine)
   config.example.yaml    committed config TEMPLATE; bootstrap seeds config.yaml
                          from it on first run (add new tunables to BOTH)
-  config/models.yaml     provider model menu + editable pricing
+  config/models.yaml     Claude-first provider model menu + editable pricing;
+                         non-Claude providers use a runtime CLI-default fallback
   aliases.yaml           client/deal alias expansions for the locator
   rules.yaml             cross-field validation rules + per-field range overrides
   schema/                compiled JSON artifacts (master_schema.json, band_routing.json)

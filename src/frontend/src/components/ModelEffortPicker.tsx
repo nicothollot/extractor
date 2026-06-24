@@ -11,8 +11,8 @@ const CUSTOM = "__custom__";
  *  The model list comes from the live catalog (GET /api/models, sourced from
  *  config/models.yaml). Aliases can float to the newest provider tier when the
  *  local CLI supports that behavior.
- *  "Custom…" lets you type ANY model id (a pinned historical id, or a brand-new
- *  one the catalog hasn't been told about yet). Effort is always selectable. */
+ *  Normal flows use the prebuilt catalog only; allowCustom is reserved for
+ *  advanced/debug surfaces. Effort is always selectable. */
 export function ModelEffortPicker({
   models,
   model,
@@ -22,6 +22,7 @@ export function ModelEffortPicker({
   modelLabel = "Model",
   effortLabel = "Effort",
   compact = false,
+  allowCustom = false,
 }: {
   models: ModelEntry[] | undefined;
   model: string;
@@ -31,10 +32,15 @@ export function ModelEffortPicker({
   modelLabel?: string;
   effortLabel?: string;
   compact?: boolean;
+  allowCustom?: boolean;
 }) {
   const catalog = models ?? [];
-  const known = new Set<string>([...catalog.map((m) => m.alias), ...catalog.map((m) => m.id)]);
-  const isCustom = model !== "" && !known.has(model);
+  const known = new Set<string>([
+    ...catalog.map((m) => m.alias),
+    ...catalog.map((m) => m.id).filter((id) => id !== ""),
+  ]);
+  const modelIsUnknown = model !== "" && !known.has(model);
+  const isCustom = allowCustom && modelIsUnknown;
 
   return (
     <div className={compact ? "flex items-end gap-3" : "grid grid-cols-2 gap-3"}>
@@ -42,8 +48,12 @@ export function ModelEffortPicker({
         <select
           className={inputCls}
           value={isCustom ? CUSTOM : model}
-          onChange={(e) => onModel(e.target.value === CUSTOM ? "" : e.target.value)}
+          onChange={(e) => onModel(e.target.value === CUSTOM && allowCustom ? "" : e.target.value)}
         >
+          {model === "" && <option value="">Choose a configured model…</option>}
+          {modelIsUnknown && !allowCustom && (
+            <option value={model}>Unavailable saved model — {model}</option>
+          )}
           {catalog.map((m) => (
             <option key={m.alias} value={m.alias}>
               {m.alias} — {m.display_name}
@@ -51,14 +61,14 @@ export function ModelEffortPicker({
             </option>
           ))}
           {/* pinned full ids, so a specific historical model can be chosen */}
-          {catalog.filter((m) => m.id !== m.alias).map((m) => (
+          {catalog.filter((m) => m.id && m.id !== m.alias).map((m) => (
             <option key={m.id} value={m.id}>
               {m.id}
             </option>
           ))}
-          <option value={CUSTOM}>Custom model id…</option>
+          {allowCustom && <option value={CUSTOM}>Custom model id…</option>}
         </select>
-        {isCustom && (
+        {allowCustom && isCustom && (
           <input
             className={`${inputCls} mt-1`}
             value={model}

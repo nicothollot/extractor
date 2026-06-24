@@ -25,7 +25,8 @@ AUTO = LlmAutoRoutingConfig()
 
 def test_seed_menu_aliases_and_ids(registry):
     by_alias = {e.alias: e for e in registry.entries}
-    assert {"fable", "opus", "sonnet", "haiku", "provider-default"} <= set(by_alias)
+    assert {"fable", "opus", "sonnet", "haiku"} <= set(by_alias)
+    assert "provider-default" not in by_alias
     assert by_alias["fable"].id == "claude-fable-5"
     assert by_alias["opus"].id == "claude-opus-4-8"
     assert by_alias["sonnet"].id == "claude-sonnet-4-6"

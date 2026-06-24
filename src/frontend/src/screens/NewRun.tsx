@@ -920,7 +920,7 @@ function SingleRun() {
                             effort={manualEffort}
                             onModel={(m) => patchAi({ manualModel: m })}
                             onEffort={(e) => patchAi({ manualEffort: e })}
-                            modelLabel="Model (any alias, full ID, or custom)"
+                            modelLabel="Configured model"
                             effortLabel="Effort"
                           />
                         </div>
@@ -1461,7 +1461,7 @@ function MultiRun() {
                         effort={manualEffort}
                         onModel={(m) => patch({ manualModel: m })}
                         onEffort={(e) => patch({ manualEffort: e })}
-                        modelLabel="Model (any alias, full ID, or custom)"
+                        modelLabel="Configured model"
                         effortLabel="Effort"
                       />
                     </div>
