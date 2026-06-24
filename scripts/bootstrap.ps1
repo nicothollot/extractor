@@ -24,6 +24,8 @@ if (-not ($env:OS -eq "Windows_NT")) {
     $VenvPython = Join-Path $VenvDir "bin/python"
 }
 $ConfigPath = Join-Path $ProjectRoot "config.yaml"
+$FrontendDist = Join-Path $ProjectRoot "src\frontend\dist"
+$FrontendIndex = Join-Path $FrontendDist "index.html"
 
 function Invoke-Native {
     # Run a native command with stdout/stderr captured; return its exit code.
@@ -72,12 +74,38 @@ function Read-InstallMissingDeps {
     return $true
 }
 
+function Build-Frontend {
+    $FrontendDir = Join-Path $ProjectRoot "src\frontend"
+    Write-Host "  npm install (src\frontend) ..."
+    Push-Location $FrontendDir
+    try {
+        $InstallExit = Invoke-Native "npm" @("install") -ShowOutputOnError
+        if ($InstallExit -ne 0) {
+            Write-Host "npm install failed. Retry manually:"
+            Write-Host "  cd `"$FrontendDir`""
+            Write-Host "  npm install"
+            exit 2
+        }
+        Write-Host "  npm run build (src\frontend) ..."
+        $BuildExit = Invoke-Native "npm" @("run", "build") -ShowOutputOnError
+        if ($BuildExit -ne 0) {
+            Write-Host "npm run build failed. Retry manually:"
+            Write-Host "  cd `"$FrontendDir`""
+            Write-Host "  npm install"
+            Write-Host "  npm run build"
+            exit 2
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
 # --- GUI prerequisites -------------------------------------------------------
-if ($WithGui) {
-    Write-Host "Checking Node.js / npm for the GUI extra ..."
+if ($WithGui -and -not (Test-Path $FrontendIndex)) {
+    Write-Host "Built frontend bundle missing; checking Node.js / npm ..."
     foreach ($tool in @("node", "npm")) {
         if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-            Write-Host "Node.js and npm are required for -WithGui but '$tool' was not found on PATH."
+            Write-Host "Node.js and npm are required to rebuild the GUI frontend but '$tool' was not found on PATH."
             Write-Host "Install Node.js 20+ from https://nodejs.org, or:"
             Write-Host "  winget install OpenJS.NodeJS.LTS"
             Write-Host "Then re-run: scripts\bootstrap.ps1 -WithGui"
@@ -94,6 +122,7 @@ if ($WithGui) {
         }
         Write-Host "  $tool $ver"
     }
+    Build-Frontend
 }
 
 # --- Python ------------------------------------------------------------------
@@ -130,13 +159,25 @@ if (Test-Path $VenvPython) {
 # --- editable install --------------------------------------------------------
 $Extras = if ($WithGui) { ".[dev,gui]" } else { ".[dev]" }
 
-# Completeness probe: EVERY runtime dependency must resolve, not just the
+# Completeness probe: EVERY dependency for the selected profile must resolve, not just the
 # package — a venv left over from an earlier phase must trigger a re-install.
 # Keep the module list in sync with pyproject.toml / REQUIRED_IMPORTS in
 # bootstrap.py. find_spec executes no module code, so the probe is fast.
-$Probe = 'import importlib.util, sys; names = "pv_extractor fitz rapidfuzz pydantic typer dateutil rich yaml openpyxl pdfplumber docx pptx rapidocr onnxruntime".split(); missing = [n for n in names if importlib.util.find_spec(n) is None]; print(" ".join(missing)); raise SystemExit(1 if missing else 0)'
+$ProbeNames = @("pv_extractor", "fitz", "rapidfuzz", "pydantic", "typer", "dateutil", "rich", "yaml", "openpyxl", "pdfplumber", "docx", "pptx", "rapidocr", "onnxruntime")
+if ($WithGui) {
+    $ProbeNames += @("fastapi", "uvicorn", "ruamel.yaml")
+}
+$Probe = 'import importlib.util, sys; missing = [];
+for n in sys.argv[1:]:
+    try:
+        ok = importlib.util.find_spec(n) is not None
+    except (ImportError, ValueError):
+        ok = False
+    if not ok:
+        missing.append(n)
+print(" ".join(missing)); raise SystemExit(1 if missing else 0)'
 
-if ((Invoke-Native $VenvPython @("-c", $Probe)) -ne 0) {
+if ((Invoke-Native $VenvPython (@("-c", $Probe) + $ProbeNames) -ShowOutputOnError) -ne 0) {
     if (-not (Read-InstallMissingDeps)) {
         Write-Host "Dependencies are missing and first_run.install_missing_deps is false in config.yaml."
         Write-Host "Either install manually:"
@@ -160,7 +201,7 @@ if ((Invoke-Native $VenvPython @("-c", $Probe)) -ne 0) {
 }
 
 # --- verify + next steps -----------------------------------------------------
-if ((Invoke-Native $VenvPython @("-c", $Probe) -ShowOutputOnError) -ne 0) {
+if ((Invoke-Native $VenvPython (@("-c", $Probe) + $ProbeNames) -ShowOutputOnError) -ne 0) {
     Write-Host "Dependencies still missing after install (listed above). Retry manually:"
     Write-Host "  cd `"$ProjectRoot`""
     Write-Host "  `"$VenvPython`" -m pip install -e `"$Extras`""

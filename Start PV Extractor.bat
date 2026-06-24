@@ -2,19 +2,18 @@
 setlocal
 rem One-click launcher for the PV Extractor GUI.
 rem First run: creates the Python environment (needs Python 3.12+ installed).
-rem Every run after that: starts the local GUI and opens your browser.
+rem Every run after that: checks the environment, installs any missing deps,
+rem then starts the local GUI and opens your browser.
 
 cd /d "%~dp0"
 title PV Extractor
 
-if exist ".venv\Scripts\pv-extractor.exe" goto launch
-
 echo ============================================================
-echo  PV Extractor - first-time setup
-echo  Creating the Python environment (one time, a few minutes).
+echo  PV Extractor - environment check
+echo  Creating/updating .venv if needed.
 echo ============================================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\bootstrap.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\bootstrap.ps1" -WithGui
 if errorlevel 1 (
     echo.
     echo Setup did not finish - see the messages above.
@@ -26,7 +25,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:launch
+if not exist ".venv\Scripts\pv-extractor.exe" (
+    echo.
+    echo Setup finished but .venv\Scripts\pv-extractor.exe was not created.
+    echo Delete .venv and double-click this file again, or run:
+    echo   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\bootstrap.ps1 -WithGui
+    echo.
+    pause
+    exit /b 1
+)
+
 echo Starting the PV Extractor GUI - your browser will open shortly.
 echo Keep this window open while you use the program. Close it to stop.
 echo.

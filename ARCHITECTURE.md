@@ -146,7 +146,8 @@ pv-extractor/
   schema/                compiled JSON artifacts (master_schema.json, band_routing.json)
   reference/             read-only input workbooks (master_index_v4.xlsx)
   scripts/               bootstrap.py / bootstrap.ps1 / sync_to_windows.sh
-  Start PV Extractor.bat one-click Windows launcher
+  Start PV Extractor.bat one-click Windows launcher; runs idempotent bootstrap
+                         before every GUI launch so cloned/stale venvs are repaired
   src/pv_extractor/      backend package (see §5)
   src/frontend/          GUI (see §6); build output in dist/
   tests/                 28 test modules + fixtures/ synthetic PV tree generators

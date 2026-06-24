@@ -4,7 +4,7 @@
 Stdlib-only on purpose — it runs before any dependency exists.
 
     python scripts/bootstrap.py            # .venv + editable install (.[dev])
-    python scripts/bootstrap.py --with-gui # also checks node/npm, adds the gui extra
+    python scripts/bootstrap.py --with-gui # adds the gui extra; builds frontend if missing
 
 Idempotent: re-running detects the existing .venv and skips completed steps —
 but completeness is judged by REQUIRED_IMPORTS (every runtime dependency),
@@ -51,6 +51,11 @@ REQUIRED_IMPORTS = (
     "rapidocr",
     "onnxruntime",
 )
+GUI_IMPORTS = (
+    "fastapi",
+    "uvicorn",
+    "ruamel.yaml",
+)
 
 
 class BootstrapError(RuntimeError):
@@ -65,6 +70,11 @@ class BootstrapError(RuntimeError):
 def extras_spec(with_gui: bool) -> str:
     """The editable-install requirement spec for pip."""
     return ".[dev,gui]" if with_gui else ".[dev]"
+
+
+def required_imports(with_gui: bool) -> tuple[str, ...]:
+    """Import probes required for the selected install profile."""
+    return REQUIRED_IMPORTS + (GUI_IMPORTS if with_gui else ())
 
 
 def venv_python_path(venv_dir: Path) -> Path:
@@ -119,7 +129,7 @@ def python_remediation() -> str:
 
 def node_remediation() -> str:
     return (
-        "Node.js and npm are required for --with-gui but were not found on PATH.\n"
+        "Node.js and npm are required to rebuild the GUI frontend but were not found on PATH.\n"
         "Install Node.js 20+ from https://nodejs.org, or:\n"
         "  Windows:        winget install OpenJS.NodeJS.LTS\n"
         "  Debian/Ubuntu:  sudo apt install nodejs npm\n"
@@ -198,19 +208,32 @@ def build_frontend() -> None:
     print(f"  frontend bundle ready: {frontend_dir / 'dist'}")
 
 
-def missing_imports(venv_python: Path) -> list[str]:
-    """REQUIRED_IMPORTS entries that do not resolve inside the venv.
+def frontend_dist_ready() -> bool:
+    """The committed/built frontend bundle is present."""
+    return (PROJECT_ROOT / "src" / "frontend" / "dist" / "index.html").exists()
+
+
+def missing_imports(venv_python: Path, imports: tuple[str, ...] | None = None) -> list[str]:
+    """Import entries that do not resolve inside the venv.
     Uses find_spec (no module code executed, so the probe stays fast)."""
     probe = (
         "import importlib.util, sys\n"
-        "missing = [n for n in sys.argv[1:] if importlib.util.find_spec(n) is None]\n"
+        "missing = []\n"
+        "for n in sys.argv[1:]:\n"
+        "    try:\n"
+        "        ok = importlib.util.find_spec(n) is not None\n"
+        "    except (ImportError, ValueError):\n"
+        "        ok = False\n"
+        "    if not ok:\n"
+        "        missing.append(n)\n"
         "print(' '.join(missing))\n"
     )
+    names = imports or REQUIRED_IMPORTS
     proc = subprocess.run(
-        [str(venv_python), "-c", probe, *REQUIRED_IMPORTS], capture_output=True, text=True
+        [str(venv_python), "-c", probe, *names], capture_output=True, text=True
     )
     if proc.returncode != 0:  # broken venv: treat everything as missing
-        return list(REQUIRED_IMPORTS)
+        return list(names)
     return proc.stdout.split()
 
 
@@ -262,12 +285,13 @@ def main(argv: list[str] | None = None) -> int:
     seed_config(CONFIG_PATH, CONFIG_TEMPLATE_PATH)
 
     try:
-        if args.with_gui:
-            print("Checking Node.js / npm for the GUI extra ...")
+        if args.with_gui and not frontend_dist_ready():
+            print("Built frontend bundle missing; checking Node.js / npm ...")
             check_node_npm()
             build_frontend()
         venv_python = ensure_venv()
-        missing = missing_imports(venv_python)
+        imports = required_imports(args.with_gui)
+        missing = missing_imports(venv_python, imports)
         if not missing:
             print("pv_extractor and all dependencies already installed in .venv (skipping install).")
         else:
@@ -276,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(install_remediation(venv_python, args.with_gui))
                 return 1
             install_package(venv_python, args.with_gui)
-            still_missing = missing_imports(venv_python)
+            still_missing = missing_imports(venv_python, imports)
             if still_missing:
                 raise BootstrapError(
                     f"still missing after install: {', '.join(still_missing)}\n"

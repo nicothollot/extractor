@@ -256,6 +256,14 @@ def test_extras_spec(bootstrap):
     assert bootstrap.extras_spec(True) == ".[dev,gui]"
 
 
+def test_required_imports_add_gui_deps_only_for_gui_profile(bootstrap):
+    assert "fastapi" not in bootstrap.required_imports(False)
+    gui_imports = bootstrap.required_imports(True)
+    assert "fastapi" in gui_imports
+    assert "uvicorn" in gui_imports
+    assert "ruamel.yaml" in gui_imports
+
+
 def test_venv_python_path_layout(bootstrap, tmp_path):
     py = bootstrap.venv_python_path(tmp_path / ".venv")
     if sys.platform == "win32":
