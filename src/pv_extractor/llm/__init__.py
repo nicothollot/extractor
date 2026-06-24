@@ -36,4 +36,7 @@ that can alter prompts, payload assembly, parsing or merge behavior.
 # 5.0.0: sparse schema-v5 candidates with numeric model_confidence, one primary
 # deal/document pass, model extraction profiles, and local confidence
 # arbitration with repair disabled by default.
-LLM_VERSION = "5.0.0"
+# 5.1.0: extended thinking forced on for every model/effort
+# (llm.always_enable_thinking) — the model reasons before answering, which can
+# change extracted values, so prior non-thinking cache entries are invalidated.
+LLM_VERSION = "5.1.0"

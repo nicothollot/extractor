@@ -153,6 +153,9 @@ def test_extract_json_flags_parsing_and_env_isolation(fake_env):
     # rather than going silent until the final envelope.
     assert argv[argv.index("--output-format") + 1] == "stream-json"
     assert "--verbose" in argv
+    # partial messages + forced thinking (always-on, every model)
+    assert "--include-partial-messages" in argv
+    assert argv[argv.index("--settings") + 1] == '{"alwaysThinkingEnabled":true}'
     # the schema is passed INLINE as a JSON string (not a path): the CLI parses
     # --json-schema as JSON, and inline avoids any cwd/path translation when
     # the call is bridged from Windows into WSL.

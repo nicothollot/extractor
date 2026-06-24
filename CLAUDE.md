@@ -652,7 +652,15 @@ stays an image. New tunables (BOTH config.py + config.example.yaml):
 combine_deal_documents, max_pages_per_deal, band_batched,
 single_call_max_pages, retry_not_found, surface_ungrounded_values,
 ungrounded_confidence_cap, prefer_ocr_text_over_image, ocr_text_min_confidence,
-band_relevance_floor, max_fields_per_call, no_evidence_effort. The router picks a
+band_relevance_floor, max_fields_per_call, no_evidence_effort,
+stream_partial_messages, always_enable_thinking. always_enable_thinking forces
+extended thinking on for EVERY model/effort via the Claude Code
+`alwaysThinkingEnabled` setting (passed as `--settings`), and
+stream_partial_messages adds `--include-partial-messages`; both feed the live
+LLM-activity view. NOTE: `claude -p` BUFFERS its stream-json output until the
+turn completes when piped (non-TTY), so token deltas are NOT live — the
+reasoning/answer surface when the call finishes; the wall-clock HEARTBEAT is the
+only during-call liveness signal. The router picks a
 tier ladder per group — MANUAL forces one
 model+effort for EVERYTHING (no escalation, even OCR-hostile docs stay on the
 chosen model); AUTO runs sonnet/medium, retries failures on opus/high

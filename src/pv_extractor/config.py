@@ -609,6 +609,13 @@ class LlmConfig(BaseModel):
     workers: int = 2  # hidden local provider session queue concurrency (keep 1-2)
     models_path: str = "./config/models.yaml"
     cache_enabled: bool = True  # response cache; --force-llm bypasses reads
+    # Stream the provider's partial output (token deltas) so the live activity
+    # view shows the model's thinking + answer AS IT WORKS, not just heartbeats.
+    stream_partial_messages: bool = True
+    # Force extended thinking on for EVERY model/effort (Claude Code
+    # alwaysThinkingEnabled setting), so the reasoning is always produced and
+    # visible. The thinking budget still scales with the chosen effort.
+    always_enable_thinking: bool = True
     timeout_seconds: int = 600  # per bounded provider extraction task (large
     #                             field sets in one call can take many minutes)
     max_pages_per_memo: int = 20  # payload page cap (candidate pages + pages 1-3)

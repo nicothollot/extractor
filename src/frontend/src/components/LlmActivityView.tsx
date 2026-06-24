@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { JobEvent } from "../lib/api";
 import { fmtDuration } from "../lib/hooks";
 import { Button, Card, CardHeader, StatusChip } from "./ui";
@@ -191,15 +191,59 @@ function CallDetails({ call, now }: { call: LlmCall; now: number }) {
         </div>
       </div>
 
+      <ProviderActivity call={call} />
+    </div>
+  );
+}
+
+function ProviderActivity({ call }: { call: LlmCall }) {
+  const logRef = useRef<HTMLDivElement | null>(null);
+  // The latest reasoning + output snapshots are shown in their own panels; the
+  // remaining discrete events (session start, tool use, heartbeats, errors)
+  // stream into the log below.
+  const thinking = [...call.messages].reverse().find((m) => m.stream === "thinking");
+  const output = [...call.messages].reverse().find((m) => m.stream === "output");
+  const log = call.messages.filter((m) => m.stream !== "thinking" && m.stream !== "output");
+
+  // Keep the newest log line in view without the analyst scrolling (the heartbeat
+  // ticks every 15s would otherwise push it out of the box constantly).
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [log.length]);
+
+  return (
+    <div className="space-y-3">
       <div>
-        <p className="text-[12px] font-semibold text-ink-700 mb-1">Provider messages</p>
-        <div className="max-h-36 overflow-auto rounded-[var(--hl-radius)] bg-ink-50 border border-line px-2 py-1 text-[11.5px]">
-          {call.messages.length === 0 && <p className="text-ink-400 py-1">No interim provider messages yet.</p>}
-          {call.messages.map((message, index) => (
+        <p className="text-[12px] font-semibold text-ink-700 mb-1">Model reasoning</p>
+        {thinking ? (
+          <pre className="max-h-48 overflow-auto rounded-[var(--hl-radius)] bg-navy-deep px-3 py-2 text-[11.5px] leading-5 text-ink-200 whitespace-pre-wrap">
+            {thinking.message}
+          </pre>
+        ) : (
+          <p className="text-[11.5px] text-ink-400 py-1">
+            {terminalStatuses.has(call.status)
+              ? "No reasoning was captured for this call."
+              : "The local CLI buffers output until the call finishes, so the reasoning and answer appear when it completes — the heartbeat below shows it is still alive."}
+          </p>
+        )}
+        {output && <p className="mt-1 text-[11px] text-ink-500 font-mono">{output.message}</p>}
+      </div>
+
+      <div>
+        <p className="text-[12px] font-semibold text-ink-700 mb-1">Activity log</p>
+        <div
+          ref={logRef}
+          className="max-h-36 overflow-auto rounded-[var(--hl-radius)] bg-ink-50 border border-line px-2 py-1 text-[11.5px]"
+        >
+          {log.length === 0 && <p className="text-ink-400 py-1">No provider activity yet.</p>}
+          {log.map((message, index) => (
             <p key={index} className="font-mono text-ink-700 py-0.5">
               <span className="text-ink-400">{message.ts.slice(11, 19)}</span>{" "}
-              <span className="text-info">{message.stream}</span>{" "}
-              <span>{message.message}</span>
+              <span className={message.stream === "heartbeat" ? "text-ink-300" : message.stream === "stderr" ? "text-err" : "text-info"}>
+                {message.stream}
+              </span>{" "}
+              <span className={message.stream === "heartbeat" ? "text-ink-400" : ""}>{message.message}</span>
             </p>
           ))}
         </div>

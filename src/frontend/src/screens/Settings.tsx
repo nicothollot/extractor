@@ -10,6 +10,7 @@ import {
   ClientsStatus,
   ConfigResponse,
   DoctorCheck,
+  HealthResponse,
   IndexDiscoverResponse,
   IndexStatus,
   JobInfo,
@@ -43,6 +44,7 @@ interface OverrideRow {
 
 export default function Settings() {
   const config = useLoad<ConfigResponse>("/api/config");
+  const health = useLoad<HealthResponse>("/api/health");
   const models = useLoad<ModelsResponse>("/api/models");
   const index = useLoad<IndexStatus>("/api/index/status");
   const clientsStatus = useLoad<ClientsStatus>("/api/index/clients-status");
@@ -379,6 +381,46 @@ export default function Settings() {
           </Button>
         </div>
       </div>
+
+      <Card>
+        <CardHeader
+          title="Version"
+          sub="which build of the code this running server is executing — restart pv-extractor gui after pulling/editing code"
+        />
+        <div className="px-4 pb-4 text-[13px]">
+          {(() => {
+            const b = health.data?.build;
+            const frontendBuilt =
+              typeof __BUILD_TIME__ === "string" ? __BUILD_TIME__ : null;
+            return (
+              <div className="grid grid-cols-2 gap-x-8 gap-y-1.5 max-w-2xl font-mono text-[12.5px]">
+                <span className="text-ink-400">App version</span>
+                <span className="text-ink-900">{health.data?.version ?? "…"}</span>
+
+                <span className="text-ink-400">Backend build (commit)</span>
+                <span className={b?.dirty ? "text-warn" : "text-ink-900"}>
+                  {b?.commit ? `${b.commit}${b.dirty ? " · uncommitted changes" : ""}` : "not a git checkout"}
+                  {b?.branch ? ` (${b.branch})` : ""}
+                </span>
+
+                <span className="text-ink-400">Backend committed</span>
+                <span className="text-ink-900">{b?.committed_at ? new Date(b.committed_at).toLocaleString() : "—"}</span>
+
+                <span className="text-ink-400">Frontend bundle built</span>
+                <span className="text-ink-900">{frontendBuilt ? new Date(frontendBuilt).toLocaleString() : "dev server"}</span>
+
+                <span className="text-ink-400">Python</span>
+                <span className="text-ink-900">{b?.python ?? "—"}</span>
+              </div>
+            );
+          })()}
+          <p className="mt-3 text-[11.5px] text-ink-400 max-w-2xl">
+            If you changed code but don't see it reflected, the running server still holds the old code:
+            stop and relaunch <span className="font-mono">pv-extractor gui</span> (and re-run{" "}
+            <span className="font-mono">npm run build</span> if you changed the frontend).
+          </p>
+        </div>
+      </Card>
 
       {c && (
         <>

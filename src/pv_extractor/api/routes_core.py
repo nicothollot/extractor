@@ -95,15 +95,15 @@ def _open_index(config: Config):
 
 @router.get("/health")
 def health(request: Request) -> dict:
+    from pv_extractor.system.version import build_info
+
     config = _config(request)
     active = _manager(request).active_pipeline_job()
-    try:
-        version = importlib.metadata.version("pv-extractor")
-    except importlib.metadata.PackageNotFoundError:
-        version = "unknown"
+    build = build_info()
     return {
         "ok": True,
-        "version": version,
+        "version": build["version"],
+        "build": build,  # commit / committed_at / branch / dirty / python / label
         "active_job": active.model_dump() if active else None,
         "llm_provider": config.llm.provider,
         "auto_update_on_start": config.llm.provider == "claude" and config.claude_code.auto_update_on_start,

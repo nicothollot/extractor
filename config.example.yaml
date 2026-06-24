@@ -408,6 +408,8 @@ llm:
   workers: 2                       # hidden local CLI session concurrency (don't hammer CLI/share)
   models_path: ./config/models.yaml  # provider model menu + editable pricing assumptions
   cache_enabled: true              # task cache keyed on provider/model/effort/schema/prompt/page hashes/fields
+  stream_partial_messages: true    # stream the model's thinking + answer token deltas to the live activity view
+  always_enable_thinking: true     # force extended thinking on for every model/effort (budget still scales with effort)
   timeout_seconds: 600             # per primary provider request (a single call
                                    # over a large field set can take many minutes)
   max_pages_per_memo: 20           # per-document payload page cap before provider transport

@@ -232,6 +232,7 @@ function SingleRun() {
   const [activeConflict, setActiveConflict] = useState<JobConflictDetail | null>(null);
   const [preflightSubmitting, setPreflightSubmitting] = useState(false);
   const preflightSubmitRef = useRef(false);
+  const [templatePicker, setTemplatePicker] = useState(false);
 
   const clients = useLoad<{ clients: string[] }>("/api/index/clients");
   const deals = useLoad<{
@@ -339,8 +340,10 @@ function SingleRun() {
 
   useEffect(() => {
     if (templates.data && !state.templateInitialized) {
+      // Default to the reference master index (master_index_v4); the analyst
+      // Browses to a previous output only when they want a cumulative run.
       patch({
-        template: templates.data.previous_outputs[0]?.path ?? templates.data.default_template,
+        template: templates.data.default_template,
         templateInitialized: true,
       });
     }
@@ -850,35 +853,50 @@ function SingleRun() {
 
           {step === 1 && (
             <Card>
-              <CardHeader title="Template" sub="the master workbook COPY this run appends to" />
+              <CardHeader title="Reference document" sub="the master workbook COPY this run appends to — defaults to the reference master index" />
               <div className="px-4 pb-4 space-y-3 max-w-3xl">
-                <label className="flex items-start gap-2 text-[13px]">
-                  <input
-                    type="radio"
-                    checked={template === templates.data?.default_template}
-                    onChange={() => patch({ template: templates.data?.default_template ?? null })}
-                  />
-                  <span>
-                    <span className="font-medium text-ink-800">Reference template</span>
-                    <span className="block text-[11.5px] text-ink-400 font-mono">{templates.data?.default_template}</span>
-                  </span>
-                </label>
-                {(templates.data?.previous_outputs ?? []).map((o) => (
-                  <label key={o.run_id} className="flex items-start gap-2 text-[13px]">
-                    <input type="radio" checked={template === o.path} onChange={() => patch({ template: o.path })} />
-                    <span>
-                      <span className="font-medium text-ink-800">Previous output — {o.run_id}</span>
-                      <span className="block text-[11.5px] text-ink-400 font-mono">{o.path}</span>
-                    </span>
-                  </label>
-                ))}
-                <Field label="…or a workbook path">
-                  <input className={inputCls} value={template ?? ""} onChange={(e) => patch({ template: e.target.value })} />
+                <Field label="Workbook">
+                  <div className="flex gap-2">
+                    <input
+                      className={`${inputCls} flex-1 font-mono text-[12px]`}
+                      value={template ?? ""}
+                      onChange={(e) => patch({ template: e.target.value })}
+                      placeholder="path to a master workbook"
+                    />
+                    <Button kind="secondary" onClick={() => setTemplatePicker(true)}>
+                      Browse…
+                    </Button>
+                  </div>
                 </Field>
+                <div className="flex items-center gap-3 text-[11.5px]">
+                  {templates.data && template !== templates.data.default_template && (
+                    <button
+                      className="text-info hover:underline"
+                      onClick={() => patch({ template: templates.data?.default_template ?? null })}
+                    >
+                      ↺ Reset to reference master index
+                    </button>
+                  )}
+                  {templates.data && template === templates.data.default_template && (
+                    <span className="text-ink-400">Using the reference master index (master_index_v4).</span>
+                  )}
+                </div>
                 <div className="pt-2 border-t border-line">
                   <Toggle checked={dryRunOnly} onChange={(v) => patch({ dryRunOnly: v })} label="Dry run only (locate + verify; nothing written)" />
                 </div>
               </div>
+              {templatePicker && (
+                <FolderPicker
+                  title="Choose a reference workbook"
+                  initial={template || templates.data?.default_template || ""}
+                  pickFiles
+                  onSelect={(path) => {
+                    patch({ template: path });
+                    setTemplatePicker(false);
+                  }}
+                  onClose={() => setTemplatePicker(false)}
+                />
+              )}
             </Card>
           )}
 
@@ -1233,10 +1251,11 @@ function MultiRun() {
 
   useEffect(() => {
     if (templates.data && multiTemplate === null) {
-      patch({ multiTemplate: templates.data.previous_outputs[0]?.path ?? templates.data.default_template });
+      patch({ multiTemplate: templates.data.default_template });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [templates.data]);
+  const [multiTemplatePicker, setMultiTemplatePicker] = useState(false);
 
   const existingClients = useMemo(() => new Set(multiFirms.map((f) => f.client)), [multiFirms]);
 
@@ -1418,22 +1437,39 @@ function MultiRun() {
         <Card>
           <CardHeader title="Run settings" sub="shared across every firm in this run" />
           <div className="px-4 pb-4 space-y-3 max-w-3xl">
-            <Field label="Template (master workbook COPY this run appends to)">
-              <select
-                className={inputCls}
-                value={multiTemplate ?? ""}
-                onChange={(e) => patch({ multiTemplate: e.target.value })}
-              >
-                {templates.data && (
-                  <option value={templates.data.default_template}>Reference template — {templates.data.default_template}</option>
-                )}
-                {(templates.data?.previous_outputs ?? []).map((o) => (
-                  <option key={o.run_id} value={o.path}>
-                    Previous output — {o.run_id}
-                  </option>
-                ))}
-              </select>
+            <Field label="Reference document (master workbook COPY this run appends to)">
+              <div className="flex gap-2">
+                <input
+                  className={`${inputCls} flex-1 font-mono text-[12px]`}
+                  value={multiTemplate ?? ""}
+                  onChange={(e) => patch({ multiTemplate: e.target.value })}
+                  placeholder="path to a master workbook"
+                />
+                <Button kind="secondary" onClick={() => setMultiTemplatePicker(true)}>
+                  Browse…
+                </Button>
+              </div>
+              {templates.data && multiTemplate !== templates.data.default_template && (
+                <button
+                  className="mt-1.5 text-[11.5px] text-info hover:underline"
+                  onClick={() => patch({ multiTemplate: templates.data?.default_template ?? null })}
+                >
+                  ↺ Reset to reference master index
+                </button>
+              )}
             </Field>
+            {multiTemplatePicker && (
+              <FolderPicker
+                title="Choose a reference workbook"
+                initial={multiTemplate || templates.data?.default_template || ""}
+                pickFiles
+                onSelect={(path) => {
+                  patch({ multiTemplate: path });
+                  setMultiTemplatePicker(false);
+                }}
+                onClose={() => setMultiTemplatePicker(false)}
+              />
+            )}
             <Toggle
               checked={multiDryRunOnly}
               onChange={(v) => patch({ multiDryRunOnly: v })}

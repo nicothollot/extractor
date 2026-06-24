@@ -58,6 +58,10 @@ _INTERIM_CHARS = 800
 # dead for minutes. A timer emits an elapsed-time note so the operator always
 # knows the call is alive (and roughly how long it has run).
 _HEARTBEAT_SECONDS = 15
+# Coalesce streamed token deltas: emit at most one thinking/output update this
+# often (raw deltas arrive dozens/second — emitting each would flood the UI).
+_STREAM_EMIT_SECONDS = 1.0
+_THINKING_TAIL_CHARS = 600  # how much of the running thinking text to surface
 
 
 class ClaudeCodeResult(LlmCliResult):
@@ -388,6 +392,8 @@ class ClaudeCodeClient:
         self._check_timeout = config.claude_code.default_timeout_seconds
         self._call_timeout = config.llm.timeout_seconds
         self._exclude_dynamic = config.llm.exclude_dynamic_system_prompt_sections
+        self._stream_partial = getattr(config.llm, "stream_partial_messages", True)
+        self._always_think = getattr(config.llm, "always_enable_thinking", True)
         self._pv_root = config.pv_root
         self._help_text: str | None = None
 
@@ -507,6 +513,13 @@ class ClaudeCodeClient:
         # final {"type":"result"} line is the same envelope json mode produced.
         # --verbose is REQUIRED by the CLI for stream-json with --print.
         stream_args = ["--output-format", "stream-json", "--verbose"]
+        if self._stream_partial:
+            # token-level deltas: surfaces the model's thinking + answer live
+            stream_args.append("--include-partial-messages")
+        if self._always_think:
+            # force extended thinking on regardless of model (budget scales with
+            # --effort); one argv token, so safe across the WSL bridge
+            stream_args += ["--settings", '{"alwaysThinkingEnabled":true}']
         # exec_argv carries the inline schema; argv (stored/logged) redacts it to
         # keep the audit pointer flags-only (the schema can be many KB).
         exec_argv = [
@@ -532,6 +545,10 @@ class ClaudeCodeClient:
                 "text": True,
                 "encoding": "utf-8",
                 "errors": "replace",
+                # Line-buffered: default block buffering holds NDJSON lines in an
+                # ~8 KB buffer, so the stream-json deltas would only surface in
+                # bursts (or at process end) instead of live as the model works.
+                "bufsize": 1,
                 "cwd": str(cwd),
                 "env": _sanitized_env(),
             }
@@ -542,6 +559,62 @@ class ClaudeCodeClient:
             proc = subprocess.Popen(exec_argv, **popen_kwargs)
             stdout_chunks: list[str] = []
             stderr_chunks: list[str] = []
+            # Live-stream state: accumulate token deltas and emit coalesced
+            # snapshots (thinking text tail + output char count) so the activity
+            # view shows the model actually working without a flood of events.
+            progress = {
+                "thinking": [], "thinking_emit": 0.0,
+                "out_chars": 0, "out_emit": 0.0, "last_delta": 0.0,
+                "session_noted": False,
+            }
+
+            def _on_stdout_event(text: str) -> None:
+                try:
+                    ev = json.loads(text)
+                except (json.JSONDecodeError, ValueError):
+                    snippet = text.strip()
+                    if snippet and not snippet.startswith("{"):
+                        _emit_provider_event(event_sink, stream="stdout", message=snippet[:_INTERIM_CHARS])
+                    return
+                if not isinstance(ev, dict):
+                    return
+                if ev.get("type") == "stream_event":
+                    se = ev.get("event") or {}
+                    if se.get("type") != "content_block_delta":
+                        return
+                    delta = se.get("delta") or {}
+                    dtype = delta.get("type")
+                    now = time.perf_counter()
+                    progress["last_delta"] = now
+                    if dtype == "thinking_delta":
+                        progress["thinking"].append(delta.get("thinking") or "")
+                        if now - progress["thinking_emit"] >= _STREAM_EMIT_SECONDS:
+                            progress["thinking_emit"] = now
+                            tail = "".join(progress["thinking"])[-_THINKING_TAIL_CHARS:]
+                            _emit_provider_event(event_sink, stream="thinking", message=tail)
+                    elif dtype in ("text_delta", "input_json_delta"):
+                        progress["out_chars"] += len(delta.get("text") or delta.get("partial_json") or "")
+                        if now - progress["out_emit"] >= _STREAM_EMIT_SECONDS:
+                            progress["out_emit"] = now
+                            _emit_provider_event(
+                                event_sink, stream="output",
+                                message=f"writing answer… {progress['out_chars']} chars",
+                            )
+                    return
+                # The CLI emits MANY system events with partial messages on;
+                # surface the session-start note exactly once.
+                if ev.get("type") == "system":
+                    if not progress["session_noted"]:
+                        progress["session_noted"] = True
+                        _emit_provider_event(
+                            event_sink, stream="stdout",
+                            message="session started — model is working",
+                        )
+                    return
+                # other discrete events (tool use, tool result, rate limit, ...)
+                message = _stream_line_message(text)
+                if message:
+                    _emit_provider_event(event_sink, stream="stdout", message=message)
 
             def _read_stream(name: str, chunks: list[str]) -> None:
                 stream = getattr(proc, name)
@@ -560,14 +633,7 @@ class ClaudeCodeClient:
                                 message=text[:_INTERIM_CHARS],
                             )
                         else:
-                            # stdout is NDJSON in stream-json mode: turn each
-                            # event line into a short progress note (skip system
-                            # init / raw payloads / the final result envelope).
-                            message = _stream_line_message(text)
-                            if message:
-                                _emit_provider_event(
-                                    event_sink, stream="stdout", message=message,
-                                )
+                            _on_stdout_event(text)
                 except Exception as exc:  # noqa: BLE001 - capture best effort output
                     _emit_provider_event(
                         event_sink,
@@ -593,6 +659,10 @@ class ClaudeCodeClient:
                 if event_sink is None:
                     return  # nothing to report to
                 while not heartbeat_stop.wait(_HEARTBEAT_SECONDS):
+                    # Stay quiet while the model is actively streaming tokens —
+                    # the thinking/output snapshots already show it is alive.
+                    if time.perf_counter() - progress["last_delta"] < _HEARTBEAT_SECONDS:
+                        continue
                     elapsed = int(time.perf_counter() - started)
                     _emit_provider_event(
                         event_sink,

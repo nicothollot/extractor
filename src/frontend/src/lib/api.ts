@@ -546,6 +546,25 @@ export interface RawConfigResponse {
   text: string;
 }
 
+export interface BuildInfo {
+  version: string;
+  commit: string | null;
+  commit_full: string | null;
+  committed_at: string | null;
+  branch: string | null;
+  dirty: boolean | null;
+  python: string;
+  label: string;
+}
+
+export interface HealthResponse {
+  ok: boolean;
+  version: string | null;
+  build?: BuildInfo;
+  llm_provider: string;
+  auto_update_on_start: boolean;
+}
+
 export interface ClaudeSource {
   id: string;
   label: string;
