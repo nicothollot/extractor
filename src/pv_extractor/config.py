@@ -609,7 +609,8 @@ class LlmConfig(BaseModel):
     workers: int = 2  # hidden local provider session queue concurrency (keep 1-2)
     models_path: str = "./config/models.yaml"
     cache_enabled: bool = True  # response cache; --force-llm bypasses reads
-    timeout_seconds: int = 180  # per bounded provider extraction task
+    timeout_seconds: int = 600  # per bounded provider extraction task (large
+    #                             field sets in one call can take many minutes)
     max_pages_per_memo: int = 20  # payload page cap (candidate pages + pages 1-3)
     # Group a deal-period's source documents into a combined LLM payload.
     # This never broadens the field set and never bypasses deterministic cache;

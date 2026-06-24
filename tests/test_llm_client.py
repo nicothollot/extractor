@@ -64,6 +64,8 @@ if mode == "err_stdout":
     sys.exit(1)
 if mode == "sleep":
     time.sleep(30)
+if mode == "slow_ok":
+    time.sleep(1)  # succeed, but slowly enough for a heartbeat to fire
 
 # `claude --json-schema` takes the schema JSON inline (a string), not a path.
 schema = json.loads(argv[argv.index("--json-schema") + 1])
@@ -184,6 +186,27 @@ def test_stream_json_emits_interim_events(fake_env):
     assert any("StructuredOutput" in m for m in messages), messages
     # the final result envelope must NOT leak as an interim progress note
     assert not any('"type": "result"' in m or "'type': 'result'" in m for m in messages)
+
+
+def test_heartbeat_emits_while_call_runs(fake_env, monkeypatch):
+    """A long, output-silent call still reports it is alive: the heartbeat timer
+    emits elapsed-time notes independent of any provider output, so the activity
+    view never looks hung even when the model streams nothing for minutes."""
+    import pv_extractor.llm.claude_code_client as ccc
+
+    monkeypatch.setattr(ccc, "_HEARTBEAT_SECONDS", 0.2)
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "slow_ok")
+    client, schema_path, _, tmp_path = fake_env
+    events: list[dict] = []
+    result = client.extract_json(
+        job_id="pv-RUN-MEMO-t0", prompt="page text", schema_path=schema_path,
+        model="sonnet", effort="low", cwd=tmp_path, timeout=30,
+        event_sink=events.append,
+    )
+    assert result.ok
+    heartbeats = [e for e in events if e.get("stream") == "heartbeat"]
+    assert heartbeats, [e.get("stream") for e in events]
+    assert "elapsed" in str(heartbeats[0].get("message", ""))
 
 
 def test_command_args_are_prepended(fake_env):

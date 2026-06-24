@@ -249,8 +249,12 @@ comments preserved), and setup/doctor flows.
                          `claude -p --output-format stream-json --verbose
                          --json-schema` calls (NDJSON: each event line is turned
                          into an LLM-activity progress note as the model works —
-                         `using Read`/`using StructuredOutput`/etc. — so a long
-                         call shows live progress instead of going silent until
+                         `session started`/`using Read`/`using StructuredOutput`/
+                         etc. — plus a wall-clock HEARTBEAT every
+                         _HEARTBEAT_SECONDS so even an output-silent call (a
+                         text-only payload streams nothing until the final tool
+                         call) shows it is alive; so a long call shows live
+                         progress instead of going silent until
                          the final envelope; the closing {type:result} line is
                          the same envelope the old `--output-format json` emitted
                          as one object, parsed by _result_envelope, which also

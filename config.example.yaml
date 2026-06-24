@@ -408,7 +408,8 @@ llm:
   workers: 2                       # hidden local CLI session concurrency (don't hammer CLI/share)
   models_path: ./config/models.yaml  # provider model menu + editable pricing assumptions
   cache_enabled: true              # task cache keyed on provider/model/effort/schema/prompt/page hashes/fields
-  timeout_seconds: 180             # per primary provider request
+  timeout_seconds: 600             # per primary provider request (a single call
+                                   # over a large field set can take many minutes)
   max_pages_per_memo: 20           # per-document payload page cap before provider transport
   combine_deal_documents: false    # legacy override forcing whole-deal payload shape; normal routing
                                    #   should use routing_mode/model profiles instead.

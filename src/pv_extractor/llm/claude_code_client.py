@@ -53,6 +53,11 @@ LOGIN_REMEDIATION = (
 
 _STDERR_DEBUG_CHARS = 400
 _INTERIM_CHARS = 800
+# A large single call (e.g. force-assist over ~200 fields) streams nothing until
+# the model emits its final tool call, so without this the activity view looks
+# dead for minutes. A timer emits an elapsed-time note so the operator always
+# knows the call is alive (and roughly how long it has run).
+_HEARTBEAT_SECONDS = 15
 
 
 class ClaudeCodeResult(LlmCliResult):
@@ -341,7 +346,16 @@ def _stream_line_message(line: str) -> str | None:
     if etype == "user":
         # tool_result coming back (e.g. a page image was read)
         return "tool result received"
-    # system / rate_limit_event / result: not useful as progress
+    if etype == "system":
+        # the first line the CLI emits — confirms the prompt was accepted and a
+        # session opened, so the operator knows the model received the request
+        # even before any output (a big single call streams nothing until then).
+        return "session started — model is working"
+    if etype == "rate_limit_event":
+        # surfaced because rate limiting is a real reason a call appears to hang
+        status = ev.get("status") or ev.get("message")
+        return f"rate limit: {status}" if isinstance(status, str) and status else "rate limit event"
+    # result envelope: handled separately, not a progress note
     return None
 
 
@@ -569,6 +583,25 @@ class ClaudeCodeClient:
             )
             stdout_thread.start()
             stderr_thread.start()
+
+            # Heartbeat: emit an elapsed-time note every _HEARTBEAT_SECONDS so a
+            # long, output-silent call (text-only payload, no Read calls to
+            # stream) still shows activity instead of looking hung.
+            heartbeat_stop = threading.Event()
+
+            def _heartbeat() -> None:
+                if event_sink is None:
+                    return  # nothing to report to
+                while not heartbeat_stop.wait(_HEARTBEAT_SECONDS):
+                    elapsed = int(time.perf_counter() - started)
+                    _emit_provider_event(
+                        event_sink,
+                        stream="heartbeat",
+                        message=f"still working — {elapsed}s elapsed",
+                    )
+
+            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+            heartbeat_thread.start()
             try:
                 if proc.stdin is not None:
                     proc.stdin.write(prompt)
@@ -631,6 +664,8 @@ class ClaudeCodeClient:
                     self._log(result, model, effort)
                     return result
             finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1)
                 stdout_thread.join(timeout=1)
                 stderr_thread.join(timeout=1)
             stdout = "".join(stdout_chunks)
