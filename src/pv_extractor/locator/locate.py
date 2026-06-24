@@ -163,7 +163,8 @@ def locate(
             ),
         )
 
-    target = resolve_target_period(query.period, config.client_period_style(client))
+    period_style = config.client_period_style(client)
+    target = resolve_target_period(query.period, period_style)
     if target is None:
         raise ValueError(
             f"could not resolve period {query.period!r} to an as-of date; expected an ISO date "
@@ -220,6 +221,7 @@ def locate(
         deal_method=deal_method,
         deal_ratio=deal_ratio,
         target_as_of=target,
+        period_style=period_style,
         doc_type=query.doc_type,
         cfg=cfg,
         doc_type_spec=doc_type_spec,

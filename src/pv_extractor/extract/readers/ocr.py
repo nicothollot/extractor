@@ -17,6 +17,9 @@ from __future__ import annotations
 import logging
 import re
 import statistics
+import os
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +32,20 @@ from pv_extractor.logging_setup import log_event
 logger = logging.getLogger(__name__)
 
 _RAPIDOCR_SINGLETON = None  # model load is expensive; one engine per process
+
+# Per-page OCR cache. OCR is the single most expensive step on scanned memos and
+# the SAME pages are OCR'd more than once per run — the extraction pass and the
+# LLM payload pass both call ocr_pdf_pages over the same file. Memoize by page
+# identity (path + mtime + size + dpi + engine) so a page is OCR'd once per
+# process. Bounded LRU, thread-safe (jobs run in a shared-process pool).
+_OCR_CACHE: "OrderedDict[tuple, OcrPageResult]" = OrderedDict()
+_OCR_CACHE_LOCK = threading.Lock()
+_OCR_CACHE_MAX = 512
+
+
+def clear_ocr_cache() -> None:
+    with _OCR_CACHE_LOCK:
+        _OCR_CACHE.clear()
 
 
 @dataclass
@@ -99,16 +116,39 @@ class OcrReader:
         are simply absent from the result (caller flags them)."""
         if not self.available():
             return {}
+        wanted = sorted(set(page_numbers))
+        # File identity for the cache; on a stat failure fall back to uncached.
+        try:
+            st = os.stat(path)
+            ident: tuple | None = (str(path), st.st_mtime_ns, st.st_size, self.cfg.dpi, self.cfg.engine)
+        except OSError:
+            ident = None
+
+        out: dict[int, OcrPageResult] = {}
+        misses: list[int] = []
+        if ident is not None:
+            with _OCR_CACHE_LOCK:
+                for number in wanted:
+                    hit = _OCR_CACHE.get((*ident, number))
+                    if hit is not None:
+                        _OCR_CACHE.move_to_end((*ident, number))
+                        out[number] = hit
+                    else:
+                        misses.append(number)
+        else:
+            misses = wanted
+        if not misses:
+            return out
+
         with open_read(path) as fh:
             data = fh.read()
         try:
             doc = fitz.open(stream=data, filetype="pdf")
         except Exception as exc:
             log_event(logger, "ocr open failed", path=str(path), error=str(exc))
-            return {}
-        out: dict[int, OcrPageResult] = {}
+            return out
         try:
-            for number in sorted(set(page_numbers)):
+            for number in misses:
                 if not 1 <= number <= doc.page_count:
                     continue
                 page = doc[number - 1]
@@ -116,6 +156,12 @@ class OcrReader:
                 result = self._ocr_png(png, number)
                 if result is not None:
                     out[number] = result
+                    if ident is not None:
+                        with _OCR_CACHE_LOCK:
+                            _OCR_CACHE[(*ident, number)] = result
+                            _OCR_CACHE.move_to_end((*ident, number))
+                            while len(_OCR_CACHE) > _OCR_CACHE_MAX:
+                                _OCR_CACHE.popitem(last=False)
                     log_event(
                         logger, "ocr page complete", path=str(path), page=number,
                         engine=result.engine, mean_confidence=result.mean_confidence,

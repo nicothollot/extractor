@@ -29,6 +29,7 @@ from pv_extractor.api.schemas import (
     OverrideRequest,
     ReviewActionRequest,
     RunRequest,
+    SourceDocsRequest,
     VerifyFileRequest,
 )
 from pv_extractor.config import Config
@@ -317,6 +318,28 @@ def job_selection(job_id: str, request: Request) -> dict:
     return selection.model_dump()
 
 
+@router.get("/jobs/{job_id}/selection/slot")
+def job_selection_slot(
+    job_id: str, client: str, deal: str, request: Request,
+    period: str | None = None, doc_type: str | None = None,
+) -> dict:
+    """Re-resolve ONE (client, deal, period, doc_type) slot for the
+    Confirm-documents table. Used after a swap/override so the table refreshes
+    just the affected row — no re-running locate()+peek-verify for every slot in
+    scope. `period`/`doc_type` default to the run's first values."""
+    config = _config(request)
+    manager = _manager(request)
+    if manager.get(job_id) is None:
+        raise HTTPException(404, detail=f"unknown job {job_id!r}")
+    try:
+        slot = selection_service.build_single_slot(
+            manager, job_id, config, client, deal, period=period, doc_type=doc_type
+        )
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    return slot.model_dump()
+
+
 @router.websocket("/ws/jobs/{job_id}")
 async def job_events_ws(websocket: WebSocket, job_id: str) -> None:
     """Replay persisted events from ?since=<seq>, then stream live ones.
@@ -424,9 +447,19 @@ def _resolve_override_key(conn, config: Config, body: OverrideRequest) -> tuple[
     )
     if deal is None:
         raise HTTPException(400, detail=f"deal {body.deal!r} does not resolve under client {client!r}")
+    if not (body.period or "").strip():
+        raise HTTPException(
+            400,
+            detail="no period was supplied for this document — pick a period (e.g. Q1 2026) "
+            "before swapping or adding a file.",
+        )
     target = resolve_target_period(body.period, config.client_period_style(client))
     if target is None:
-        raise HTTPException(400, detail=f"period {body.period!r} does not resolve to an as-of date")
+        raise HTTPException(
+            400,
+            detail=f"period {body.period!r} does not resolve to an as-of date "
+            "(try a quarter like 'Q1 2026', a month like 'January 2026', or an ISO date '2026-03-31').",
+        )
     return client, deal, target
 
 
@@ -449,6 +482,41 @@ def record_locator_override(body: OverrideRequest, request: Request) -> dict:
         return {"recorded": {
             "client": client, "deal": deal, "as_of_date": target.isoformat(),
             "doc_type": body.doc_type.value, "file_path": body.file_path,
+        }}
+    finally:
+        conn.close()
+
+
+@router.post("/locator/source-docs")
+def record_source_docs(body: SourceDocsRequest, request: Request) -> dict:
+    """Record the SET of documents for one investment (multi-doc merge):
+    file_paths[0] becomes the primary (override = the row's identity); the rest
+    are extra sources merged into the same row by best confidence per field.
+    A 0/1-element list clears the extras. Every path must be indexed."""
+    from pv_extractor.locator import overrides
+
+    config = _config(request)
+    conn = db.open_db(config.db_path, config.pv_root)
+    try:
+        client, deal, target = _resolve_override_key(conn, config, body)
+        for path in body.file_paths:
+            if overrides.indexed_record_for_path(conn, path) is None:
+                raise HTTPException(400, detail=f"{path!r} is not in the file index")
+        primary = body.file_paths[0] if body.file_paths else None
+        extras = body.file_paths[1:]
+        if primary is not None:
+            overrides.record_override(
+                conn, client=client, deal=deal, as_of_date=target,
+                doc_type=body.doc_type.value, file_path=primary,
+                note="primary of a multi-document selection",
+            )
+        overrides.set_extra_docs(
+            conn, client=client, deal=deal, as_of_date=target,
+            doc_type=body.doc_type.value, file_paths=extras,
+        )
+        return {"recorded": {
+            "client": client, "deal": deal, "as_of_date": target.isoformat(),
+            "doc_type": body.doc_type.value, "primary": primary, "extra_docs": extras,
         }}
     finally:
         conn.close()
@@ -549,3 +617,38 @@ def open_containing_folder(body: OpenFolderRequest, request: Request) -> dict:
     except OSError as exc:
         raise HTTPException(500, detail=f"could not open folder: {exc}") from exc
     return {"opened": str(folder)}
+
+
+@router.post("/locator/open-file")
+def open_document(body: OpenFolderRequest, request: Request) -> dict:
+    """Open a document in its OS default application for inspection (explicit
+    analyst action; the file must live under pv_root). Read-only — opening a
+    file never writes the share."""
+    config = _config(request)
+    target = str(Path(body.path))
+    if not is_under_pv_root(target, config.pv_root):
+        raise HTTPException(400, detail="path is outside pv_root")
+    if not Path(target).is_file():
+        raise HTTPException(404, detail="file not found")
+    try:
+        if platform.system() == "Windows":
+            os.startfile(target)  # noqa: S606 — explicit analyst action
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", target])
+        else:
+            subprocess.Popen(["xdg-open", target])
+    except OSError as exc:
+        raise HTTPException(500, detail=f"could not open file: {exc}") from exc
+    return {"opened": target}
+
+
+@router.get("/locator/preview")
+def candidate_preview(request: Request, file_path: str, page: int = 1) -> FileResponse:
+    """Render a candidate document page (default page 1) to PNG so the analyst
+    can eyeball it in Confirm documents before picking. PDF + pv_root only."""
+    config = _config(request)
+    try:
+        path = evidence_service.render_file_page(config, file_path, page)
+    except evidence_service.EvidenceError as exc:
+        raise HTTPException(404, detail=str(exc)) from exc
+    return FileResponse(path, media_type="image/png")

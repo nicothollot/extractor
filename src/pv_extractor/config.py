@@ -95,6 +95,12 @@ class LocatorWeights(BaseModel):
     client_deal_normalized: float = 27.0
     client_deal_fuzzy_max: float = 22.0
     period_folder_exact: float = 25.0
+    # Date folder parses to a DIFFERENT date but the SAME reporting period as
+    # the target under the client's cadence (e.g. a 2.28 month-end folder when
+    # the target is Q1: still Q1). Scored just below an exact hit so an exact
+    # match still wins, but a sibling-month doc in the same quarter is found
+    # rather than penalized. Only applied when locator.tolerate_same_period.
+    period_folder_same_period: float = 22.0
     period_folder_mismatch: float = -20.0
     period_in_filename: float = 15.0
     period_mtime_window: float = 3.0
@@ -131,6 +137,24 @@ class LocatorConfig(BaseModel):
     # bare NOT_YET_UPLOADED with no candidates. Lets the analyst "Replace" with a
     # real document. False = the strict doc-type-only behavior.
     surface_period_matches_without_doctype: bool = True
+    # When the peek-verifier leaves a slot AMBIGUOUS (several acceptable
+    # candidates, none disambiguated to a single survivor), auto-select the
+    # highest-confidence candidate the locator already deemed acceptable
+    # (final_score >= min_accept_score; VERIFIED preferred, then peek confidence,
+    # then locator score) and resolve to FOUND — the analyst can still swap it in
+    # Confirm documents. Sub-threshold candidates (archived priors, period-only
+    # fallbacks) are NOT auto-accepted: they stay AMBIGUOUS for a human pick.
+    # False = always leave multi-candidate ambiguity for the human.
+    auto_select_best_on_ambiguous: bool = True
+    # Treat a document as a period match when its as-of date falls in the SAME
+    # reporting period (quarter for quarterly clients, month for monthly,
+    # fiscal quarter for fiscal) as the target — not only on an exact-date hit.
+    # This is what lets one "Q1 2026" selection find every deal in Q1 even when
+    # they file at different month-ends, and stops the peek-verifier from
+    # rejecting a genuine same-quarter document for a non-quarter-end as-of.
+    # Exact-date hits still outrank same-period hits. False = strict exact-date
+    # behavior (the original Phase-1/2 semantics) byte-for-byte.
+    tolerate_same_period: bool = True
     mtime_window_days: int = 75
     family_ratio_threshold: int = 92
     fuzzy_match_threshold: int = 80
@@ -406,6 +430,13 @@ class PeekVerifyConfig(BaseModel):
             "valuation memo", "valuation memorandum", "investment committee", "ic memo",
             "portfolio review", "quarterly review", "valuation summary", "fair value",
             "valuation as of", "concluded value", "enterprise value", "net asset value",
+            # client-template vocabulary (AWM/GP valuation & financials templates):
+            "valuation template", "valuation overview", "valuation methodology",
+            "valuation metric", "implied multiple", "implied enterprise value",
+            "equity value", "total equity value", "discounted cashflow",
+            "discounted cash flow", "comparable multiple", "comparable summary",
+            "ev/ebitda", "reported ebitda", "financials template",
+            "company financial performance",
         ]
     )
     hl_work_product_markers: list[str] = Field(
@@ -458,6 +489,22 @@ class LlmConfig(BaseModel):
     cache_enabled: bool = True  # response cache; --force-llm bypasses reads
     timeout_seconds: int = 600  # per Claude Code extraction call
     max_pages_per_memo: int = 20  # payload page cap (candidate pages + pages 1-3)
+    # ONE LLM CALL PER DEAL (default). Instead of escalating each document
+    # separately with band-batched, multi-call extraction, group a deal-period's
+    # documents together and make a SINGLE claude -p call over ALL of their pages
+    # for the whole field set (the $ref schema keeps ~200 fields under the
+    # Windows inline-schema limit). The deterministic engine still runs first
+    # (grounding, comps tables, derived fields); the LLM is the primary field
+    # extractor in one clear message. This is far faster than the per-band,
+    # per-tier fan-out and is what an analyst expects ("read the whole deal,
+    # give me the fields"). It implies comprehensive (force-assist) escalation
+    # and bypasses the deterministic result cache, exactly like --force-llm-assist.
+    # False = the legacy per-memo band-batched path (byte-for-byte unchanged).
+    one_call_per_deal: bool = True
+    # Total page cap for a combined per-deal payload (across all the deal's
+    # documents). Bounds the single call so a deal with many large documents
+    # stays feasible; documents contribute their summary pages first.
+    max_pages_per_deal: int = 40
     image_max_long_edge: int = 1080  # SCANNED/IMAGE_TABLE page render cap, PNG
     quote_match_threshold: int = 85  # fuzzy quote-grounding floor on OCR pages
     # Band-batched extraction: instead of one giant call over every escalated
@@ -467,9 +514,49 @@ class LlmConfig(BaseModel):
     # and bands the document shows no evidence for are batched into one cheap
     # pass rather than expanded across every tier. False = legacy single call.
     band_batched: bool = True
+    # Small-doc collapse: when the LLM payload is at most this many pages, ignore
+    # band_batched and make ONE call over the whole document + all fields (far
+    # cheaper/faster for short client memos; the model also sees the full doc at
+    # once). Large memos still band-batch. 0 disables the collapse.
+    single_call_max_pages: int = 8
+    # When the model answers not_found for a field (it looked and the field is
+    # absent from the supplied pages), treat that as RESOLVED: do not re-ask the
+    # expensive AUTO retry tier for it, and do not raise a NOT_EXTRACTABLE flag
+    # (a confirmed absence is not an extraction failure). Fields that FAILED
+    # (call error) or were REJECTED (ungrounded/type/vocab) still escalate. Set
+    # True to restore the old behavior (retry not_found on the stronger tier).
+    retry_not_found: bool = False
+    # When the model returns a parseable value whose verbatim quote can't be
+    # matched on the cited page (common on SCANNED pages: the OCR text differs
+    # from what the model read off the image), SHOW the value as a low-confidence
+    # hit with an UNGROUNDED flag for the analyst to review, instead of silently
+    # discarding it. False = discard ungrounded values (stricter, but a clean
+    # scanned memo can then yield nothing).
+    surface_ungrounded_values: bool = True
+    ungrounded_confidence_cap: float = 0.2  # max confidence stamped on a surfaced ungrounded value
     band_relevance_floor: float = 0.0  # band anchor score strictly above this = "has evidence"
-    max_fields_per_call: int = 50  # split a band's call when it carries more fields than this
+    # Max fields per LLM call. With the $ref response schema (~10x smaller than
+    # inlining the field shape) a 200-field schema is ~12 KB inline, well under
+    # the Windows ~32 KB command-line limit — so the whole escalate-everything
+    # set fits in ONE call instead of many tiny ones.
+    max_fields_per_call: int = 200
+    # SCANNED pages are normally sent as page IMAGES (read via the Read tool),
+    # which is slow (vision reasoning + huge output) and re-done per call. When a
+    # scanned page OCRs cleanly (mean confidence >= ocr_text_min_confidence), send
+    # that OCR TEXT instead — far faster, cheaper, and the quote-grounding matches
+    # the same text. IMAGE_TABLE pages always stay images (OCR mangles tables).
+    prefer_ocr_text_over_image: bool = True
+    ocr_text_min_confidence: float = 0.85
     no_evidence_effort: str = "low"  # effort for the single no-evidence sweep call
+    # Adaptive page-locality batching (efficiency). With band_batched on, bands
+    # that target the SAME pages are MERGED into one call instead of one call
+    # per band — so a small document (every band on pages 1-3) becomes a handful
+    # of calls instead of ~19, and each page-set is sent to the model once.
+    # Each merged call is still capped at max_fields_per_call. Bands on genuinely
+    # different pages stay separate, so a large document still fans out by where
+    # its data actually lives. False = one call per band (original behavior).
+    adaptive_batching: bool = True
+    adaptive_max_pages_per_call: int = 8  # merge page-sets until their union exceeds this
     exclude_dynamic_system_prompt_sections: bool = True  # pass flag when CLI supports it
     # LLM self-reported confidence -> FieldHit.confidence
     confidence_scores: dict[str, float] = Field(
@@ -501,6 +588,18 @@ class LoggingConfig(BaseModel):
     level: str = "INFO"
 
 
+class SelectionConfig(BaseModel):
+    """New Run 'Confirm documents' tunables (GUI-editable, shared with the
+    Confirm-documents threshold control — the same value lives here and in the
+    Settings screen)."""
+
+    # Auto-pick floor (0..1): on the Confirm-documents step, a slot whose
+    # auto-selected document has peek-verify confidence BELOW this is dropped
+    # from the run (deselected) when the analyst clicks Refresh; at/above it is
+    # kept. 0.0 = keep every located document (no confidence filtering).
+    min_confidence: float = 0.0
+
+
 class Config(BaseModel):
     pv_root: str = "\\\\hlhz\\dfs\\nyfva\\PV"
     output_dir: Path = Path("./output")
@@ -516,6 +615,7 @@ class Config(BaseModel):
     multi_search: MultiSearchConfig = Field(default_factory=MultiSearchConfig)
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
     peek_verify: PeekVerifyConfig = Field(default_factory=PeekVerifyConfig)
+    selection: SelectionConfig = Field(default_factory=SelectionConfig)
     llm: LlmConfig = Field(default_factory=LlmConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

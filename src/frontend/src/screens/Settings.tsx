@@ -923,6 +923,17 @@ export default function Settings() {
               <Field label="Escalation confidence threshold">
                 <input className={inputCls} type="number" step="0.05" min="0" max="1" value={Number(value("extraction.confidence_threshold", c.extraction.confidence_threshold))} onChange={(e) => setValue("extraction.confidence_threshold", Number(e.target.value))} />
               </Field>
+              <Field label="Confirm-documents auto-select floor (%)">
+                <input
+                  className={inputCls}
+                  type="number"
+                  step="1"
+                  min="0"
+                  max="100"
+                  value={Math.round(Number(value("selection.min_confidence", c.selection?.min_confidence ?? 0)) * 100)}
+                  onChange={(e) => setValue("selection.min_confidence", Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
+                />
+              </Field>
               {auto &&
                 ([
                   ["llm.auto.extraction_model", "AUTO: extraction model", auto.extraction_model],

@@ -50,6 +50,7 @@ _EDITABLE_PREFIXES = (
     "llm.",
     "extraction.confidence_threshold",
     "deal_discovery.display_min_confidence",
+    "selection.min_confidence",
 )
 
 
@@ -1000,8 +1001,15 @@ def search_feedback(request: Request, body: SearchFeedbackRequest) -> dict:
 
 @router.get("/index/periods")
 def periods(request: Request, client: str | None = None, deal: str | None = None) -> dict:
-    """Date folders that actually exist in the index, newest first, with the
-    client-style display label."""
+    """Reporting periods that exist in the index, newest first, DEDUPED to the
+    client-style label (one 'Q1 2026', never one per underlying date folder).
+
+    Many distinct date folders can map to the same reporting period — e.g. for a
+    calendar-quarterly client, deals filed under 1.31, 2.28 and 3.31 are all
+    'Q1 2026'. We collapse them so the picker shows the quarter ONCE. The submit
+    value is the label itself ('period'); with locator.tolerate_same_period a run
+    on that label finds every deal in the quarter regardless of its month-end.
+    `as_of_date` is the representative (latest) underlying date, for display."""
     config = _config(request)
     conn = _open_index(config)
     try:
@@ -1020,11 +1028,18 @@ def periods(request: Request, client: str | None = None, deal: str | None = None
             dates = sorted({date_type.fromisoformat(r[0]) for r in rows})
     finally:
         conn.close()
-    style_client = client or "default"
+    style = config.client_period_style(client or "default")
+    # Group by reporting-period label; keep the latest underlying date as the
+    # representative. dates is ascending, so the last write per label is newest.
+    by_label: dict[str, date_type] = {}
+    for d in dates:
+        by_label[period_label(d, style)] = d
+    # Newest period first (by the representative date).
+    ordered = sorted(by_label.items(), key=lambda kv: kv[1], reverse=True)
     return {
         "periods": [
-            {"as_of_date": d.isoformat(), "label": period_label(d, config.client_period_style(style_client))}
-            for d in reversed(dates)
+            {"period": label, "label": label, "as_of_date": rep.isoformat()}
+            for label, rep in ordered
         ]
     }
 
@@ -1045,7 +1060,9 @@ def periods_expand(request: Request, start: str, end: str, client: str | None = 
     out = []
     for label in labels:
         as_of = resolve_target_period(label, style)
-        out.append({"label": label, "as_of_date": as_of.isoformat() if as_of else label})
+        # 'period' (the submit value) is the label, so a range round-trips as
+        # quarter labels and matches every deal in each quarter (see /index/periods).
+        out.append({"period": label, "label": label, "as_of_date": as_of.isoformat() if as_of else label})
     return {"periods": out, "error": None}
 
 
@@ -1132,6 +1149,7 @@ def get_config(request: Request) -> dict:
         "llm": config.llm.model_dump(exclude={"confidence_scores"}),
         "extraction": {"confidence_threshold": config.extraction.confidence_threshold},
         "deal_discovery": {"display_min_confidence": config.deal_discovery.display_min_confidence},
+        "selection": {"min_confidence": config.selection.min_confidence},
     }
 
 

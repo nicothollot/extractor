@@ -144,3 +144,34 @@ def test_override_winner_is_verified_but_forces_past_rejection(phase2_env) -> No
         )
     finally:
         conn.close()
+
+
+def test_multidoc_merge_collapses_to_one_row(phase2_env) -> None:
+    """Recording extra source docs for a slot makes run() extract each chosen
+    document and merge them into ONE row (best confidence per field), instead of
+    one row per file. The merge is recorded in the memo flags (never silent)."""
+    conn = _conn(phase2_env)
+    try:
+        rows = conn.execute(
+            "SELECT file_path FROM files WHERE file_path LIKE '%Accell%1.31.25%' "
+            "AND lower(file_path) LIKE '%.pdf' ORDER BY file_path"
+        ).fetchall()
+        paths = [r[0] for r in rows]
+        primary = next(p for p in paths if p.endswith("vf.pdf"))
+        extra = next(p for p in paths if p.endswith("v1.pdf"))
+        key = dict(client="Angelo Gordon", deal="Accell",
+                   as_of_date=date(2025, 1, 31), doc_type="valuation_memo")
+        overrides.record_override(conn, **key, file_path=primary)
+        overrides.set_extra_docs(conn, **key, file_paths=[extra])
+    finally:
+        conn.close()
+
+    report = run(
+        phase2_env, scope="deal", client="Angelo Gordon", deal="Accell",
+        period="2025-01-31", doc_type=DocType.valuation_memo, llm_settings=None,
+    )
+    accell = [m for m in report.memos if m.deal == "Accell"]
+    assert len(accell) == 1, "the two source docs must merge into one memo/row"
+    memo = accell[0]
+    assert len(memo.assets) == 1
+    assert any("Merged from 2 source documents" in f.description for f in memo.memo_flags)

@@ -219,6 +219,22 @@ def test_period_folder_mismatch(config: Config) -> None:
     assert bd.period_method == "folder_mismatch"
 
 
+def test_period_folder_same_quarter_is_a_match(config: Config) -> None:
+    # TARGET is 2025-01-31 (Q1 2025); a 3.31.2025 folder is a DIFFERENT date but
+    # the SAME quarter, so with tolerate_same_period it scores just below exact.
+    bd = scored(config, "Angelo Gordon\\Accell\\3.31.2025\\Client\\Accell Valuation Memo.pdf").breakdown
+    assert bd.period_score == config.locator.weights.period_folder_same_period
+    assert bd.period_method == "folder_same_period"
+    assert bd.period_score < config.locator.weights.period_folder_exact
+
+
+def test_period_same_quarter_off_when_flag_disabled(config: Config) -> None:
+    config.locator.tolerate_same_period = False
+    bd = scored(config, "Angelo Gordon\\Accell\\3.31.2025\\Client\\Accell Valuation Memo.pdf").breakdown
+    assert bd.period_score == config.locator.weights.period_folder_mismatch
+    assert bd.period_method == "folder_mismatch"
+
+
 def test_period_in_filename(config: Config) -> None:
     bd = scored(config, "Angelo Gordon\\Accell\\Client\\Accell Valuation Memo 1.31.25.pdf").breakdown
     assert bd.period_score == config.locator.weights.period_in_filename

@@ -9,6 +9,8 @@ estimates in the ledger once the run executes."""
 
 from __future__ import annotations
 
+import os
+import threading
 from pathlib import Path
 
 import pymupdf
@@ -53,19 +55,39 @@ class PreflightEstimate(BaseModel):
     assumptions: dict = Field(default_factory=dict)
 
 
+_PAGE_COUNT_CACHE: "dict[tuple, int | None]" = {}
+_PAGE_COUNT_LOCK = threading.Lock()
+
+
 def _pdf_page_count(file_path: str) -> int | None:
+    """Total page count of a PDF, memoized by file identity so the selection
+    table and preflight don't reopen the same file once per slot per reload."""
     if not file_path.lower().endswith(".pdf"):
         return None
+    key = None
+    try:
+        st = os.stat(file_path)
+        key = (file_path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None:
+        with _PAGE_COUNT_LOCK:
+            if key in _PAGE_COUNT_CACHE:
+                return _PAGE_COUNT_CACHE[key]
     try:
         with open_read(file_path) as fh:
             data = fh.read()
         doc = pymupdf.open(stream=data, filetype="pdf")
         try:
-            return doc.page_count
+            count: int | None = doc.page_count
         finally:
             doc.close()
     except Exception:  # noqa: BLE001 — preflight estimates degrade, never fail
         return None
+    if key is not None:
+        with _PAGE_COUNT_LOCK:
+            _PAGE_COUNT_CACHE[key] = count
+    return count
 
 
 def estimate_from_dry_run(

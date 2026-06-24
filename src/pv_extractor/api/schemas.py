@@ -132,6 +132,15 @@ class VerifyFileRequest(LocateRequest):
     file_path: str
 
 
+class SourceDocsRequest(LocateRequest):
+    """Record the SET of source documents for one investment (multi-doc merge):
+    file_paths[0] is the primary (recorded as the override = the row's identity);
+    the rest are extra sources whose fields are merged into the same row by best
+    confidence. An empty/one-element list clears the extras."""
+
+    file_paths: list[str] = Field(default_factory=list)
+
+
 class OpenFolderRequest(BaseModel):
     path: str  # file or folder; the containing folder is opened
 

@@ -6,10 +6,14 @@ CLI by default (the only exception is tests/test_llm_live.py, opt-in)."""
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from pv_extractor.llm.claude_code_client import LOGIN_REMEDIATION, ClaudeCodeResult
 from pv_extractor.models import LlmUsage
+
+# Field lines in the call prompt look like:  - "Gross IRR %" {json key: Gross_IRR} (...)
+_PROMPT_KEY_RE = re.compile(r'"(?P<header>[^"]+)"\s*\{json key:\s*(?P<key>[^}]+)\}')
 
 
 def field_result(
@@ -32,14 +36,20 @@ def field_result(
     }
 
 
-def schema_response(schema: dict, values: dict[str, dict]) -> dict:
+def schema_response(
+    schema: dict, values: dict[str, dict], key_to_header: dict[str, str] | None = None
+) -> dict:
     """Fill EVERY band/field the response schema demands: canned objects for
-    headers in `values`, not_found for the rest (always schema-valid)."""
+    headers in `values`, not_found for the rest (always schema-valid). The
+    schema's property keys are the sanitized JSON keys, so `key_to_header`
+    (parsed from the call prompt) maps each schema key back to its workbook
+    header before looking it up in the header-keyed `values`."""
+    key_to_header = key_to_header or {}
     out: dict[str, dict] = {}
     for band, band_schema in schema["properties"].items():
         out[band] = {
-            header: values.get(header, field_result(not_found=True))
-            for header in band_schema["properties"]
+            key: values.get(key_to_header.get(key, key), field_result(not_found=True))
+            for key in band_schema["properties"]
         }
     return out
 
@@ -149,7 +159,11 @@ class FakeClaudeCodeClient:
         if self.mode == "intent":
             structured = intent_response(schema, **self.intent_anchors)
         else:
-            structured = schema_response(schema, self.values)
+            key_to_header = {
+                m.group("key").strip(): m.group("header")
+                for m in _PROMPT_KEY_RE.finditer(prompt)
+            }
+            structured = schema_response(schema, self.values, key_to_header)
         return ClaudeCodeResult(
             job_id=job_id, ok=True, exit_code=0, duration_seconds=0.2,
             session_id=f"sess-fake-{len(self.calls):03d}",

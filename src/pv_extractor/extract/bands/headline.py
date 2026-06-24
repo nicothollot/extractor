@@ -48,7 +48,10 @@ OPERATING = SpecBandExtractor(
     "OPERATING FINANCIALS",
     [
         spec("Revenue ($M)", "Revenue", "LTM Revenue", "Total Revenue"),
-        spec("EBITDA ($M)", "EBITDA", "LTM EBITDA", "Adjusted EBITDA", "Cash EBITDA"),
+        spec(
+            "EBITDA ($M)", "EBITDA", "LTM EBITDA", "Adjusted EBITDA", "Cash EBITDA",
+            "Reported EBITDA", "Reported EBITDA (Primary EBITDA Metric)", "Credit Adj. EBITDA",
+        ),
         spec("EBITDA Margin %", "EBITDA Margin"),
         spec("EBITDA vs Budget %", "EBITDA vs Budget", "EBITDA vs Plan"),
         spec("Maintenance Capex ($M)", "Maintenance Capex"),

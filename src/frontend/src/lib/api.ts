@@ -261,6 +261,8 @@ export interface SelectionSlot {
   client: string;
   deal: string;
   slot_key: string;
+  period: string;  // the slot's requested period label (drives the period tabs)
+  doc_type: string;  // the slot's requested doc-type (slug or enum value)
   status: string;
   as_of_date: string | null;
   predicted_period: string;
@@ -274,6 +276,7 @@ export interface SelectionSlot {
   verify_status: string;
   confidence: number | null;
   score: number | null;
+  extra_docs?: string[];  // multi-doc merge: extra source files for this slot
   candidates: SelectionCandidate[];
   // Multi-search additions (backend now returns these on multi-path slots;
   // optional so the single-firm SelectionResponse path still type-checks).
@@ -422,6 +425,7 @@ export interface ConfigResponse {
   };
   extraction: { confidence_threshold: number };
   deal_discovery: { display_min_confidence: number };
+  selection: { min_confidence: number };
 }
 
 export interface RawConfigResponse {
@@ -532,3 +536,7 @@ export const evidenceUrl = (runId: string, memoId: string, page: number, bbox: n
   }
   return `/api/runs/${runId}/evidence/${memoId}?${params}`;
 };
+
+/** Rendered page image of an arbitrary candidate file (Confirm documents). */
+export const candidatePreviewUrl = (filePath: string, page = 1) =>
+  `/api/locator/preview?file_path=${encodeURIComponent(filePath)}&page=${page}`;

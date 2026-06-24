@@ -180,12 +180,14 @@ def assemble_payload(
         n for n in selected
         if pages_by_number[n].page_class is PageClass.SCANNED and content.reader == "pdf"
     ]
+    ocr_conf: dict[int, float] = {}
     if scanned and config.extraction.ocr.enabled:
         ocr = OcrReader(config.extraction.ocr)
         if ocr.available():
             for number, result in ocr.ocr_pdf_pages(file_path, scanned).items():
                 pages_by_number[number].text = result.text
                 pages_by_number[number].ocr_engine = result.engine
+                ocr_conf[number] = result.mean_confidence
 
     pdf_bytes: bytes | None = None
     if content.reader == "pdf":
@@ -197,7 +199,17 @@ def assemble_payload(
     block_start = len(prompt_sections)
     for number in selected:
         page = pages_by_number[number]
-        as_image = page.page_class in _IMAGE_CLASSES and pdf_bytes is not None
+        # A SCANNED page that OCR'd cleanly is sent as TEXT, not an image: the
+        # Read-tool/vision path is slow (huge output, re-done per call) and the
+        # OCR text is reliable at high confidence. IMAGE_TABLE always stays an
+        # image (OCR mangles table structure).
+        high_ocr_text = (
+            page.page_class is PageClass.SCANNED
+            and config.llm.prefer_ocr_text_over_image
+            and ocr_conf.get(number, 0.0) >= config.llm.ocr_text_min_confidence
+            and bool((page.text or "").strip())
+        )
+        as_image = page.page_class in _IMAGE_CLASSES and pdf_bytes is not None and not high_ocr_text
         png = (
             _render_page_png(pdf_bytes, number, config.llm.image_max_long_edge)
             if as_image
@@ -229,9 +241,10 @@ def assemble_payload(
             payload.page_texts[number] = text_block
             prompt_sections.append(f"--- page {number} ({page.page_class.value}) ---\n{text_block}")
 
-    payload.ocr_hostile = any(
-        pages_by_number[n].page_class in _IMAGE_CLASSES for n in selected
-    )
+    # OCR-hostile only if a page is ACTUALLY sent as an image (a scanned page
+    # downgraded to high-confidence OCR text is text, not vision — AUTO can stay
+    # on sonnet rather than escalating to opus for it).
+    payload.ocr_hostile = any(p.kind == "image" for p in payload.pages)
     # Per-page sections (everything after the "== DOCUMENT PAGES ==" header)
     # line up with `selected` in order — keep them so band-scoped calls can
     # compose a prompt from only the pages a band needs.
@@ -257,5 +270,171 @@ def assemble_payload(
         logger, "llm payload assembled",
         pages=len(payload.pages), images=payload.image_count,
         page_count=content.page_count, ocr_hostile=payload.ocr_hostile,
+    )
+    return payload
+
+
+def assemble_deal_payload(
+    *,
+    files: list[tuple[str, str]],
+    fields: list[EscalationField],
+    config: Config,
+    payload_dir: Path,
+) -> MemoPayload:
+    """Re-read EVERY document of one deal-period (read-only) into ONE payload.
+
+    This backs the one-call-per-deal LLM pass: a deal's whole document set is
+    extracted in a SINGLE `claude -p` call. All documents' pages are concatenated
+    under a single GLOBAL page index (1..N) so quote-grounding still keys off
+    `page` -> page_texts[page]; each block is labelled with its source document
+    and that document's own page number so the model (and a reviewer) can tell
+    the documents apart. A document that fits the per-document cap is sent WHOLE
+    ("parse the whole document"); an oversized one falls back to candidate-page
+    selection. Cleanly-OCR'd scanned pages travel as TEXT (fast); IMAGE_TABLE and
+    low-confidence scanned pages stay images. The total page count is bounded by
+    `llm.max_pages_per_deal` so a deal with many large documents stays feasible.
+    """
+    payload = MemoPayload(directory=payload_dir)
+    prompt_sections: list[str] = ["== DOCUMENT PAGES =="]
+    block_offsets: list[tuple[int, int]] = []  # (global page no, prompt_sections index)
+    manifest_docs: list[dict] = []
+    total_cap = max(1, config.llm.max_pages_per_deal)
+    per_doc_cap = max(1, config.llm.max_pages_per_memo)
+    summary_pages = config.extraction.summary_pages
+    global_no = 0
+    readable = 0
+
+    for doc_index, (file_path, label) in enumerate(files):
+        if global_no >= total_cap:
+            break
+        extension = Path(file_path).suffix.lower()
+        reader = reader_for_extension(extension, config.extraction.page_classification)
+        if reader is None:
+            log_event(logger, "deal payload: skipped doc (no reader)", doc=doc_index)
+            continue
+        try:
+            content = reader.summarize(file_path)
+        except OSError as exc:
+            log_event(logger, "deal payload: skipped doc (read error)", doc=doc_index, error=str(exc))
+            continue
+        if content.flags:
+            log_event(
+                logger, "deal payload: skipped doc (unreadable)",
+                doc=doc_index, flags=[f.value for f in content.flags],
+            )
+            continue
+        readable += 1
+
+        doc_cap = min(per_doc_cap, total_cap - global_no)
+        if content.page_count <= doc_cap:
+            selected = list(range(1, content.page_count + 1))  # whole document
+        else:
+            selected = select_pages(fields, content.page_count, summary_pages, doc_cap)
+        pages_by_number = {page.page_number: page for page in content.pages}
+        selected = [n for n in selected if n in pages_by_number]
+        if not selected:
+            continue
+
+        tables = reader.extract_tables(file_path, selected)
+        for number in selected:
+            page = pages_by_number[number]
+            if number in tables and not page.tables:
+                page.tables = tables[number]
+
+        scanned = [
+            n for n in selected
+            if pages_by_number[n].page_class is PageClass.SCANNED and content.reader == "pdf"
+        ]
+        ocr_conf: dict[int, float] = {}
+        if scanned and config.extraction.ocr.enabled:
+            ocr = OcrReader(config.extraction.ocr)
+            if ocr.available():
+                for number, result in ocr.ocr_pdf_pages(file_path, scanned).items():
+                    pages_by_number[number].text = result.text
+                    pages_by_number[number].ocr_engine = result.engine
+                    ocr_conf[number] = result.mean_confidence
+
+        pdf_bytes: bytes | None = None
+        if content.reader == "pdf":
+            with open_read(file_path) as fh:
+                pdf_bytes = fh.read()
+
+        manifest_docs.append({"doc": doc_index, "label": label, "pages": selected})
+        for number in selected:
+            if global_no >= total_cap:
+                break
+            page = pages_by_number[number]
+            global_no += 1
+            high_ocr_text = (
+                page.page_class is PageClass.SCANNED
+                and config.llm.prefer_ocr_text_over_image
+                and ocr_conf.get(number, 0.0) >= config.llm.ocr_text_min_confidence
+                and bool((page.text or "").strip())
+            )
+            as_image = page.page_class in _IMAGE_CLASSES and pdf_bytes is not None and not high_ocr_text
+            png = (
+                _render_page_png(pdf_bytes, number, config.llm.image_max_long_edge)
+                if as_image
+                else None
+            )
+            if png is not None:
+                rel = f"pages/doc{doc_index:02d}_page_{number:03d}.png"
+                digest = _write_payload_file(payload_dir / rel, png, config.pv_root)
+                payload.pages.append(
+                    PayloadPage(number=global_no, page_class=page.page_class, kind="image",
+                                rel_path=rel, sha256=digest)
+                )
+                payload.image_count += 1
+                payload.page_texts[global_no] = page.text
+                block_offsets.append((global_no, len(prompt_sections)))
+                prompt_sections.append(
+                    f"--- page {global_no} | {label}, document page {number} "
+                    f"({page.page_class.value}, image) ---\n"
+                    f'This page is an image. View it with the Read tool: "{rel}"'
+                )
+            else:
+                text_block = _page_text_block(page)
+                rel = f"pages/doc{doc_index:02d}_page_{number:03d}.txt"
+                digest = _write_payload_file(
+                    payload_dir / rel, text_block.encode("utf-8"), config.pv_root
+                )
+                payload.pages.append(
+                    PayloadPage(number=global_no, page_class=page.page_class, kind="text",
+                                rel_path=rel, sha256=digest)
+                )
+                payload.page_texts[global_no] = text_block
+                block_offsets.append((global_no, len(prompt_sections)))
+                prompt_sections.append(
+                    f"--- page {global_no} | {label}, document page {number} "
+                    f"({page.page_class.value}) ---\n{text_block}"
+                )
+
+    if global_no == 0:
+        raise PayloadError(f"no readable pages across {len(files)} document(s) for the deal")
+
+    payload.ocr_hostile = any(p.kind == "image" for p in payload.pages)
+    for global_idx, section_offset in block_offsets:
+        payload.page_blocks[global_idx] = prompt_sections[section_offset]
+    payload.dynamic_prompt = "\n\n".join(prompt_sections) + "\n"
+
+    manifest = {
+        "pages": [
+            {"number": p.number, "page_class": p.page_class.value, "kind": p.kind,
+             "file": p.rel_path, "sha256": p.sha256}
+            for p in payload.pages
+        ],
+        "documents": manifest_docs,
+    }
+    manifest_bytes = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    with guarded_open_write(payload_dir / "manifest.json", config.pv_root, mode="wb") as fh:
+        fh.write(manifest_bytes)
+    payload.payload_hash = hashlib.sha256(manifest_bytes).hexdigest()
+
+    log_event(
+        logger, "llm deal payload assembled",
+        documents=readable, pages=len(payload.pages), images=payload.image_count,
+        ocr_hostile=payload.ocr_hostile,
     )
     return payload

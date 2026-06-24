@@ -106,6 +106,17 @@ def test_manual_forces_single_pass(registry):
     assert [(t.entry.alias, t.effort, t.reason) for t in tiers] == [("sonnet", "low", "manual")]
 
 
+def test_manual_sonnet_stays_sonnet_even_for_ocr_hostile(registry):
+    """Manual means EVERYTHING uses the chosen model. OCR-hostile docs force
+    opus under AUTO, but must NOT escalate off the manual model — one sonnet
+    tier, no opus anywhere."""
+    tiers = registry.extraction_tiers(
+        mode="manual", auto=AUTO, manual_model="sonnet", manual_effort="low",
+        ocr_hostile=True,
+    )
+    assert [t.entry.alias for t in tiers] == ["sonnet"]
+
+
 def test_manual_naming_fable_is_explicit_enablement(registry):
     tiers = registry.extraction_tiers(
         mode="manual", auto=AUTO, manual_model="fable", manual_effort="high"

@@ -1,6 +1,8 @@
 /* Houlihan Lokey brand assets as React components. The official logo SVGs are
    imported verbatim (never recolored, stretched or recreated); only the canvas
    crop differs between the full signature+mark and the globe-only mark. */
+import { AnimatePresence, motion } from "framer-motion";
+import { useEffect, useState } from "react";
 import logoColor from "../assets/hl-logo.svg";
 import logoWhite from "../assets/hl-logo-white.svg";
 import markColor from "../assets/hl-mark.svg";
@@ -69,7 +71,11 @@ export function HLSpinner({ size = 44, tone = "color" }: { size?: number; tone?:
           strokeDasharray="36 200"
         />
       </svg>
-      <HLMark tone={tone} size={Math.round(size * 0.5)} className="hl-mark-pulse" />
+      {/* Absolutely centered so the globe is concentric with the ring — an
+          inline <img> otherwise sits on the text baseline a few px low. */}
+      <span className="absolute inset-0 flex items-center justify-center">
+        <HLMark tone={tone} size={Math.round(size * 0.58)} className="hl-mark-pulse block" />
+      </span>
     </span>
   );
 }
@@ -80,6 +86,48 @@ export function HLLoading({ label = "Loading…", size = 48, tone = "color" }: {
     <div className="flex flex-col items-center justify-center gap-3 py-10 text-ink-500">
       <HLSpinner size={size} tone={tone} />
       {label && <p className="text-[12.5px]">{label}</p>}
+    </div>
+  );
+}
+
+/**
+ * Branded loading block for long operations (locating across a large client,
+ * building the per-deal selection): the HL spinner plus a reassuring message
+ * that cycles every few seconds so the wait never feels stuck. The first
+ * message is shown immediately; the rest rotate in with a gentle cross-fade.
+ */
+export function HLWorkingHints({
+  messages,
+  size = 44,
+  intervalMs = 4000,
+}: {
+  messages: string[];
+  size?: number;
+  intervalMs?: number;
+}) {
+  const [i, setI] = useState(0);
+  useEffect(() => {
+    if (messages.length <= 1) return;
+    const id = setInterval(() => setI((n) => (n + 1) % messages.length), intervalMs);
+    return () => clearInterval(id);
+  }, [messages.length, intervalMs]);
+  return (
+    <div className="flex flex-col items-center justify-center gap-3 py-10 text-ink-500" role="status">
+      <HLSpinner size={size} />
+      <div className="h-5 overflow-hidden text-center">
+        <AnimatePresence mode="wait">
+          <motion.p
+            key={i}
+            className="text-[12.5px]"
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
+            transition={{ duration: 0.3 }}
+          >
+            {messages[i] ?? messages[0]}
+          </motion.p>
+        </AnimatePresence>
+      </div>
     </div>
   );
 }

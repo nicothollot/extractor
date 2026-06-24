@@ -179,6 +179,62 @@ def test_rerank_disambiguates_ambiguous_to_found(tmp_path: Path, default_config)
     assert reranked.winner is not None and reranked.winner.record.file_path == str(good)
 
 
+def test_rerank_auto_selects_best_on_ambiguous(tmp_path: Path, default_config) -> None:
+    """Two acceptable, content-verified survivors and neither collapses to a
+    single winner: auto-select the highest-confidence (here higher-scored)
+    candidate and resolve to FOUND, instead of leaving the slot blank."""
+    a = _pdf(tmp_path, "memo_a.pdf", CLIENT_MEMO_LINES)
+    b = _pdf(tmp_path, "memo_b.pdf", CLIENT_MEMO_LINES)
+    ambiguous = LocateResult(
+        status=ResolutionStatus.AMBIGUOUS, query=_query(),
+        candidates=[_candidate(a, 60.0), _candidate(b, 58.0)],
+        evidence="scores within min_gap",
+    )
+    reranked, _ = verify_and_rerank(ambiguous, default_config)
+    assert reranked.status is ResolutionStatus.FOUND
+    assert reranked.winner is not None and reranked.winner.record.file_path == str(a)
+    assert "auto-selected" in reranked.evidence
+
+
+def test_rerank_scanned_valuation_beats_readable_nonvaluation(tmp_path: Path, default_config) -> None:
+    """The real BrightNight bug: the valuation memo is a SCANNED PDF (peek can't
+    read it -> UNVERIFIED, confidence 0.0) and a readable DDQ in the same folder
+    inspects as not-a-valuation (UNVERIFIED, OTHER, confidence > 0). When NOTHING
+    verifies, peek confidence is unreliable, so the higher locator score (the
+    scanned valuation memo) must win, not the readable off-type doc."""
+    scanned_memo = tmp_path / "Valuation.pdf"
+    make_scanned_pdf(scanned_memo, [CLIENT_MEMO_LINES])  # UNVERIFIED, conf 0.0
+    ddq = _pdf(tmp_path, "DDQ Responses.docx.pdf",
+               ["Diligence Information Request List", "Please provide the following items",
+                "Question 1", "Question 2"])  # readable, OTHER, conf > 0
+    ambiguous = LocateResult(
+        status=ResolutionStatus.AMBIGUOUS, query=_query(),
+        candidates=[_candidate(scanned_memo, 85.0), _candidate(ddq, 84.0)],
+        evidence="scores within min_gap",
+    )
+    reranked, verdicts = verify_and_rerank(ambiguous, default_config)
+    assert verdicts[str(scanned_memo)].status is VerifyStatus.UNVERIFIED
+    assert verdicts[str(ddq)].status is VerifyStatus.UNVERIFIED
+    assert reranked.status is ResolutionStatus.FOUND
+    assert reranked.winner is not None and reranked.winner.record.file_path == str(scanned_memo)
+
+
+def test_rerank_keeps_subthreshold_ambiguous_for_human(tmp_path: Path, default_config) -> None:
+    """Auto-select never accepts candidates below min_accept_score (archived
+    priors / period-only fallbacks): those stay AMBIGUOUS for a human pick."""
+    below = default_config.locator.min_accept_score - 10.0
+    a = _pdf(tmp_path, "weak_a.pdf", CLIENT_MEMO_LINES)
+    b = _pdf(tmp_path, "weak_b.pdf", CLIENT_MEMO_LINES)
+    ambiguous = LocateResult(
+        status=ResolutionStatus.AMBIGUOUS, query=_query(),
+        candidates=[_candidate(a, below), _candidate(b, below - 2.0)],
+        evidence="period fallback below accept",
+    )
+    reranked, _ = verify_and_rerank(ambiguous, default_config)
+    assert reranked.status is ResolutionStatus.AMBIGUOUS
+    assert reranked.winner is None
+
+
 def test_rerank_all_rejected_becomes_not_found(tmp_path: Path, default_config) -> None:
     hl = _pdf(tmp_path, "hl1.pdf", HL_REPORT_LINES)
     found = LocateResult(

@@ -15,8 +15,16 @@ from pydantic import BaseModel
 from rapidfuzz import fuzz
 
 from pv_extractor.config import LocatorConfig
-from pv_extractor.indexer.periods import filename_contains_period
-from pv_extractor.models import DocType, DocTypeSpec, FileRecord, ScoreBreakdown, SourceClass
+from pv_extractor.indexer.periods import filename_contains_period, period_label
+from pv_extractor.models import (
+    DocType,
+    DocTypeSpec,
+    FileRecord,
+    PeriodStyle,
+    PeriodStyleKind,
+    ScoreBreakdown,
+    SourceClass,
+)
 from pv_extractor.normalize import has_do_not_use_marker, normalize_text
 
 
@@ -31,6 +39,10 @@ class ScoreContext(BaseModel):
     deal_method: str
     deal_ratio: float
     target_as_of: date
+    # The client's reporting cadence, used (with cfg.tolerate_same_period) to
+    # treat a same-quarter/same-month folder date as a period match. Defaults
+    # to calendar-quarterly so existing callers/tests need no change.
+    period_style: PeriodStyle = PeriodStyle(kind=PeriodStyleKind.quarterly_calendar)
     doc_type: DocType
     cfg: LocatorConfig
     # When a DocTypeSpec is supplied it REPLACES the static
@@ -157,6 +169,13 @@ def _period_component(rec: FileRecord, ctx: ScoreContext) -> tuple[float, str]:
     if rec.as_of_date is not None:
         if rec.as_of_date == ctx.target_as_of:
             return weights.period_folder_exact, "folder"
+        # Same reporting period (e.g. a 2.28 month-end folder for a Q1 target):
+        # a real period match, scored just below an exact hit so the exact-date
+        # document still wins when one exists.
+        if ctx.cfg.tolerate_same_period and period_label(
+            rec.as_of_date, ctx.period_style
+        ) == period_label(ctx.target_as_of, ctx.period_style):
+            return weights.period_folder_same_period, "folder_same_period"
         return weights.period_folder_mismatch, "folder_mismatch"
     if filename_contains_period(rec.normalized_file_name, ctx.target_as_of):
         return weights.period_in_filename, "filename"

@@ -250,8 +250,13 @@ comments preserved), and setup/doctor flows.
                          claude_code.command_args = Windows->WSL bridge
                          (command: wsl, command_args: [-e, /abs/path/claude] —
                          wsl -e skips the login shell, so the path must be
-                         absolute); the schema arg is passed RELATIVE to cwd
-                         (posix separators) so bridged calls resolve it
+                         absolute); `--json-schema` takes the schema JSON
+                         INLINE (a string), NOT a file path — the client reads
+                         the compiled schema file and passes its content (a path
+                         makes the CLI JSON.parse the path and exit 1); inline
+                         also needs no cwd/path translation across the WSL bridge;
+                         non-zero exits record the CLI's stderr in the result
+                         error (never a bare "exit N")
         model_registry.py  loads config/models.yaml (aliases/ids, editable
                          pricing, latest_alias/pinned/requires_explicit_enable);
                          AUTO/MANUAL routing -> tier ladder (sonnet -> opus;
@@ -260,20 +265,29 @@ comments preserved), and setup/doctor flows.
         schema_builder.py  escalated fields -> strict band-grouped JSON schema
                          (additionalProperties:false everywhere; per-field
                          {value, unit, page, verbatim_quote, confidence,
-                         not_found}) + byte-stable static prompt from workbook
-                         row-3 descriptions (no timestamps/memo names)
+                         not_found} defined ONCE in $defs and $ref'd per field
+                         so a ~200-field schema is ~10KB inline, not ~100KB) +
+                         byte-stable static prompt from workbook row-3
+                         descriptions (no timestamps/memo names)
         payload.py       pages-not-documents payload: candidate pages + pages
                          1-3; TEXT pages as text + markdown pipe tables,
-                         SCANNED/IMAGE_TABLE pages as <=1080px PNGs; local OCR
-                         text retained for quote-grounding; manifest hash
+                         IMAGE_TABLE (+ low-confidence SCANNED) pages as
+                         <=1080px PNGs; SCANNED pages that OCR cleanly (>=
+                         ocr_text_min_confidence) sent as OCR TEXT instead of a
+                         slow page image; OCR text retained for quote-grounding;
+                         manifest hash. assemble_deal_payload() combines ALL of a
+                         deal-period's documents into ONE payload under a global
+                         page index (per-document labels) for one_call_per_deal
         cache.py         llm_cache table: sha256(static prompt + payload +
                          field set + model + effort + LLM_VERSION); --force-llm
                          bypasses reads
         costs.py         token estimator (labeled ESTIMATED vs actual CLI
                          usage), JSONL cost ledger, thread-safe BudgetTracker
                          (hard cap -> LLM_DEFERRED, run finishes cleanly)
-        escalate.py      worker queue (1-2 hidden sessions), one call per memo
-                         per tier, quote-grounding (exact on text pages, fuzzy
+        escalate.py      worker queue (1-2 hidden sessions); process_deals (ONE
+                         call per deal-period over the combined payload, default,
+                         _single_group) or legacy process_memos (per-memo,
+                         band-batched); quote-grounding (exact on text pages, fuzzy
                          vs OCR on image pages; failure -> UNGROUNDED_LLM_VALUE),
                          merge policy (never overwrite deterministic conf >=
                          threshold; old value kept as conflict; merge_log in
@@ -339,8 +353,12 @@ comments preserved), and setup/doctor flows.
                          relative-path previews], LLM assist [deal_discovery
                          refresh job with llm:true, model selectable, cheap
                          alias default]; dropdown-first periods everywhere;
-                         Confirm-documents step curates the locator selection —
-                         swap/remove/add, the folded-in AMBIGUOUS workflow),
+                         Confirm-documents step curates the locator selection,
+                         organized as PERIOD TABS -> per-client sections ->
+                         per-deal rows (ranked by confidence) that expand inline
+                         to ranked candidates (preview/swap/replace) — shows EVERY
+                         period's documents, not just the first; swap/remove/add,
+                         the folded-in AMBIGUOUS workflow),
                          Run Progress (lanes/cost meter/log tail/cancel; auto-
                          routes a finished non-dry run into Review), Review Queue
                          (j/k/a/e/u keyboard, evidence image + full-document
@@ -486,6 +504,10 @@ gate) — so the preflight always has something to Replace with.
 Phase 2 then content-verifies the ranked candidates (`locator/verify.py`):
 HL work product or a wrong in-file quarter/asset REJECTS and re-ranks; an
 AMBIGUOUS result whose survivors collapse to one candidate upgrades to FOUND.
+On the AMBIGUOUS auto-select, peek confidence leads ONLY when a candidate
+VERIFIED; when NONE verify (e.g. every candidate is a SCANNED PDF the peek can't
+read — a scanned valuation memo reads 0.0 "couldn't inspect" and must not lose to
+a readable-but-off-type doc like a DDQ), the locator's final score leads instead.
 Phase-B doc-type routing: `locate()` accepts an optional `doc_type_spec`
 (a Smart Search `DocTypeSpec`, addressable by `LocateQuery.doc_type_profile`
 slug); when supplied, the doc-type/negative scoring and the eligibility gate use
@@ -558,7 +580,26 @@ mismatch, corrupt file) into qa_pass / qa_pass_with_flags / qa_fail.
 
 ## LLM fallback in one paragraph
 
-After validation, each memo whose EscalationPlan has fields goes through the
+ONE CALL PER DEAL (llm.one_call_per_deal, DEFAULT). The deterministic engine
+still runs first (fast/local: grounding, comps/cap tables, derived fields), but
+the LLM second pass is the primary field extractor and runs as ONE `claude -p`
+call per deal-period over the COMBINED payload of ALL that deal's documents —
+not the per-memo, per-band, per-tier fan-out (which was slow: a large memo was
+6-24 calls). run._build_deal_groups groups the assembled (item, memo) pairs
+exactly like the multi-doc merge (merge_key, non-merge items standalone) and
+hands each group to escalate.process_deals; payload.assemble_deal_payload
+concatenates every document's pages under a single GLOBAL page index (each block
+labelled with its source document + that doc's own page number, so
+quote-grounding still keys off page->page_texts[page]) and escalate._single_group
+sends the whole field set over all pages in ONE call (only max_fields_per_call
+can split it). It implies comprehensive (force_assist) escalation + result-cache
+bypass, so plans are always rebuilt complete; merged hits land on the primary and
+the multi-doc merge collapses the group to one row by best confidence per field.
+max_pages_per_deal bounds the combined payload. one_call_per_deal=false restores
+the legacy per-memo band-batched path described next (byte-for-byte unchanged).
+
+Legacy per-memo path (one_call_per_deal=false): each memo whose EscalationPlan
+has fields goes through the
 worker queue (config.llm.workers hidden Claude Code sessions). The plan
 (run._build_escalation) is low-confidence hits + required-but-empty fields, and
 — when an asset QA-FAILS (engine recognized nothing / no valuation value) or
@@ -580,21 +621,47 @@ descending relevance, plus ONE cheap sweep over the bands with no evidence
 (no_evidence_effort, single pass, no retry ladder). Each group's call sends only
 that band's pages + a small schema, so the model engages deeply instead of
 rushing one ~190-field giant call; the most-relevant bands run first so the
-budget is spent well. band_batched=false = legacy single-call-per-memo. New
-tunables (BOTH config.py + config.example.yaml): band_batched,
+budget is spent well. band_batched=false = single-call-per-memo. SMALL-DOC
+COLLAPSE (llm.single_call_max_pages, default 8): when the LLM payload is <= that
+many pages, _build_groups ignores band_batched and runs the whole doc + all
+fields over one page set — band-batching's per-call page re-uploads only pay off
+on large memos, so short client memos collapse to cheap/fast calls (0 disables).
+The field set is still chunked by max_fields_per_call: the response schema is
+passed INLINE on the `claude` command line and Windows caps that at ~32 KB, so a
+one-shot ~200-field schema (~40 KB) fails to launch ([WinError 206]).
+The response schema uses $defs/$ref (the per-field shape defined ONCE) so it is
+~10x smaller and the whole ~200-field set fits ONE inline-schema call under the
+Windows limit (max_fields_per_call default 200). Cleanly-OCR'd SCANNED pages are
+sent as OCR TEXT, not page images (prefer_ocr_text_over_image / ocr_text_min_
+confidence) — vision/Read-tool calls are slow and re-done per call; IMAGE_TABLE
+stays an image. New tunables (BOTH config.py + config.example.yaml):
+one_call_per_deal, max_pages_per_deal, band_batched,
+single_call_max_pages, retry_not_found, surface_ungrounded_values,
+ungrounded_confidence_cap, prefer_ocr_text_over_image, ocr_text_min_confidence,
 band_relevance_floor, max_fields_per_call, no_evidence_effort. The router picks a
 tier ladder per group — MANUAL forces one
-model+effort; AUTO runs sonnet/medium, retries failures on opus/high
+model+effort for EVERYTHING (no escalation, even OCR-hostile docs stay on the
+chosen model); AUTO runs sonnet/medium, retries failures on opus/high
 (OCR-hostile bands start at opus, retry at xhigh), and touches fable only on
-explicit opt-in. Each group-tier is ONE `claude -p --output-format json
+explicit opt-in. A field the model answers not_found is RESOLVED, not retried
+(llm.retry_not_found=False default): a confirmed absence is not a failure, so it
+neither re-asks the expensive tier nor raises a NOT_EXTRACTABLE flag — only
+FAILED (call error) or REJECTED (ungrounded/type/vocab) fields escalate. Each group-tier is ONE `claude -p --output-format json
 --json-schema` call (job id pv-<run>-<memo>-g<group>t<tier>; cached by
 prompt+payload+fields+page-scope+model+effort; budget
 reserved before launch, LLM_DEFERRED past the cap). Answers are
-quote-grounded against local page text (fuzzy vs OCR on image pages;
-failures discarded + UNGROUNDED_LLM_VALUE), type/vocab-checked, then merged:
-fill empty fields, replace only below-threshold deterministic values (loser
-kept as a conflict), never touch confident/computed/metadata hits. Leftover
-fields get NOT_EXTRACTABLE / LLM_UNCONFIRMED reviewer flags; every attempt
+quote-grounded against local page text (fuzzy vs OCR on image pages),
+type/vocab-checked, then merged: fill empty fields, replace only below-threshold
+deterministic values (loser kept as a conflict), never touch
+confident/computed/metadata hits. A value that PARSES but whose quote can't be
+matched on the page (common on SCANNED/OCR pages) is, by default
+(llm.surface_ungrounded_values), SHOWN as a low-confidence UNGROUNDED_LLM_VALUE
+hit for review rather than discarded — but it only fills EMPTY fields, never
+overwrites an existing deterministic value (it rides along as a conflict
+instead). When EVERY call for a memo fails, ONE LLM_PASS_FAILED flag carries the
+CLI's real error (e.g. the 400/timeout) instead of a flag per field. Leftover
+fields that genuinely FAILED/were rejected (not confirmed-absent) get
+NOT_EXTRACTABLE / LLM_UNCONFIRMED reviewer flags; every attempt
 (job id, session id, tokens, cost actual-vs-ESTIMATED) lands in the audit
 record, the run's cost_ledger.jsonl and the Run Log "Batch Sessions" column.
 

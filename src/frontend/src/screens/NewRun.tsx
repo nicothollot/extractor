@@ -1,6 +1,7 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
+import { HLWorkingHints } from "../components/branding";
 import { DataTable } from "../components/DataTable";
 import { FirmRegion } from "../components/FirmRegion";
 import { DocTypeListBuilder } from "../components/DocTypeListBuilder";
@@ -11,6 +12,7 @@ import { PeriodMultiPicker } from "../components/PeriodMultiPicker";
 import { Stepper } from "../components/Stepper";
 import { Button, Card, CardHeader, Field, Panel, StatusChip, Toggle, inputCls } from "../components/ui";
 import {
+  ConfigResponse,
   CoverageEntry,
   JobInfo,
   ModelsResponse,
@@ -24,15 +26,36 @@ import {
   SelectionResponse,
   SelectionSlot,
   VerifyFileResponse,
+  candidatePreviewUrl,
   get,
   post,
+  put,
 } from "../lib/api";
 import { fmtUsd, useJobPolling, useLoad } from "../lib/hooks";
 import { FirmEntry, useWizard, WizardState } from "../lib/wizard";
 
 const STEPS = ["Scope", "Template", "AI / model", "Preflight", "Confirm documents", "Launch", "Review"];
 
+// Reassuring rotating messages for the longer waits (locating + verifying every
+// document for a whole client can take a minute). Semi-formal, lightly human.
+const PREFLIGHT_HINTS = [
+  "Locating documents across the share — this can take a moment for a large client.",
+  "Peeking inside candidate files to confirm we have the right ones…",
+  "Cross-checking periods and document types…",
+  "Still working — bigger client folders take a little longer to sweep. Feel free to grab a coffee. ☕",
+  "Tallying coverage and estimating cost…",
+  "Almost there — assembling the document shortlist.",
+];
+const SELECTION_HINTS = [
+  "Building the per-deal document selection…",
+  "Matching each deal to its best document for the period…",
+  "Verifying the auto-selected files — thanks for your patience.",
+  "Running all deals takes a bit longer; hang tight (perfect time for that coffee). ☕",
+  "Almost ready — finalizing the confirm-documents table.",
+];
+
 interface Period {
+  period: string; // submit value (reporting-period label, e.g. "Q1 2026")
   as_of_date: string;
   label: string;
 }
@@ -73,9 +96,11 @@ const confidencePct = (c: number | null) => (c === null ? "—" : `${Math.round(
 // profile/free-text doc type that must travel in doc_types (slot expansion).
 const ENUM_DOC_TYPES = new Set(["valuation_memo", "ic_memo", "portfolio_review", "any_client_valuation_doc"]);
 
+// slot_key is "client|deal|period|doc_type"; the launch exclude is per-(client,
+// deal), so removing a deal in any period tab drops it from the whole run.
 const slotKeyParts = (key: string): { client: string; deal: string } => {
-  const sep = key.indexOf("|");
-  return { client: key.slice(0, sep), deal: key.slice(sep + 1) };
+  const parts = key.split("|");
+  return { client: parts[0] ?? "", deal: parts[1] ?? "" };
 };
 
 /* Top-level mode switch. Single Search is the existing wizard, byte-for-behavior
@@ -684,12 +709,12 @@ function SingleRun() {
 
                 {/* ---- period: dropdown-first everywhere, free-text fallback ---- */}
                 <div className="grid grid-cols-2 gap-4">
-                  <Field label="Period (date folders that exist in the index)">
+                  <Field label="Period (reporting periods in the index)">
                     <select className={inputCls} value={period} onChange={(e) => patchScope({ period: e.target.value })}>
                       <option value="">— select period —</option>
                       {(discoveredPeriods.data?.periods ?? []).map((p) => (
-                        <option key={p.as_of_date} value={p.as_of_date}>
-                          {p.label} ({p.as_of_date})
+                        <option key={p.period} value={p.period}>
+                          {p.label}
                         </option>
                       ))}
                     </select>
@@ -826,11 +851,7 @@ function SingleRun() {
                 <div className="px-4 pb-4">
                   {!preflightJobId && <p className="text-[12.5px] text-ink-500">Preflight locates and verifies every document in scope without writing anything.</p>}
                   {preflightJob && ["queued", "running"].includes(preflightJob.status) && (
-                    <div className="space-y-2 py-2">
-                      <div className="skeleton h-4 w-1/2" />
-                      <div className="skeleton h-4 w-2/3" />
-                      <p className="text-[12px] text-ink-500">locating + verifying…</p>
-                    </div>
+                    <HLWorkingHints messages={PREFLIGHT_HINTS} />
                   )}
                   {preflightCoverage && (
                     <DataTable<CoverageEntry>
@@ -1524,23 +1545,156 @@ function ConfirmDocuments({
   const [verifyResult, setVerifyResult] = useState<VerifyFileResponse | null>(null);
   const [pendingPath, setPendingPath] = useState<string | null>(null);
   const [pendingSlot, setPendingSlot] = useState<SelectionSlot | null>(null);
+  // Single-slot refresh: after a swap we re-resolve ONLY the affected row
+  // (server peeks just that slot — every other file was already verified and
+  // is cached) instead of rebuilding the whole table.
+  const [slotPatches, setSlotPatches] = useState<Record<string, SelectionSlot>>({});
+  const [refreshingKey, setRefreshingKey] = useState<string | null>(null);
+  // Confirm-documents layout: a tab per period, collapsible section per client.
+  const [activePeriod, setActivePeriod] = useState<string | null>(null);
+  const [collapsedClients, setCollapsedClients] = useState<Set<string>>(new Set());
+
+  // A fresh selection load (preflight re-run) supersedes any local patches.
+  useEffect(() => {
+    setSlotPatches({});
+  }, [preflightJobId, preflightReady]);
 
   const removed = useMemo(() => new Set(removedSlots), [removedSlots]);
-  const slots = selection.data?.slots ?? [];
-  const selectedSlot = slots.find((s) => s.slot_key === selectedKey) ?? null;
+  const allSlots = (selection.data?.slots ?? []).map((s) => slotPatches[s.slot_key] ?? s);
+  const selectedSlot = allSlots.find((s) => s.slot_key === selectedKey) ?? null;
+  // Overrides MUST be keyed on the doc type the run/selection actually resolves
+  // (the effective doc type — `docTypes[0]` when a list was built, else the base
+  // `docType`), which the selection echoes back. Recording under the base
+  // `docType` would miss the lookup and the swap would silently not apply.
+  const effectiveDocType = selection.data?.doc_type ?? docType;
 
+  const refreshSlot = async (slot: SelectionSlot) => {
+    if (!preflightJobId) return;
+    setRefreshingKey(slot.slot_key);
+    try {
+      // Re-resolve THIS slot (its own period + doc_type), so a swap in one
+      // period tab refreshes only that row.
+      const fresh = await get<SelectionSlot>(
+        `/api/jobs/${preflightJobId}/selection/slot?client=${encodeURIComponent(slot.client)}` +
+          `&deal=${encodeURIComponent(slot.deal)}` +
+          `&period=${encodeURIComponent(slot.period)}` +
+          `&doc_type=${encodeURIComponent(slot.doc_type)}`,
+      );
+      setSlotPatches((p) => ({ ...p, [slot.slot_key]: fresh }));
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setRefreshingKey(null);
+    }
+  };
+
+  // Confidence threshold (Feature 1) + candidate preview (Feature 2). The
+  // threshold's default comes from config.selection.min_confidence and is
+  // LINKED to Settings — changing it here persists back to the same config key.
+  const cfg = useLoad<ConfigResponse>("/api/config", []);
+  const pvRoot = cfg.data?.pv_root ?? "";
+  const [thresholdPct, setThresholdPct] = useState<number>(0);
+  const [thresholdInit, setThresholdInit] = useState(false);
+  useEffect(() => {
+    if (cfg.data && !thresholdInit) {
+      setThresholdPct(Math.round((cfg.data.selection?.min_confidence ?? 0) * 100));
+      setThresholdInit(true);
+    }
+  }, [cfg.data, thresholdInit]);
+  const [previewPath, setPreviewPath] = useState<string | null>(null);
+  // First-few-pages preview: step through pages; previewMax is discovered when a
+  // page render 404s (we don't know a candidate's page count up front).
+  const [previewPage, setPreviewPage] = useState(1);
+  const [previewMax, setPreviewMax] = useState<number | null>(null);
+  const togglePreview = (path: string) => {
+    setPreviewPath((cur) => (cur === path ? null : path));
+    setPreviewPage(1);
+    setPreviewMax(null);
+  };
+
+  // "Refresh": keep slots whose auto-selected doc is at/above the threshold,
+  // drop the rest (drives the existing removedSlots/exclude machinery), and
+  // persist the threshold so Settings shows the same value.
+  const applyThreshold = async () => {
+    setActionError(null);
+    const frac = Math.max(0, Math.min(100, thresholdPct)) / 100;
+    const drop = (selection.data?.slots ?? [])
+      .map((s) => slotPatches[s.slot_key] ?? s)
+      .filter((s) => s.confidence == null || s.confidence < frac)
+      .map((s) => s.slot_key);
+    patch({ removedSlots: drop, docsConfirmed: false });
+    try {
+      await put("/api/config", { values: { "selection.min_confidence": frac } });
+    } catch {
+      /* threshold still applied locally even if the persist fails */
+    }
+  };
+
+  const openDocument = async (filePath: string) => {
+    setActionError(null);
+    try {
+      await post("/api/locator/open-file", { path: filePath });
+    } catch (e) {
+      setActionError((e as Error).message);
+    }
+  };
+
+  // Multi-doc selection (Feature 4): some investments span several files — the
+  // run extracts each and merges fields into ONE row by best confidence. The
+  // analyst ticks several candidates and confirms; the first is the primary.
+  const [multiMode, setMultiMode] = useState(false);
+  const [multiPicks, setMultiPicks] = useState<string[]>([]);
+  const enterMultiMode = (slot: SelectionSlot) => {
+    // seed with the current selection + any already-recorded extras
+    const seed = [slot.file_path, ...(slot.extra_docs ?? [])].filter(Boolean) as string[];
+    setMultiPicks(seed);
+    setMultiMode(true);
+  };
+  const toggleMultiPick = (filePath: string) => {
+    setMultiPicks((p) => (p.includes(filePath) ? p.filter((x) => x !== filePath) : [...p, filePath]));
+  };
+  const confirmMultiDocs = async (slot: SelectionSlot) => {
+    setActionError(null);
+    try {
+      await post("/api/locator/source-docs", {
+        client: slot.client, deal: slot.deal, period: slotPeriod(slot), doc_type: slotDocType(slot),
+        file_paths: multiPicks,
+      });
+      patch({ docsConfirmed: false });
+      setMultiMode(false);
+      await refreshSlot(slot);
+    } catch (e) {
+      setActionError((e as Error).message);
+    }
+  };
+
+  // Removal is per-(client, deal) — the launch exclude is per pair, so dropping
+  // a deal in any period tab drops it from every slot. Toggle ALL of the deal's
+  // slot_keys together so the UI stays consistent across tabs.
   const toggleRemove = (slot: SelectionSlot) => {
+    const pairKeys = allSlots
+      .filter((s) => s.client === slot.client && s.deal === slot.deal)
+      .map((s) => s.slot_key);
     const next = new Set(removed);
-    if (next.has(slot.slot_key)) next.delete(slot.slot_key);
-    else next.add(slot.slot_key);
+    const isOut = pairKeys.some((k) => next.has(k));
+    pairKeys.forEach((k) => (isOut ? next.delete(k) : next.add(k)));
     patch({ removedSlots: [...next], docsConfirmed: false });
   };
+
+  // Each slot carries its OWN resolved period (the run may span several periods,
+  // and the run-wide `period` field is empty when only the multi-period picker
+  // was used). Prefer the slot's resolved as-of date so the override key always
+  // matches what the run will look up — never send an empty period.
+  const slotPeriod = (s: SelectionSlot) => s.as_of_date ?? s.predicted_period ?? s.period ?? period;
+  // Overrides/verifies are recorded for the slot's OWN doc-type (a run may span
+  // several doc-types); fall back to the run-wide effective doc-type.
+  const slotDocType = (s: SelectionSlot) => s.doc_type || effectiveDocType;
 
   const recordOverride = async (slot: SelectionSlot, filePath: string) => {
     setActionError(null);
     try {
       await post("/api/locator/override", {
-        client: slot.client, deal: slot.deal, period, doc_type: docType,
+        client: slot.client, deal: slot.deal, period: slotPeriod(slot), doc_type: slotDocType(slot),
         file_path: filePath, note: "selected in New Run → Confirm documents",
       });
       patch({ docsConfirmed: false });
@@ -1548,7 +1702,7 @@ function ConfirmDocuments({
       setPendingPath(null);
       setPendingSlot(null);
       setPicker(null);
-      selection.reload();
+      await refreshSlot(slot);
     } catch (e) {
       setActionError((e as Error).message);
     }
@@ -1561,7 +1715,7 @@ function ConfirmDocuments({
     setPendingSlot(slot);
     try {
       const v = await post<VerifyFileResponse>("/api/locator/verify-file", {
-        client: slot.client, deal: slot.deal, period, doc_type: docType, file_path: filePath,
+        client: slot.client, deal: slot.deal, period: slotPeriod(slot), doc_type: slotDocType(slot), file_path: filePath,
       });
       setVerifyResult(v);
     } catch (e) {
@@ -1571,185 +1725,344 @@ function ConfirmDocuments({
     }
   };
 
-  const activeCount = slots.filter((s) => !removed.has(s.slot_key)).length;
-  const foundActive = slots.filter((s) => !removed.has(s.slot_key) && s.status === "FOUND").length;
-  const slotCount = selection.data?.slot_count ?? slots.length;
-  const isMultiSlot = slotCount > slots.length;
+  // Removal is per-(client, deal); a deal is "removed" if any of its slot_keys
+  // is excluded. activeCount/foundActive count whole slots still in scope.
+  const removedPairs = new Set(
+    [...removed].map((k) => {
+      const { client, deal } = slotKeyParts(k);
+      return `${client}|${deal}`;
+    }),
+  );
+  const isRemoved = (s: SelectionSlot) => removedPairs.has(`${s.client}|${s.deal}`);
+  const activeCount = allSlots.filter((s) => !isRemoved(s)).length;
+  const foundActive = allSlots.filter((s) => !isRemoved(s) && s.status === "FOUND").length;
+
+  // Period tabs from the run's periods (fall back to distinct slot periods);
+  // the active tab defaults to the first.
+  const distinctPeriods = Array.from(new Set(allSlots.map((s) => s.period).filter(Boolean)));
+  const fromResp = (selection.data?.periods ?? []).filter((p) => distinctPeriods.includes(p));
+  const periodList = fromResp.length ? fromResp : distinctPeriods;
+  const effectivePeriod =
+    activePeriod && periodList.includes(activePeriod) ? activePeriod : periodList[0] ?? null;
+  const periodSlots = allSlots.filter((s) => !effectivePeriod || s.period === effectivePeriod);
+
+  // Within the active period, group deals by client; rank each client's deals by
+  // confidence (highest first), then deal name.
+  const clientGroups = (() => {
+    const m = new Map<string, SelectionSlot[]>();
+    for (const s of periodSlots) {
+      const arr = m.get(s.client) ?? [];
+      arr.push(s);
+      m.set(s.client, arr);
+    }
+    return [...m.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([client, ss]) => ({
+        client,
+        slots: ss
+          .slice()
+          .sort((x, y) => (y.confidence ?? -1) - (x.confidence ?? -1) || x.deal.localeCompare(y.deal)),
+      }));
+  })();
+
+  // The ranked candidate list for one deal — preview, swap, multi-doc, replace —
+  // rendered inline under the expanded deal row.
+  const renderCandidates = (s: SelectionSlot) => (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-3 flex-wrap pb-1">
+        <p className="text-[11.5px] text-ink-500">
+          {s.predicted_period || s.period} · the locator ranked these — pick one to record a learned override
+        </p>
+        <span className="flex gap-2">
+          <Button
+            kind={multiMode ? "primary" : "secondary"}
+            onClick={() => (multiMode ? setMultiMode(false) : enterMultiMode(s))}
+            title="Select several files for this investment — their fields merge into one row by best confidence"
+          >
+            {multiMode ? "Cancel multi-select" : "＋ Add multiple"}
+          </Button>
+          <Button kind="secondary" onClick={() => setPicker({ slot: s })}>
+            Replace with a file from the share
+          </Button>
+        </span>
+      </div>
+      {multiMode && (
+        <div className="rounded border border-info bg-info-soft px-3 py-2 text-[12.5px] text-ink-700 flex items-center justify-between gap-3">
+          <span>
+            Tick every file that holds part of this investment’s data ({multiPicks.length} selected). At run
+            time each is extracted and the fields merge into one row, each value taken from the document most
+            confident about it. The first ticked file is the row’s primary.
+          </span>
+          <Button kind="primary" disabled={multiPicks.length === 0} onClick={() => confirmMultiDocs(s)}>
+            Confirm {multiPicks.length} document{multiPicks.length === 1 ? "" : "s"}
+          </Button>
+        </div>
+      )}
+      {!multiMode && (s.extra_docs?.length ?? 0) > 0 && (
+        <p className="text-[12px] text-ink-600">
+          Merging <b>{(s.extra_docs?.length ?? 0) + 1} documents</b> into one row for this investment (best
+          confidence per field). Use “Add multiple” to change the set.
+        </p>
+      )}
+      {s.candidates.length === 0 && (
+        <p className="text-[12.5px] text-ink-500">
+          No ranked candidates for this slot ({s.status}). Use “Replace with a file from the share” to point at
+          the right document.
+        </p>
+      )}
+      {s.candidates.map((c) => (
+        <div
+          key={c.file_path}
+          className={`border rounded-[var(--hl-radius)] px-3 py-2 ${c.is_selected ? "border-ok bg-ok-soft" : "border-line bg-surface"}`}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-[12.5px] font-medium text-ink-800">
+                {c.file_name}
+                {c.is_selected && <span className="text-ok text-[11px] font-semibold"> · auto-selected</span>}
+              </p>
+              <p className="font-mono text-[11px] text-ink-400 break-all">{c.file_path}</p>
+              <p className="text-[11px] text-ink-500 mt-0.5">
+                score <span className="font-mono">{c.score.toFixed(1)}</span> · verify{" "}
+                <span className={c.verify_status === "REJECTED" ? "text-err" : c.verify_status === "VERIFIED" ? "text-ok" : "text-ink-500"}>
+                  {c.verify_status || "—"}
+                </span>
+                {c.doc_class ? ` · ${c.doc_class.toLowerCase().replace(/_/g, " ")}` : ""}
+              </p>
+              <div className="flex gap-2 mt-1.5">
+                <Button
+                  kind="ghost"
+                  onClick={() => togglePreview(c.file_path)}
+                  title="Preview the first few pages"
+                >
+                  {previewPath === c.file_path ? "▾ hide preview" : "▸ preview"}
+                </Button>
+                <Button kind="ghost" onClick={() => openDocument(c.file_path)} title="Open the document for full inspection">
+                  ↗ open
+                </Button>
+              </div>
+            </div>
+            {multiMode ? (
+              <label className="flex items-center gap-1.5 text-[12px] text-ink-700 whitespace-nowrap cursor-pointer">
+                <input type="checkbox" checked={multiPicks.includes(c.file_path)} onChange={() => toggleMultiPick(c.file_path)} />
+                merge
+              </label>
+            ) : (
+              <Button kind="primary" disabled={c.is_selected} onClick={() => recordOverride(s, c.file_path)}>
+                {c.is_selected ? "Current" : "Use this one"}
+              </Button>
+            )}
+          </div>
+          {previewPath === c.file_path && (
+            <div className="mt-2 border-t border-line pt-2">
+              <div className="flex items-center justify-center gap-3 pb-2 text-[12px] text-ink-600">
+                <Button
+                  kind="ghost"
+                  disabled={previewPage <= 1}
+                  onClick={() => setPreviewPage((p) => Math.max(1, p - 1))}
+                  title="Previous page"
+                >
+                  ◀
+                </Button>
+                <span className="font-mono">page {previewPage}</span>
+                <Button
+                  kind="ghost"
+                  disabled={previewMax != null && previewPage >= previewMax}
+                  onClick={() => setPreviewPage((p) => p + 1)}
+                  title="Next page"
+                >
+                  ▶
+                </Button>
+              </div>
+              <img
+                key={previewPage}
+                src={candidatePreviewUrl(c.file_path, previewPage)}
+                alt={`Page ${previewPage} of ${c.file_name}`}
+                className="max-h-[420px] w-auto mx-auto border border-line rounded shadow-sm"
+                onError={() => {
+                  // Stepped past the last page (render 404): remember the max and
+                  // step back so the view stays on a real page.
+                  if (previewPage > 1) {
+                    setPreviewMax(previewPage - 1);
+                    setPreviewPage((p) => Math.max(1, p - 1));
+                  }
+                }}
+              />
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 
   return (
     <div className="space-y-4">
-      {isMultiSlot && (
-        <div className="rounded border border-info/40 bg-info-soft px-3 py-2 text-[12.5px] text-ink-700">
-          This run executes <b>{slotCount} slots</b> — {(selection.data?.doc_types ?? []).length} document
-          type(s) × {(selection.data?.periods ?? []).length} period(s) × {slots.length} deal(s). The table
-          previews the first type/period per deal; all slots run at launch. Removing a deal drops it from every
-          slot.
-        </div>
-      )}
       <Card>
         <CardHeader
           title="Confirm documents"
-          sub="exactly the files the locator auto-selected — swap, remove or add before launch"
+          sub="exactly the files the locator auto-selected — flip through periods, expand a client to preview, swap, remove or add documents per deal"
           right={
             <Button
               kind="secondary"
-              disabled={slots.length === 0}
-              onClick={() => setPicker({ slot: selectedSlot ?? slots[0] })}
+              disabled={periodSlots.length === 0}
+              onClick={() => setPicker({ slot: selectedSlot ?? periodSlots[0] })}
             >
               + Add a missed file
             </Button>
           }
         />
-        <div className="px-1 pb-1">
-          <DataTable<SelectionSlot>
-            rows={selection.data ? slots : null}
-            loading={selection.loading}
-            error={selection.error}
-            onRetry={selection.reload}
-            emptyTitle="Nothing in scope"
-            emptyHint="Go back and adjust the scope or re-run preflight."
-            rowKey={(s) => s.slot_key}
-            onRowClick={(s) => setSelectedKey(s.slot_key)}
-            selectedKey={selectedKey}
-            maxHeight="48vh"
-            filterable
-            columns={[
-              {
-                key: "deal",
-                header: "Company / Deal",
-                sortValue: (s) => s.deal,
-                filterValue: (s) => `${s.client} ${s.deal}`,
-                render: (s) => (
-                  <div className={removed.has(s.slot_key) ? "opacity-50 line-through" : ""}>
-                    <p className="font-medium text-ink-800">{s.deal}</p>
-                    <p className="text-[11px] text-ink-400">{s.client}</p>
-                  </div>
-                ),
-              },
-              {
-                key: "file",
-                header: "File",
-                sortValue: (s) => s.file_name ?? "",
-                filterValue: (s) => s.file_name ?? "",
-                render: (s) => <span className="text-[12px]">{s.file_name ?? <span className="text-ink-400">— none —</span>}</span>,
-              },
-              {
-                key: "location",
-                header: "Location",
-                filterValue: (s) => s.file_path ?? "",
-                render: (s) => <span className="font-mono text-[11px] text-ink-400 break-all">{s.file_path ?? "—"}</span>,
-              },
-              {
-                key: "modified",
-                header: "Last modified",
-                sortValue: (s) => s.last_modified ?? "",
-                render: (s) => <span className="text-[11.5px] text-ink-500">{s.last_modified ? s.last_modified.slice(0, 10) : "—"}</span>,
-              },
-              {
-                key: "period",
-                header: "Predicted period",
-                filterValue: (s) => s.predicted_period,
-                render: (s) => <span className="text-[12px]">{s.predicted_period || "—"}</span>,
-              },
-              {
-                key: "doc",
-                header: "Doc type",
-                filterValue: (s) => s.doc_class,
-                render: (s) => <span className="text-[11.5px] text-ink-600">{s.doc_class ? s.doc_class.replace(/_/g, " ").toLowerCase() : "—"}</span>,
-              },
-              { key: "pages", header: "Pages", align: "right", sortValue: (s) => s.page_count ?? -1, render: (s) => s.page_count ?? "—" },
-              {
-                key: "status",
-                header: "Status",
-                sortValue: (s) => s.status,
-                filterValue: (s) => s.status,
-                render: (s) => (
-                  <span className="flex flex-col items-start gap-0.5">
-                    {removed.has(s.slot_key) ? <StatusChip value="DEFERRED" /> : <StatusChip value={s.status} />}
-                    {s.override_in_effect && <span className="text-[10px] text-info font-semibold">override</span>}
-                  </span>
-                ),
-              },
-              {
-                key: "conf",
-                header: "Confidence",
-                align: "right",
-                sortValue: (s) => s.confidence ?? -1,
-                render: (s) => <span className="font-mono text-[12px]">{confidencePct(s.confidence)}</span>,
-              },
-              {
-                key: "actions",
-                header: "",
-                render: (s) => (
-                  <span className="flex gap-1.5 justify-end whitespace-nowrap">
-                    <Button kind="ghost" onClick={() => setSelectedKey(s.slot_key)} title="View candidates / swap">
-                      ⇄ swap
-                    </Button>
-                    <Button kind="ghost" onClick={() => toggleRemove(s)} title={removed.has(s.slot_key) ? "Restore to the run" : "Exclude from the run"}>
-                      {removed.has(s.slot_key) ? "restore" : "remove"}
-                    </Button>
-                  </span>
-                ),
-              },
-            ]}
+        {/* Feature 1: confidence threshold — keep only auto-picks at/above X% */}
+        <div className="px-4 pb-2 flex items-center gap-2 flex-wrap text-[12.5px] text-ink-600">
+          <span>Auto-select documents with confidence ≥</span>
+          <input
+            type="number"
+            min={0}
+            max={100}
+            value={thresholdPct}
+            onChange={(e) => setThresholdPct(Number(e.target.value))}
+            className={`${inputCls} w-20 text-right`}
+            aria-label="minimum confidence percent"
           />
+          <span>%</span>
+          <Button kind="secondary" disabled={allSlots.length === 0} onClick={applyThreshold} title="Re-select: keep documents at/above this confidence, drop the rest">
+            Refresh
+          </Button>
+          <span className="text-ink-400">
+            documents below this are removed from the run; this default is shared with Settings.
+          </span>
+        </div>
+        {/* period tabs — one per requested period (hidden for a single period) */}
+        {periodList.length > 1 && (
+          <div className="px-4 flex items-center gap-1 flex-wrap border-b border-line">
+            {periodList.map((p) => {
+              const ps = allSlots.filter((s) => s.period === p);
+              const found = ps.filter((s) => s.status === "FOUND" && !isRemoved(s)).length;
+              const active = p === effectivePeriod;
+              return (
+                <button
+                  key={p}
+                  onClick={() => {
+                    setActivePeriod(p);
+                    setSelectedKey(null);
+                    setMultiMode(false);
+                  }}
+                  className={`px-3 py-1.5 text-[12.5px] border-b-2 -mb-px ${
+                    active ? "border-accent text-accent font-semibold" : "border-transparent text-ink-500 hover:text-ink-700"
+                  }`}
+                >
+                  {p} <span className="text-[11px] text-ink-400">({found}/{ps.length})</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* client sections — collapsible; each deal expands to its candidates */}
+        <div className="px-3 py-2">
+          {selection.loading && !selection.data ? (
+            <HLWorkingHints messages={SELECTION_HINTS} />
+          ) : selection.error ? (
+            <p className="px-2 py-3 text-[12.5px] text-err">
+              {selection.error}{" "}
+              <button className="underline" onClick={selection.reload}>
+                retry
+              </button>
+            </p>
+          ) : clientGroups.length === 0 ? (
+            <p className="px-2 py-6 text-center text-[12.5px] text-ink-500">
+              Nothing in scope{effectivePeriod ? ` for ${effectivePeriod}` : ""}. Go back and adjust the scope
+              or re-run preflight.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {clientGroups.map(({ client, slots: cslots }) => {
+                const collapsed = collapsedClients.has(client);
+                const cFound = cslots.filter((s) => s.status === "FOUND" && !isRemoved(s)).length;
+                return (
+                  <div key={client} className="border border-line rounded-[var(--hl-radius)] overflow-hidden">
+                    <button
+                      onClick={() =>
+                        setCollapsedClients((c) => {
+                          const n = new Set(c);
+                          if (n.has(client)) n.delete(client);
+                          else n.add(client);
+                          return n;
+                        })
+                      }
+                      className="w-full flex items-center justify-between px-3 py-2 bg-ink-50 hover:bg-ink-100 text-left"
+                    >
+                      <span className="font-semibold text-ink-800 text-[13px]">
+                        <span className="text-ink-400 mr-1.5">{collapsed ? "▸" : "▾"}</span>
+                        {client}
+                      </span>
+                      <span className="text-[11.5px] text-ink-500">
+                        {cFound}/{cslots.length} resolved
+                      </span>
+                    </button>
+                    {!collapsed && (
+                      <div className="divide-y divide-line">
+                        {cslots.map((s) => {
+                          const expanded = selectedKey === s.slot_key;
+                          const gone = isRemoved(s);
+                          return (
+                            <div key={s.slot_key}>
+                              <div className={`flex items-center gap-3 px-3 py-2 ${expanded ? "bg-info-soft" : "hover:bg-ink-50"}`}>
+                                <button
+                                  className="flex-1 min-w-0 text-left flex items-center gap-2"
+                                  onClick={() => {
+                                    setSelectedKey(expanded ? null : s.slot_key);
+                                    setMultiMode(false);
+                                    setPreviewPath(null);
+                                  }}
+                                  title="Show ranked candidates"
+                                >
+                                  <span className="text-ink-400 text-[11px]">{expanded ? "▾" : "▸"}</span>
+                                  <span className={`min-w-0 ${gone ? "opacity-50 line-through" : ""}`}>
+                                    <span className="block font-medium text-ink-800 text-[12.5px] truncate">{s.deal}</span>
+                                    <span className="block text-[11px] text-ink-400 truncate">
+                                      {refreshingKey === s.slot_key ? "updating…" : s.file_name ?? "— no document —"}
+                                      {(s.extra_docs?.length ?? 0) > 0 && (
+                                        <span className="ml-1 text-info font-semibold">+{s.extra_docs!.length} merged</span>
+                                      )}
+                                    </span>
+                                  </span>
+                                </button>
+                                <span className="hidden md:block text-[11px] text-ink-500 w-28 truncate" title={s.doc_class}>
+                                  {s.doc_class ? s.doc_class.replace(/_/g, " ").toLowerCase() : "—"}
+                                </span>
+                                <span className="font-mono text-[12px] w-12 text-right">{confidencePct(s.confidence)}</span>
+                                <span className="w-24 flex justify-end items-center gap-1">
+                                  {gone ? <StatusChip value="DEFERRED" /> : <StatusChip value={s.status} />}
+                                  {s.override_in_effect && <span className="text-[10px] text-info font-semibold">ovr</span>}
+                                </span>
+                                <Button
+                                  kind="ghost"
+                                  onClick={() => toggleRemove(s)}
+                                  title={gone ? "Restore to the run" : "Exclude this deal from the run (all periods)"}
+                                >
+                                  {gone ? "restore" : "remove"}
+                                </Button>
+                              </div>
+                              {expanded && <div className="px-3 pb-3 pt-1 bg-info-soft">{renderCandidates(s)}</div>}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
         {actionError && <p className="px-4 pb-3 text-[12px] text-err">{actionError}</p>}
       </Card>
-
-      {/* selected-slot detail: the candidate list (swap) + add-from-share */}
-      {selectedSlot && (
-        <Card>
-          <CardHeader
-            title={`${selectedSlot.deal} — candidates`}
-            sub={`${selectedSlot.client} · ${selectedSlot.predicted_period || period} · the locator ranked these; pick a different one to record a learned override`}
-            right={
-              <Button kind="secondary" onClick={() => setPicker({ slot: selectedSlot })}>
-                Replace with a file from the share
-              </Button>
-            }
-          />
-          <div className="px-4 pb-4 space-y-2">
-            {selectedSlot.candidates.length === 0 && (
-              <p className="text-[12.5px] text-ink-500">
-                No ranked candidates for this slot ({selectedSlot.status}). Use “Replace with a file from the share” to point at the right document.
-              </p>
-            )}
-            {selectedSlot.candidates.map((c) => (
-              <div
-                key={c.file_path}
-                className={`border rounded-[var(--hl-radius)] px-3 py-2 flex items-start justify-between gap-3 ${
-                  c.is_selected ? "border-ok bg-ok-soft" : "border-line"
-                }`}
-              >
-                <div className="min-w-0">
-                  <p className="text-[12.5px] font-medium text-ink-800">
-                    {c.file_name}
-                    {c.is_selected && <span className="text-ok text-[11px] font-semibold"> · auto-selected</span>}
-                  </p>
-                  <p className="font-mono text-[11px] text-ink-400 break-all">{c.file_path}</p>
-                  <p className="text-[11px] text-ink-500 mt-0.5">
-                    score <span className="font-mono">{c.score.toFixed(1)}</span> · verify{" "}
-                    <span className={c.verify_status === "REJECTED" ? "text-err" : c.verify_status === "VERIFIED" ? "text-ok" : "text-ink-500"}>
-                      {c.verify_status || "—"}
-                    </span>
-                    {c.doc_class ? ` · ${c.doc_class.toLowerCase().replace(/_/g, " ")}` : ""}
-                  </p>
-                </div>
-                <Button kind="primary" disabled={c.is_selected} onClick={() => recordOverride(selectedSlot, c.file_path)}>
-                  {c.is_selected ? "Current" : "Use this one"}
-                </Button>
-              </div>
-            ))}
-          </div>
-        </Card>
-      )}
 
       {/* footer: acknowledge selection */}
       <Card className="px-4 py-3 flex items-center justify-between">
         <p className="text-[12.5px] text-ink-600">
           {activeCount} document slot(s) in scope · {foundActive} resolved
-          {removed.size > 0 && <span className="text-warn"> · {removed.size} removed</span>}
+          {removedPairs.size > 0 && <span className="text-warn"> · {removedPairs.size} deal(s) removed</span>}
         </p>
         <Toggle
           checked={docsConfirmed}
@@ -1762,7 +2075,7 @@ function ConfirmDocuments({
       {picker && (
         <FolderPicker
           title={`Pick a file for ${picker.slot.deal}`}
-          initial={picker.slot.file_path ?? ""}
+          initial={pvRoot || picker.slot.file_path || ""}
           pickFiles
           onClose={() => setPicker(null)}
           onSelect={(path) => {

@@ -25,6 +25,7 @@ from pv_extractor.models import (
     SchemaField,
     VerifyResult,
 )
+from pv_extractor.indexer.periods import period_label
 from pv_extractor.validate.checks import check_hits
 from pv_extractor.validate.qoq import qoq_checks
 from pv_extractor.validate.rules import RuleSet, load_rules, run_rules
@@ -41,6 +42,22 @@ _VALUATION_VALUE_HEADERS = (
     "Cap Implied Asset Value ($M, local)",
     "Yield Cost + Accrued ($M, local)",
 )
+
+
+def _same_reporting_period(
+    asof_date: date, target: date, config: Config, client: str | None
+) -> bool:
+    """True when the document's in-file as-of and the target fall in the SAME
+    reporting period under the client's cadence (same quarter for quarterly
+    clients, same month for monthly). The period selector chooses the quarter/
+    year, not an exact day — a genuine Q2 document dated Apr/May must satisfy a
+    Q2 (Jun-30) target. Mirrors the peek-verifier's same-period tolerance and
+    is likewise gated by locator.tolerate_same_period (False = strict exact
+    date)."""
+    if not config.locator.tolerate_same_period:
+        return False
+    style = config.client_period_style(client or "default")
+    return period_label(asof_date, style) == period_label(target, style)
 
 
 @dataclass
@@ -61,6 +78,7 @@ def validate_asset(
     as_of_date: date | None,
     verify: VerifyResult | None,
     prior_row: dict[str, object] | None,
+    client: str | None = None,
 ) -> ValidatedAsset:
     validation = config.validation
     flags: list[ReviewFlag] = list(extraction_flags)
@@ -88,6 +106,7 @@ def validate_asset(
         and verify.asof_date is not None
         and as_of_date is not None
         and verify.asof_date != as_of_date
+        and not _same_reporting_period(verify.asof_date, as_of_date, config, client)
     ):
         flags.append(
             ReviewFlag(

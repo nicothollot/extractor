@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -264,6 +265,27 @@ def _extract_structured(envelope: dict) -> dict | None:
     return None
 
 
+def _error_from_stdout(stdout: str) -> str:
+    """Best-effort error message when `claude` exits non-zero with empty stderr:
+    the CLI's print-mode JSON envelope often carries the real reason on stdout
+    (is_error=true + a `result`/`error` string, or an `api_error_status`). Falls
+    back to a raw stdout snippet so the failure is never an undiagnosable
+    'exit N'."""
+    text = (stdout or "").strip()
+    if not text:
+        return ""
+    try:
+        env = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return re.sub(r"\s+", " ", text)
+    if isinstance(env, dict):
+        for key in ("error", "result", "message", "api_error_status", "subtype"):
+            value = env.get(key)
+            if isinstance(value, str) and value.strip():
+                return re.sub(r"\s+", " ", value.strip())
+    return re.sub(r"\s+", " ", text)
+
+
 class ClaudeCodeClient:
     """Launches hidden, non-interactive Claude Code extraction calls."""
 
@@ -339,25 +361,38 @@ class ClaudeCodeClient:
         """One hidden `claude -p` extraction call. The prompt travels via
         stdin (never argv: no process-list leakage, no length limits); page
         images in `cwd` are exposed read-only through the Read tool."""
-        # The schema lives inside the payload dir (= cwd); pass it relative
-        # with posix separators so the same argv works when the call is
-        # bridged from Windows into WSL (wsl.exe translates cwd, not args).
+        # `claude --json-schema` takes the schema JSON *inline* (a string), NOT
+        # a file path — passing a path makes the CLI try to JSON.parse the path
+        # and exit 1 ("--json-schema is not valid JSON"). Read the compiled
+        # schema and pass its content. Inline also sidesteps the Windows->WSL
+        # bridge entirely (no cwd-relative path to translate); argv is a list,
+        # so no shell quoting/escaping is involved.
         try:
-            schema_arg = schema_path.resolve().relative_to(Path(cwd).resolve()).as_posix()
-        except ValueError:
-            schema_arg = str(schema_path)
+            schema_arg = schema_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            result = ClaudeCodeResult(
+                job_id=job_id, ok=False,
+                error=f"could not read schema {schema_path}: {exc}",
+            )
+            self._log(result, model, effort)
+            return result
+        tail = ["--model", model]
+        if self.supports("--effort"):
+            tail += ["--effort", effort]
+        if allow_read_tool:
+            tail += ["--allowedTools", "Read"]
+        if self._exclude_dynamic and self.supports("--exclude-dynamic-system-prompt-sections"):
+            tail.append("--exclude-dynamic-system-prompt-sections")
+        # exec_argv carries the inline schema; argv (stored/logged) redacts it to
+        # keep the audit pointer flags-only (the schema can be many KB).
+        exec_argv = [
+            self._command, *self._command_args, "-p",
+            "--output-format", "json", "--json-schema", schema_arg, *tail,
+        ]
         argv = [
             self._command, *self._command_args, "-p",
-            "--output-format", "json",
-            "--json-schema", schema_arg,
-            "--model", model,
+            "--output-format", "json", "--json-schema", f"<inline schema:{len(schema_arg)} chars>", *tail,
         ]
-        if self.supports("--effort"):
-            argv += ["--effort", effort]
-        if allow_read_tool:
-            argv += ["--allowedTools", "Read"]
-        if self._exclude_dynamic and self.supports("--exclude-dynamic-system-prompt-sections"):
-            argv.append("--exclude-dynamic-system-prompt-sections")
 
         started = time.perf_counter()
         try:
@@ -367,7 +402,7 @@ class ClaudeCodeClient:
             # the call even runs. Force UTF-8 on both directions (errors=replace
             # only guards stdout decode; UTF-8 encodes any prompt losslessly).
             proc = subprocess.run(
-                argv, input=prompt, capture_output=True, text=True,
+                exec_argv, input=prompt, capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
                 timeout=timeout or self._call_timeout, cwd=str(cwd), env=_sanitized_env(),
             )
@@ -393,8 +428,16 @@ class ClaudeCodeClient:
             stdout_sha256=hashlib.sha256(stdout.encode("utf-8")).hexdigest(), argv=argv,
         )
         if proc.returncode != 0:
-            result.error = f"exit {proc.returncode}"
-            logger.debug("claude stderr (%s): %s", job_id, (proc.stderr or "")[:_STDERR_DEBUG_CHARS])
+            # Surface the CLI's own diagnostic — a bare "exit N" is useless.
+            # The CLI sometimes writes the error to STDERR and sometimes (with
+            # --output-format json) emits a JSON envelope on STDOUT with
+            # is_error=true / an error string and STILL exits non-zero, so check
+            # both. stderr/the envelope error is the CLI's own diagnostic, not
+            # memo content (the memo travels via stdin and only appears in the
+            # structured stdout payload). Truncated to keep the audit compact.
+            stderr = re.sub(r"\s+", " ", (proc.stderr or "")).strip()
+            detail = stderr or _error_from_stdout(stdout)
+            result.error = f"exit {proc.returncode}" + (f": {detail[:_STDERR_DEBUG_CHARS]}" if detail else "")
             self._log(result, model, effort)
             return result
 

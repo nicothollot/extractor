@@ -15,8 +15,32 @@ model cannot skip fields silently.
 from __future__ import annotations
 
 import json
+import re
 
 from pv_extractor.models import SchemaField
+
+# The Anthropic API rejects any tool input_schema property key that does not
+# match this pattern (HTTP 400 "Property keys should match pattern ..."), so the
+# human workbook headers ("Total Invested Capital ($M)") and band names
+# ("METHODOLOGY: MULTIPLE") CANNOT be used as JSON keys directly. We sanitize
+# every key to a legal token, annotate the prompt with the exact key per field,
+# and reverse the mapping when parsing the response (see response_key_map).
+_KEY_OK = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_KEY_ILLEGAL = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _safe_key(name: str, unique_id: int, used: set[str]) -> str:
+    """Map an arbitrary band/field name to a key matching `_KEY_OK`, unique
+    within `used`. `unique_id` (a stable, globally-unique int — the field's
+    col_index or the band's order) disambiguates collisions deterministically,
+    so the mapping does not depend on call order."""
+    base = _KEY_ILLEGAL.sub("_", name).strip("_")[:48] or "field"
+    key = base if base not in used else f"{base}__{unique_id}"[:64]
+    while key in used:  # pathological: still collides after the id suffix
+        unique_id += 1
+        key = f"{base}__{unique_id}"[:64]
+    used.add(key)
+    return key
 
 # One escalated field's answer. Plain types only — structured-output schema
 # support excludes numeric/string constraints, so length/range rules live in
@@ -35,10 +59,11 @@ FIELD_RESULT_SCHEMA: dict = {
     "required": ["value", "unit", "page", "verbatim_quote", "confidence", "not_found"],
 }
 
-_PROMPT_HEADER = """\
+_PROMPT_RULES = """\
 You are extracting structured fields from selected pages of a private-equity
-valuation document. The pages follow after the field list; some pages are
-plain text, some are page images you must view with the Read tool.
+valuation document. The document pages appear first, then the list of fields to
+extract; some pages are plain text, some are page images you must view with the
+Read tool.
 
 Rules — follow every one exactly:
 1. Use ONLY the supplied pages. Never use outside knowledge, never guess,
@@ -65,10 +90,16 @@ Rules — follow every one exactly:
    answer with one of the allowed values verbatim or set not_found.
 4. Respond with a single JSON document conforming to the provided schema —
    one object per band, one object per field. No commentary.
-
-Fields to extract, grouped by workbook band (the description after each
-field header is the authoritative extraction instruction):
+5. The response schema uses short JSON keys, NOT the human field names. Each
+   band and field below is annotated with the exact key to use, shown as
+   `{json key: ...}`. Put each field's object under its band's json key and its
+   own json key, exactly as annotated.
 """
+
+_FIELDS_PREAMBLE = (
+    "Fields to extract, grouped by workbook band (the description after each "
+    "field header is the authoritative extraction instruction):"
+)
 
 
 def sorted_fields(fields: list[SchemaField]) -> list[SchemaField]:
@@ -84,22 +115,60 @@ def band_grouped(fields: list[SchemaField]) -> dict[str, list[SchemaField]]:
     return grouped
 
 
+def _keyed_bands(
+    fields: list[SchemaField],
+) -> list[tuple[str, str, list[tuple[str, SchemaField]]]]:
+    """Deterministic [(band_key, band_name, [(field_key, field), ...]), ...].
+
+    Every band_key and field_key matches `_KEY_OK` so the response schema is
+    accepted by the API. Keys derive only from the field set (band order +
+    col_index), so build_response_schema and response_key_map agree."""
+    band_used: set[str] = set()
+    out: list[tuple[str, str, list[tuple[str, SchemaField]]]] = []
+    for band_idx, (band, band_fields) in enumerate(band_grouped(fields).items()):
+        band_key = _safe_key(band, band_idx, band_used)
+        field_used: set[str] = set()
+        keyed = [(_safe_key(f.header, f.col_index, field_used), f) for f in band_fields]
+        out.append((band_key, band, keyed))
+    return out
+
+
+_FIELD_DEF = "fieldresult"  # $defs name for the shared per-field answer shape
+
+
 def build_response_schema(fields: list[SchemaField]) -> dict:
-    """Strict band-grouped response schema for `claude --json-schema`."""
+    """Strict band-grouped response schema for `claude --json-schema`. Property
+    keys are sanitized to satisfy the API's `^[A-Za-z0-9_.-]{1,64}$` rule; the
+    human header/band names live in the prompt's field list instead.
+
+    The per-field answer shape (~330 chars) is defined ONCE under `$defs` and
+    every field is a `$ref` to it — inlining it per field made a ~200-field
+    schema ~100 KB, and the schema is passed INLINE on the `claude` command line
+    where Windows caps the line at ~32 KB ([WinError 206]). With `$ref` the same
+    schema is ~10 KB, so the whole escalate-everything field set fits in ONE
+    call."""
     bands: dict[str, dict] = {}
-    for band, band_fields in band_grouped(fields).items():
-        bands[band] = {
+    for band_key, _band, keyed in _keyed_bands(fields):
+        bands[band_key] = {
             "type": "object",
             "additionalProperties": False,
-            "properties": {f.header: FIELD_RESULT_SCHEMA for f in band_fields},
-            "required": [f.header for f in band_fields],
+            "properties": {fk: {"$ref": f"#/$defs/{_FIELD_DEF}"} for fk, _f in keyed},
+            "required": [fk for fk, _f in keyed],
         }
     return {
         "type": "object",
         "additionalProperties": False,
+        "$defs": {_FIELD_DEF: FIELD_RESULT_SCHEMA},
         "properties": bands,
         "required": list(bands),
     }
+
+
+def response_key_map(fields: list[SchemaField]) -> dict[str, dict[str, str]]:
+    """Reverse of the schema keys: {band_key: {field_key: workbook header}}.
+    Used to turn the model's response (keyed by the sanitized schema keys) back
+    into header-keyed hits for the merge step."""
+    return {bk: {fk: f.header for fk, f in keyed} for bk, _band, keyed in _keyed_bands(fields)}
 
 
 def schema_json_bytes(schema: dict) -> bytes:
@@ -107,8 +176,8 @@ def schema_json_bytes(schema: dict) -> bytes:
     return json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def _field_line(field: SchemaField) -> str:
-    parts = [f'- "{field.header}"']
+def _field_line(field_key: str, field: SchemaField) -> str:
+    parts = [f'- "{field.header}" {{json key: {field_key}}}']
     meta: list[str] = [f"type={field.dtype}"]
     if field.unit:
         meta.append(f"unit={field.unit}")
@@ -121,12 +190,37 @@ def _field_line(field: SchemaField) -> str:
     return " ".join(parts)
 
 
-def build_static_prompt(fields: list[SchemaField]) -> str:
-    """Byte-stable instruction block: header + band-grouped field list with
-    the workbook row-3 descriptions verbatim (whitespace-collapsed only)."""
-    lines: list[str] = [_PROMPT_HEADER]
-    for band, band_fields in band_grouped(fields).items():
-        lines.append(f"[{band}]")
-        lines.extend(_field_line(field) for field in band_fields)
+def build_field_block(fields: list[SchemaField]) -> str:
+    """The band-grouped field list (workbook row-3 descriptions verbatim), each
+    band and field annotated with the JSON key the response schema expects. This
+    is the part of the prompt that VARIES per call (each chunk/retry asks for a
+    different field subset)."""
+    lines: list[str] = []
+    for band_key, band, keyed in _keyed_bands(fields):
+        lines.append(f"[{band}] {{json key: {band_key}}}")
+        lines.extend(_field_line(field_key, field) for field_key, field in keyed)
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def build_static_prompt(fields: list[SchemaField]) -> str:
+    """Byte-stable instruction block (rules + the field list). Used for the
+    response-cache key and the audit copy — NOT the literal wire order, which
+    `build_call_prompt` arranges cache-first."""
+    return _PROMPT_RULES + "\n" + _FIELDS_PREAMBLE + "\n" + build_field_block(fields)
+
+
+def build_call_prompt(fields: list[SchemaField], page_payload: str) -> str:
+    """The prompt actually sent to `claude -p`, ordered for prompt-cache reuse:
+    the STABLE rules + the page payload first (identical across a memo's chunks
+    and across a group's retry tiers — so it is created in the cache once and
+    READ thereafter), then the per-call field list last. Same content as
+    build_static_prompt + payload, only reordered so the expensive page payload
+    is a cacheable prefix instead of being re-uploaded behind a varying field
+    list."""
+    return (
+        _PROMPT_RULES + "\n"
+        + page_payload.rstrip() + "\n\n"
+        + _FIELDS_PREAMBLE + "\n"
+        + build_field_block(fields)
+    )

@@ -36,7 +36,7 @@ if log:
 
 if "--help" in argv:
     print("Usage: claude [options] [prompt]\\n"
-          "  -p, --print\\n  --output-format <format>\\n  --json-schema <file>\\n"
+          "  -p, --print\\n  --output-format <format>\\n  --json-schema <schema>\\n"
           "  --model <model>\\n  --effort <level>\\n  --allowedTools <tools>\\n"
           "  --exclude-dynamic-system-prompt-sections")
     sys.exit(0)
@@ -57,11 +57,16 @@ if mode == "malformed":
     sys.exit(0)
 if mode == "exit3":
     sys.exit(3)
+if mode == "err_stdout":
+    # exit non-zero with the reason ONLY on stdout (empty stderr) — the CLI's
+    # print-mode error envelope shape.
+    print(json.dumps({{"type": "result", "is_error": True, "result": "Usage limit reached"}}))
+    sys.exit(1)
 if mode == "sleep":
     time.sleep(30)
 
-with open(argv[argv.index("--json-schema") + 1]) as fh:
-    schema = json.load(fh)
+# `claude --json-schema` takes the schema JSON inline (a string), not a path.
+schema = json.loads(argv[argv.index("--json-schema") + 1])
 doc = {{}}
 for band, band_schema in schema["properties"].items():
     doc[band] = {{header: {{"value": "v", "unit": None, "page": 1,
@@ -138,10 +143,11 @@ def test_extract_json_flags_parsing_and_env_isolation(fake_env):
     argv = extraction["argv"]
     assert argv[0] == "-p"
     assert argv[argv.index("--output-format") + 1] == "json"
-    # the schema lives inside cwd and is passed RELATIVE with posix
-    # separators, so the same argv works when bridged from Windows into WSL
-    expected_schema = schema_path.resolve().relative_to(tmp_path.resolve()).as_posix()
-    assert argv[argv.index("--json-schema") + 1] == expected_schema
+    # the schema is passed INLINE as a JSON string (not a path): the CLI parses
+    # --json-schema as JSON, and inline avoids any cwd/path translation when
+    # the call is bridged from Windows into WSL.
+    schema_arg = argv[argv.index("--json-schema") + 1]
+    assert json.loads(schema_arg) == json.loads(schema_path.read_text(encoding="utf-8"))
     assert argv[argv.index("--model") + 1] == "sonnet"
     assert argv[argv.index("--effort") + 1] == "low"  # probed via --help
     assert argv[argv.index("--allowedTools") + 1] == "Read"
@@ -205,6 +211,19 @@ def test_nonzero_exit_is_an_error_result(fake_env, monkeypatch):
         model="sonnet", effort="low", cwd=tmp_path,
     )
     assert not result.ok and result.exit_code == 3 and "exit 3" in (result.error or "")
+
+
+def test_nonzero_exit_surfaces_stdout_error(fake_env, monkeypatch):
+    """When the CLI exits non-zero with EMPTY stderr but a JSON error envelope
+    on stdout, the real reason is surfaced (not a bare 'exit 1')."""
+    client, schema_path, _, tmp_path = fake_env
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "err_stdout")
+    result = client.extract_json(
+        job_id="j", prompt="x", schema_path=schema_path,
+        model="sonnet", effort="low", cwd=tmp_path,
+    )
+    assert not result.ok and result.exit_code == 1
+    assert "Usage limit reached" in (result.error or "")
 
 
 def test_timeout_is_an_error_result(fake_env, monkeypatch):

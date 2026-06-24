@@ -22,13 +22,19 @@ rejection: filename evidence then stands on its own.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 from rapidfuzz import fuzz
 
+from datetime import date
+
 from pv_extractor.config import Config
 from pv_extractor.extract.patterns import parse_date_text, snippet
+from pv_extractor.indexer.periods import period_label
 from pv_extractor.extract.readers import reader_for_extension
 from pv_extractor.locator.aliases import expansions_for, load_aliases
 from pv_extractor.logging_setup import log_event
@@ -44,6 +50,78 @@ from pv_extractor.models import (
 from pv_extractor.normalize import normalize_text
 
 logger = logging.getLogger(__name__)
+
+# --- peek-read cache -------------------------------------------------------
+# Peeking a candidate (reader.summarize over the first N pages, incl. any OCR)
+# is the dominant cost of selection/preflight. The SAME file is peeked many
+# times in one session: once by the preflight dry-run, again when the Confirm-
+# documents table is built, and again on every swap/reload. The read is a pure
+# function of (file bytes, page-budget, page-classification config), so we
+# memoize the DocumentContent by file identity (path + mtime + size). The
+# cheap keyword/regex/cross-check work is always recomputed, so a different
+# query against the same file is correct without re-reading it. Bounded LRU,
+# thread-safe (jobs and request handlers share one process). The share is
+# read-only, so cached content can only go stale if a file is overwritten
+# in place with the same size AND mtime — which mtime_ns makes vanishingly
+# unlikely; a real re-upload changes mtime and misses the cache.
+_PEEK_CACHE: "OrderedDict[tuple, object]" = OrderedDict()
+_PEEK_CACHE_LOCK = threading.Lock()
+_PEEK_CACHE_MAX = 2048
+
+
+def _peek_class_sig(config: Config) -> str:
+    """Signature of the config that affects reader.summarize output, so an
+    edited page-classification config invalidates cached reads."""
+    try:
+        return config.extraction.page_classification.model_dump_json()
+    except Exception:  # noqa: BLE001 — signature is best-effort; fall back to a constant
+        return ""
+
+
+def peek_summarize(path: str | Path, reader, pages: int, class_sig: str):
+    """reader.summarize(path, max_pages=pages), memoized by file identity."""
+    key = None
+    try:
+        st = os.stat(path)
+        key = (str(path), st.st_mtime_ns, st.st_size, pages, class_sig)
+    except OSError:
+        key = None  # stat failed -> read uncached, let the reader surface the error
+    if key is not None:
+        with _PEEK_CACHE_LOCK:
+            hit = _PEEK_CACHE.get(key)
+            if hit is not None:
+                _PEEK_CACHE.move_to_end(key)
+                return hit
+    content = reader.summarize(path, max_pages=pages)
+    # Never cache a transient failure (locked file, cloud placeholder): those
+    # must be retried, not pinned.
+    if key is not None and not content.flags:
+        with _PEEK_CACHE_LOCK:
+            _PEEK_CACHE[key] = content
+            _PEEK_CACHE.move_to_end(key)
+            while len(_PEEK_CACHE) > _PEEK_CACHE_MAX:
+                _PEEK_CACHE.popitem(last=False)
+    return content
+
+
+def clear_peek_cache() -> None:
+    """Drop all cached peek reads (used by tests; also safe after a rescan)."""
+    with _PEEK_CACHE_LOCK:
+        _PEEK_CACHE.clear()
+
+def _same_reporting_period(
+    asof_date: date, target: date, config: Config, client: str | None
+) -> bool:
+    """True when both dates fall in the same reporting period under the client's
+    cadence (same quarter for quarterly clients, same month for monthly). Lets a
+    genuine same-quarter document pass the in-file cross-check instead of being
+    rejected for a non-quarter-end as-of. Off when locator.tolerate_same_period
+    is False (strict exact-date behavior)."""
+    if not config.locator.tolerate_same_period:
+        return False
+    style = config.client_period_style(client or "default")
+    return period_label(asof_date, style) == period_label(target, style)
+
 
 _ASOF_MARKERS = re.compile(r"\b(?:valuation\s+(?:date|as\s+of)|as\s+of|as\s+at|dated)\b[:\s]*", re.IGNORECASE)
 _DOC_TYPE_TITLE_NOISE = re.compile(
@@ -66,6 +144,29 @@ def _extract_asof(lines: list[str]) -> tuple[object, str] | None:
         if m is None:
             continue
         parsed = parse_date_text(line[m.end():]) or parse_date_text(line)
+        if parsed is not None:
+            return parsed[0], line.strip()
+    return None
+
+
+# Title separators ('Valuation Template - June - 2026') flattened so the
+# stated reporting period parses as a month/quarter + year.
+_TITLE_PERIOD_SEP = re.compile(r"[\-–—_/]+")
+
+
+def _title_period_asof(lines: list[str]) -> tuple[object, str] | None:
+    """Fallback as-of: the reporting period stated in a header/title line
+    (e.g. 'Valuation Template - June - 2026', 'Q2 2026 Portfolio Review').
+    Many client templates carry the period in the title and on the value
+    table header rather than after an 'as of:' marker. parse_date_text only
+    returns a date for an explicit month/quarter + year, so a bare codename
+    or page number never produces a false as-of."""
+    for line in lines[:8]:
+        flat = _TITLE_PERIOD_SEP.sub(" ", line)
+        flat = re.sub(r"\s+", " ", flat).strip()
+        if not flat:
+            continue
+        parsed = parse_date_text(flat)
         if parsed is not None:
             return parsed[0], line.strip()
     return None
@@ -120,7 +221,7 @@ def verify_candidate(
             reason=f"no reader for extension {extension!r}; content not inspected",
         )
 
-    content = reader.summarize(path, max_pages=cfg.pages)
+    content = peek_summarize(path, reader, cfg.pages, _peek_class_sig(config))
     if content.flags:
         return VerifyResult(
             status=VerifyStatus.UNVERIFIED,
@@ -142,7 +243,7 @@ def verify_candidate(
     exception_hits, _ = _count_hits(norm, cfg.hl_addressee_exceptions)
     client_hits, client_matched = _count_hits(norm, cfg.client_doc_keywords)
 
-    asof = _extract_asof(lines)
+    asof = _extract_asof(lines) or _title_period_asof(lines)
     asof_date = asof[0] if asof else None
     if asof:
         evidence.append(snippet(asof[1]))
@@ -197,7 +298,9 @@ def verify_candidate(
 
     # --- cross-checks against the locate query ---
     if query is not None and query.as_of_date is not None and asof_date is not None:
-        if asof_date != query.as_of_date:
+        if asof_date != query.as_of_date and not _same_reporting_period(
+            asof_date, query.as_of_date, config, query.client
+        ):
             return VerifyResult(
                 status=VerifyStatus.REJECTED,
                 reason=(
@@ -340,6 +443,41 @@ def verify_and_rerank(
                 f"content verification disambiguated: {winner.record.file_name!r} is the only "
                 f"VERIFIED candidate among {len(survivors)} survivors"
             )
+        elif config.locator.auto_select_best_on_ambiguous:
+            # Several acceptable candidates and none collapsed to one: auto-pick
+            # the highest-confidence one the locator already accepted, rather than
+            # leaving the slot blank. Sub-threshold candidates (archived priors,
+            # period-only fallbacks) are never auto-accepted — they stay AMBIGUOUS
+            # for a human pick. The analyst can still swap the auto-pick.
+            acceptable = [
+                c for c in survivors
+                if c.breakdown.final_score >= config.locator.min_accept_score
+            ]
+            verified_pool = [c for c in acceptable if status_of(c) is VerifyStatus.VERIFIED]
+            pool = verified_pool or acceptable
+            if pool:
+                def _peek_conf(cand) -> float:
+                    verdict = verdicts.get(cand.record.file_path)
+                    return verdict.confidence if verdict is not None else 0.0
+
+                # When at least one candidate VERIFIED as a valuation doc, peek
+                # confidence leads. When NONE verified — e.g. every candidate is a
+                # SCANNED PDF the text-peek can't read — peek confidence is
+                # unreliable: a scanned valuation memo reads 0.0 ("couldn't
+                # inspect") and would lose to a readable-but-wrong doc (a DDQ that
+                # inspected as not-a-valuation, ~0.6). Trust the locator's score
+                # (filename/period/source) instead, so the right file wins over an
+                # off-type readable one.
+                def _key(cand):
+                    pc, fs, fr = _peek_conf(cand), cand.breakdown.final_score, -cand.family_rank
+                    return (pc, fs, fr) if verified_pool else (fs, pc, fr)
+
+                winner = max(pool, key=_key)
+                status = ResolutionStatus.FOUND
+                evidence = (
+                    f"auto-selected highest-confidence candidate {winner.record.file_name!r} "
+                    f"among {len(survivors)} acceptable survivors — review/swap in Confirm documents"
+                )
 
     return (
         LocateResult(status=status, query=result.query, candidates=reranked, winner=winner, evidence=evidence),

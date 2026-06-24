@@ -121,7 +121,12 @@ def test_index_metadata_endpoints(client) -> None:
     periods = client.get(
         "/api/index/periods", params={"client": "Angelo Gordon", "deal": "Accell"}
     ).json()["periods"]
-    assert {"as_of_date", "label"} <= set(periods[0])
+    assert {"period", "as_of_date", "label"} <= set(periods[0])
+    # Deduped to one entry per reporting-period label (never one per date folder),
+    # and the submit value (period) equals the label.
+    labels = [p["label"] for p in periods]
+    assert len(labels) == len(set(labels))
+    assert all(p["period"] == p["label"] for p in periods)
     doc_types = client.get("/api/index/doc-types").json()["doc_types"]
     assert "valuation_memo" in doc_types
     templates = client.get("/api/templates").json()
@@ -544,9 +549,9 @@ def test_review_accept_all_pending(client, completed_run) -> None:
 
 def test_multi_period_and_doc_type_expand_to_slots(client) -> None:
     """A run naming multiple periods and/or doc types fans out into one slot per
-    (pair × doc type × period); the preflight selection reports the slot_count
-    and previews one row per deal."""
-    # two periods, one deal -> 2 slots
+    (pair × doc type × period). The Confirm-documents table now shows EVERY slot
+    (one per period tab), not just the first — each with a distinct slot_key."""
+    # two periods, one deal -> 2 slots, one per period (both shown)
     r = client.post("/api/jobs/run", json={
         "scope": "deal", "client": "Angelo Gordon", "deal": "Accell",
         "period": "2025-01-31", "periods": ["2025-01-31", "2024-11-30"],
@@ -558,9 +563,13 @@ def test_multi_period_and_doc_type_expand_to_slots(client) -> None:
     sel = client.get(f"/api/jobs/{job['id']}/selection").json()
     assert sel["slot_count"] == 2
     assert sel["periods"] == ["2025-01-31", "2024-11-30"]
-    assert len(sel["slots"]) == 1  # one representative row per deal
+    # BOTH periods now appear (the multi-period Confirm-documents fix), one slot
+    # per period, with distinct slot_keys.
+    assert len(sel["slots"]) == 2
+    assert {s["period"] for s in sel["slots"]} == {"2025-01-31", "2024-11-30"}
+    assert len({s["slot_key"] for s in sel["slots"]}) == 2
 
-    # two doc types, one deal/period -> 2 slots
+    # two doc types, one deal/period -> 2 slots, one per doc type (both shown)
     r = client.post("/api/jobs/run", json={
         "scope": "deal", "client": "Angelo Gordon", "deal": "Accell",
         "period": "2025-01-31", "doc_types": ["valuation_memo", "quarterly_report"],
@@ -570,6 +579,8 @@ def test_multi_period_and_doc_type_expand_to_slots(client) -> None:
     sel = client.get(f"/api/jobs/{job['id']}/selection").json()
     assert sel["slot_count"] == 2
     assert sel["doc_types"] == ["valuation_memo", "quarterly_report"]
+    assert len(sel["slots"]) == 2
+    assert {s["doc_type"] for s in sel["slots"]} == {"valuation_memo", "quarterly_report"}
 
 
 def test_period_range_expand_endpoint(client) -> None:
@@ -690,7 +701,11 @@ def test_job_selection_endpoint(client) -> None:
     assert "Accell" in by_deal
     accell = by_deal["Accell"]
     assert accell["status"] == "FOUND"
-    assert accell["slot_key"] == "Angelo Gordon|Accell"
+    # slot_key now carries period + doc_type so multi-period/-doc-type runs have
+    # one distinct slot per tab (the Confirm-documents fix).
+    assert accell["slot_key"] == "Angelo Gordon|Accell|2025-01-31|any_client_valuation_doc"
+    assert accell["period"] == "2025-01-31"
+    assert accell["doc_type"] == "any_client_valuation_doc"
     assert accell["file_name"] and accell["file_path"]
     assert accell["predicted_period"] and accell["as_of_date"] == "2025-01-31"
     assert accell["page_count"] and accell["page_count"] > 0
@@ -705,6 +720,71 @@ def test_job_selection_endpoint(client) -> None:
     nondry_job = _wait_job(client, nondry.json()["job"]["id"])
     bad = client.get(f"/api/jobs/{nondry_job['id']}/selection")
     assert bad.status_code == 400
+
+
+def test_confirm_documents_features(client) -> None:
+    """Confirm-documents add-ons (read-only here; editability is covered by the
+    config-edit test): candidate first-page preview renders an arbitrary indexed
+    PDF, open-file rejects paths outside pv_root, and the selection confidence
+    threshold is exposed in /api/config (linked to the Settings control)."""
+    # candidate preview renders page 1 of a real indexed PDF
+    located = client.post("/api/locator/locate", json={
+        "client": "Angelo Gordon", "deal": "Accell", "period": "2025-01-31",
+    }).json()
+    pdf = located["candidates"][0]["record"]["file_path"]
+    img = client.get("/api/locator/preview", params={"file_path": pdf, "page": 1})
+    assert img.status_code == 200, img.text
+    assert img.headers["content-type"] == "image/png"
+    assert img.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    # preview of a file outside pv_root is refused
+    bad = client.get("/api/locator/preview", params={"file_path": "/etc/hosts", "page": 1})
+    assert bad.status_code == 404
+
+    # open-file refuses a path outside pv_root (never spawns an opener)
+    out = client.post("/api/locator/open-file", json={"path": "/etc/passwd"})
+    assert out.status_code == 400
+
+    # the selection threshold is exposed for the Confirm-documents control
+    cfg = client.get("/api/config").json()
+    assert "selection" in cfg and "min_confidence" in cfg["selection"]
+
+
+def test_source_docs_multi_doc_selection(client) -> None:
+    """Recording a multi-document selection: file_paths[0] is the primary
+    (override), the rest are extra sources surfaced on the slot for the
+    multi-doc merge. Cleans up so the module-scoped index isn't polluted."""
+    loc = client.post("/api/locator/locate", json={
+        "client": "Angelo Gordon", "deal": "Accell", "period": "2025-01-31",
+    }).json()
+    primary = loc["winner"]["record"]["file_path"]
+    # a second real Accell file from the same period folder (a sibling version)
+    listing = client.get("/api/fs/list", params={
+        "path": str(Path(primary).parent), "files": True,
+    }).json()
+    siblings = [f["path"] for f in listing["files"] if f["path"] != primary and f["path"].lower().endswith(".pdf")]
+    assert siblings, "fixture should have sibling Accell versions"
+    extra = siblings[0]
+
+    body = {
+        "client": "Angelo Gordon", "deal": "Accell", "period": "2025-01-31",
+        "doc_type": "valuation_memo", "file_paths": [primary, extra],
+    }
+    r = client.post("/api/locator/source-docs", json=body)
+    assert r.status_code == 200, r.text
+    rec = r.json()["recorded"]
+    assert rec["primary"] == primary and rec["extra_docs"] == [extra]
+
+    # the extra surfaces on the slot (drives the '+N merged' UI + the run merge)
+    listed = client.get("/api/locator/overrides").json()["overrides"]
+    assert any(o["file_path"] == primary for o in listed)
+
+    # cleanup: clear extras + delete the override
+    client.post("/api/locator/source-docs", json={**body, "file_paths": []})
+    client.delete("/api/locator/overrides", params={
+        "client": "Angelo Gordon", "deal": "Accell",
+        "as_of_date": rec["as_of_date"], "doc_type": "valuation_memo",
+    })
 
 
 def test_run_exclude_drops_slot(client) -> None:
@@ -908,6 +988,12 @@ def test_config_edit_preserves_comments_and_validates(client, gui_env) -> None:
     # locations are GUI-editable (Settings > Locations & file index)
     r = client.put("/api/config", json={"values": {"pv_root": config.pv_root}})
     assert r.status_code == 200 and r.json()["pv_root"] == config.pv_root
+
+    # the Confirm-documents selection threshold is GUI-editable and round-trips
+    # even though config.yaml has no `selection:` block yet (set_dotted creates
+    # the whitelisted section); the value links to the Confirm-documents control.
+    r = client.put("/api/config", json={"values": {"selection.min_confidence": 0.8}})
+    assert r.status_code == 200 and r.json()["selection"]["min_confidence"] == 0.8
 
     # non-whitelisted key refused
     r = client.put("/api/config", json={"values": {"indexer.batch_size": 1}})
@@ -1163,7 +1249,7 @@ def test_multi_search_selection_groups_per_firm(client) -> None:
     assert ag["slots"] and ag["found"] >= 1
     accell = next(s for s in ag["slots"] if s["deal"] == "Accell")
     assert accell["status"] == "FOUND"
-    assert accell["slot_key"] == "Angelo Gordon|Accell"
+    assert accell["slot_key"].startswith("Angelo Gordon|Accell|2025-01-31|")
     assert accell["file_name"] and accell["file_path"]
     assert accell["as_of_date"] == "2025-01-31"
     # SlotSelection fields + the multi-search-only doc_type_slug
@@ -1321,3 +1407,4 @@ def test_multi_search_run_conflicts_with_active_pipeline(client) -> None:
         _wait_job(client, first.json()["job"]["id"])
         if second.status_code == 200:
             _wait_job(client, second.json()["job"]["id"])
+

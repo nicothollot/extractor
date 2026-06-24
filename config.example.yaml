@@ -173,6 +173,20 @@ locator:
   # target period, offer them as AMBIGUOUS (so the analyst can Replace) instead
   # of a bare NOT_YET_UPLOADED. Pure-negative files (NDA/invoice/wire) excluded.
   surface_period_matches_without_doctype: true
+  # When the peek-verifier leaves a slot AMBIGUOUS, auto-select the highest-
+  # confidence acceptable candidate (final_score >= min_accept_score; VERIFIED
+  # preferred, then peek confidence, then locator score) and resolve to FOUND —
+  # the analyst can still swap it in Confirm documents. Sub-threshold candidates
+  # (archived priors, period-only fallbacks) stay AMBIGUOUS for a human pick.
+  # false = always leave multi-candidate ambiguity for the human.
+  auto_select_best_on_ambiguous: true
+  # Treat a document whose as-of date falls in the SAME reporting period as the
+  # target (same quarter for quarterly clients, same month for monthly) as a
+  # period match, not only on an exact-date hit. Lets one "Q1 2026" selection
+  # find every deal in Q1 even when they file at different month-ends, and stops
+  # the peek-verifier rejecting a genuine same-quarter doc. Exact hits still win.
+  # false = strict exact-date matching (original Phase-1/2 behavior).
+  tolerate_same_period: true
   mtime_window_days: 75          # modified_time in [as-of, as-of + N days] = weak period signal
   family_ratio_threshold: 92     # rapidfuzz ratio on normalized stems for version-family grouping
   fuzzy_match_threshold: 80      # token_set_ratio below this = no client/deal match
@@ -182,6 +196,7 @@ locator:
     client_deal_normalized: 27.0
     client_deal_fuzzy_max: 22.0        # scaled by (token_set_ratio - threshold) / (100 - threshold)
     period_folder_exact: 25.0          # date-folder parse equals target as-of date
+    period_folder_same_period: 22.0    # SAME reporting period (e.g. Q1) but a different date; needs tolerate_same_period
     period_folder_mismatch: -20.0      # date folder parses to a DIFFERENT period than target
     period_in_filename: 15.0           # filename contains the target period
     period_mtime_window: 3.0           # weak tie-breaker only
@@ -320,6 +335,22 @@ peek_verify:
   - concluded value
   - enterprise value
   - net asset value
+  - valuation template          # AWM/GP valuation & financials template vocabulary
+  - valuation overview
+  - valuation methodology
+  - valuation metric
+  - implied multiple
+  - implied enterprise value
+  - equity value
+  - total equity value
+  - discounted cashflow
+  - discounted cash flow
+  - comparable multiple
+  - comparable summary
+  - ev/ebitda
+  - reported ebitda
+  - financials template
+  - company financial performance
   hl_work_product_markers:         # Houlihan Lokey letterhead/disclaimer language
   - houlihan lokey
   - prepared by hl
@@ -339,6 +370,14 @@ peek_verify:
   - borrower
   - project
 
+# --- New Run "Confirm documents" step ---
+selection:
+  # Auto-pick floor (0..1). On Confirm documents, clicking Refresh drops any
+  # slot whose auto-selected document scores BELOW this peek-verify confidence
+  # and keeps the rest. Editable here AND inline on the Confirm step (same
+  # value). 0.0 = keep every located document (no confidence filtering).
+  min_confidence: 0.0
+
 # --- Phase 3: Claude Code CLI fallback (LLM second pass) ---
 # No Anthropic SDK, no ANTHROPIC_API_KEY: hidden local `claude -p` sessions
 # reuse the operator's one-time `claude auth login`. The deterministic engine
@@ -357,12 +396,36 @@ llm:
   cache_enabled: true              # response cache keyed on prompt+payload+fields+model+effort
   timeout_seconds: 600             # per extraction call
   max_pages_per_memo: 20           # payload cap: candidate pages + pages 1-3
+  one_call_per_deal: true          # ONE claude -p call per deal-period over ALL its documents' pages +
+                                   #   the whole field set (deterministic engine still runs first for
+                                   #   grounding/comps/derived). Far faster than per-band multi-call
+                                   #   fan-out; implies comprehensive escalation + result-cache bypass.
+                                   #   false = legacy per-memo band-batched path (unchanged).
+  max_pages_per_deal: 40           # total page cap for the combined per-deal payload (across its docs)
   image_max_long_edge: 1080        # SCANNED/IMAGE_TABLE pages render to PNG at most this long edge
   quote_match_threshold: 85        # fuzzy quote-grounding floor for OCR'd pages
   band_batched: true               # focused per-band LLM calls (relevance-ordered) vs one giant call
+  single_call_max_pages: 8         # when the LLM payload is <= this many pages, ignore band_batched
+                                   #   and make ONE call over the whole doc + all fields (cheaper/faster
+                                   #   for short client memos; large memos still band-batch). 0 disables.
+  retry_not_found: false           # false = a field the model marks not_found is RESOLVED (no expensive
+                                   #   retry tier, no NOT_EXTRACTABLE flag — a confirmed absence is not a
+                                   #   failure); failed/rejected fields still escalate. true = old behavior.
+  surface_ungrounded_values: true  # true = a parseable value whose quote can't be matched on the cited
+                                   #   page (common on SCANNED/OCR pages) is SHOWN as a low-confidence
+                                   #   flagged hit for review, not discarded. false = discard it (stricter).
+  ungrounded_confidence_cap: 0.2   # max confidence stamped on a surfaced ungrounded value
   band_relevance_floor: 0.0        # band page-anchor score strictly above this counts as "has evidence"
-  max_fields_per_call: 50          # split a band's call when it carries more fields than this
+  max_fields_per_call: 200         # fields per LLM call; the $ref schema is ~10x smaller, so the whole
+                                   #   escalate-everything set fits ONE call inline under the Windows limit
+  prefer_ocr_text_over_image: true # scanned page that OCRs cleanly -> send OCR TEXT (fast) not the page
+                                   #   image (slow vision + huge output). IMAGE_TABLE pages stay images.
+  ocr_text_min_confidence: 0.85    # min OCR mean confidence to send text instead of the page image
   no_evidence_effort: low          # effort for the single sweep over bands with no page evidence
+  adaptive_batching: true          # merge bands that target the SAME pages into one call (a small
+                                   #   doc -> a few calls, not ~19 per-band calls); each call still
+                                   #   capped at max_fields_per_call. false = one call per band.
+  adaptive_max_pages_per_call: 8   # greedily combine page-sets until their union exceeds this
   exclude_dynamic_system_prompt_sections: true  # better prompt-cache reuse when the CLI supports it
   confidence_scores:               # LLM self-reported confidence -> FieldHit.confidence
     high: 0.85

@@ -37,8 +37,16 @@ from pv_extractor.models import (
 from pv_extractor.normalize import normalize_text
 
 # Column headers tried when a spec gives no explicit table_col: the generic
-# 'value of this metric' columns found in memo tables.
-DEFAULT_VALUE_COLS = ["value", "selected", "current", "amount", "total"]
+# 'value of this metric' columns found in memo tables. Includes the
+# current-mark column spellings used by AWM/GP valuation templates
+# ('Cur. Rec' = current recommendation, the mark for the period) — "current"
+# alone token-sorts below threshold against "cur rec", so the abbreviations
+# are listed explicitly.
+DEFAULT_VALUE_COLS = [
+    "value", "selected", "current", "amount", "total",
+    "cur rec", "cur. rec", "current recommendation", "current rec",
+    "current mark", "current period",
+]
 
 # table_col values that still mean 'the value of the metric' — these specs
 # may fall back to a headerless label|value pair row.

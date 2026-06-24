@@ -407,6 +407,10 @@ class FieldHit(BaseModel):
     evidence: str = ""  # verbatim snippet <= ~200 chars
     confidence_components: dict[str, float] = Field(default_factory=dict)
     conflicts: list[ConflictingCandidate] = Field(default_factory=list)
+    # When an investment spans several source documents (Feature: multi-doc
+    # merge), the merged row records WHICH document each cell's value came from
+    # (the highest-confidence one). None on single-document rows.
+    source_file: str | None = None
 
 
 # ---------------------------------------------------------------------------

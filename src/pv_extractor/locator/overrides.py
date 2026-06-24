@@ -38,9 +38,74 @@ CREATE TABLE IF NOT EXISTS locator_overrides (
 """
 
 
+# Additional source documents for one slot (Feature: multi-doc merge). The
+# override table holds the PRIMARY pick per slot; this holds the EXTRA documents
+# whose fields are merged into the same row by best confidence. Multiple rows
+# per slot key; uniqueness on the full tuple so re-recording is idempotent.
+_EXTRA_SCHEMA = """
+CREATE TABLE IF NOT EXISTS extra_source_docs (
+    client TEXT NOT NULL,
+    deal TEXT NOT NULL,
+    as_of_date TEXT NOT NULL,
+    doc_type TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (client, deal, as_of_date, doc_type, file_path)
+);
+"""
+
+
 def init_overrides(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    conn.executescript(_EXTRA_SCHEMA)
     conn.commit()
+
+
+def set_extra_docs(
+    conn: sqlite3.Connection,
+    *,
+    client: str,
+    deal: str,
+    as_of_date: date,
+    doc_type: str,
+    file_paths: list[str],
+) -> None:
+    """Replace the extra-source-document set for one slot (idempotent)."""
+    init_overrides(conn)
+    conn.execute(
+        "DELETE FROM extra_source_docs WHERE client=? AND deal=? AND as_of_date=? AND doc_type=?",
+        (client, deal, as_of_date.isoformat(), doc_type),
+    )
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for path in dict.fromkeys(file_paths):  # de-dupe, preserve order
+        conn.execute(
+            "INSERT OR IGNORE INTO extra_source_docs "
+            "(client, deal, as_of_date, doc_type, file_path, created_at) VALUES (?,?,?,?,?,?)",
+            (client, deal, as_of_date.isoformat(), doc_type, path, now),
+        )
+    conn.commit()
+    log_event(
+        logger, "extra source docs set", client=client, deal=deal,
+        as_of_date=as_of_date.isoformat(), doc_type=doc_type, count=len(file_paths),
+    )
+
+
+def lookup_extra_docs(
+    conn: sqlite3.Connection,
+    *,
+    client: str,
+    deal: str,
+    as_of_date: date,
+    doc_type: str,
+) -> list[str]:
+    """Extra source documents recorded for this exact resolved slot, if any."""
+    init_overrides(conn)
+    rows = conn.execute(
+        "SELECT file_path FROM extra_source_docs "
+        "WHERE client=? AND deal=? AND as_of_date=? AND doc_type=? ORDER BY created_at, file_path",
+        (client, deal, as_of_date.isoformat(), doc_type),
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def record_override(

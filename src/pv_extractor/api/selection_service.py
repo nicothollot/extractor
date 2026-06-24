@@ -15,6 +15,7 @@ picked up by locate() at launch, and removals ride on RunRequest.exclude.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 from pydantic import BaseModel, Field
@@ -25,7 +26,7 @@ from pv_extractor.config import Config
 from pv_extractor.indexer import db
 from pv_extractor.indexer.periods import period_label, resolve_target_period
 from pv_extractor.locator.locate import locate
-from pv_extractor.locator.overrides import lookup_override
+from pv_extractor.locator.overrides import lookup_extra_docs, lookup_override
 from pv_extractor.locator.verify import verify_and_rerank
 from pv_extractor.models import (
     DocType,
@@ -53,7 +54,13 @@ class CandidateInfo(BaseModel):
 class SlotSelection(BaseModel):
     client: str
     deal: str
-    slot_key: str  # "client|deal" — stable id for removals/swaps in the UI
+    # "client|deal|period|doc_type" — stable id for removals/swaps. The period
+    # + doc_type segments make every slot of a multi-period / multi-doc-type run
+    # distinct so the Confirm-documents table can show ALL of them (a 2-period
+    # run is two slots per deal, one per tab), not just the first.
+    slot_key: str
+    period: str = ""  # the slot's requested period label (drives the period tabs)
+    doc_type: str = ""  # the slot's requested doc-type (slug or enum value)
     status: str  # ResolutionStatus value or ERROR
     as_of_date: str | None = None
     predicted_period: str = ""
@@ -74,6 +81,9 @@ class SlotSelection(BaseModel):
     misfiled: bool = False
     detected_period: str | None = None  # the in-file period label, when it disagrees
     detected_as_of: str | None = None  # the in-file as-of date (ISO), when it disagrees
+    # Multi-doc merge: extra source documents recorded for this slot (their
+    # fields are merged into the same row by best confidence at run time).
+    extra_docs: list[str] = Field(default_factory=list)
     candidates: list[CandidateInfo] = Field(default_factory=list)
 
 
@@ -114,7 +124,7 @@ def _candidate_info(cand, verdict: VerifyResult | None, selected_path: str | Non
     )
 
 
-def slot_selection(
+def _locate_slot(
     conn,
     config: Config,
     client: str,
@@ -122,29 +132,25 @@ def slot_selection(
     period: str,
     doc_type: DocType,
     *,
-    target: date | None = None,
-    enhanced_period_check: bool = False,
-    doc_type_spec: DocTypeSpec | None = None,
-    restrict_to_client_sourced: bool = True,
-) -> SlotSelection:
-    """Resolve one (client, deal) slot through the SAME pipeline steps a run
-    uses — locate() then the Phase-2 peek-verifier verify_and_rerank().
+    target: date | None,
+    doc_type_spec: DocTypeSpec | None,
+    restrict_to_client_sourced: bool,
+    doc_type_label: str | None = None,
+) -> tuple[SlotSelection, LocateResult | None]:
+    """Conn-bound phase: the predicted period, the learned-override check and
+    locate() (FTS + scoring — cheap, must hold the sqlite connection). Returns
+    the partially-filled slot and the LocateResult to peek-verify next (None on
+    an unresolvable period — ERROR is final, nothing to verify).
 
-    Reusable by both the single-firm preflight table (build_selection) and the
-    later multi-search service (one slot per call, no dry-run job needed).
-
-    `doc_type_spec`: when supplied (a Smart Search profile), it is passed to
-    locate(); otherwise locate() falls back to the builtin `doc_type`.
-
-    `enhanced_period_check`: when True, a slot that did NOT resolve a verified
-    winner for the target period but whose top-scored candidate carries an
-    in-file as-of date that DISAGREES with the target is surfaced as MISFILED,
-    carrying the document's true detected period (no new extraction — the
-    peek-verifier already populates VerifyResult.asof_date, even on REJECTED).
-    When False, behavior is byte-for-byte as before.
-    """
+    `doc_type_label` is the requested doc-type STRING (a Smart Search slug or an
+    enum value) used in slot_key/slot.doc_type so the UI and removal/refresh
+    round-trip on the exact value the analyst chose; it defaults to the resolved
+    `doc_type` enum value."""
+    label = doc_type_label or doc_type.value
     slot = SlotSelection(
-        client=client, deal=deal, slot_key=f"{client}|{deal}",
+        client=client, deal=deal,
+        slot_key=f"{client}|{deal}|{period}|{label}",
+        period=period, doc_type=label,
         status=ResolutionStatus.NOT_FOUND.value,
     )
     if target is not None:
@@ -156,7 +162,9 @@ def slot_selection(
             )
             is not None
         )
-
+        slot.extra_docs = lookup_extra_docs(
+            conn, client=client, deal=deal, as_of_date=target, doc_type=doc_type.value
+        )
     try:
         located: LocateResult = locate(
             conn,
@@ -170,8 +178,26 @@ def slot_selection(
     except ValueError as exc:  # unresolvable period — surfaced, never silent
         slot.status = "ERROR"
         slot.detail = str(exc)
-        return slot
+        return slot, None
+    return slot, located
 
+
+def _verify_slot(
+    slot: SlotSelection,
+    located: LocateResult | None,
+    config: Config,
+    *,
+    target: date | None,
+    enhanced_period_check: bool,
+    client: str,
+) -> SlotSelection:
+    """Connection-free phase: peek-verify + re-rank the located candidates and
+    fill the per-document fields. This is the expensive, I/O-bound work (PDF
+    reads, OCR) and holds no sqlite connection, so it parallelizes safely. Peek
+    reads are memoized in verify.py, so repeats (preflight->confirm, reloads)
+    are cheap."""
+    if located is None:
+        return slot
     reranked, verdicts = verify_and_rerank(located, config)
     slot.status = reranked.status.value
     slot.detail = reranked.evidence[:200]
@@ -197,6 +223,48 @@ def slot_selection(
     return slot
 
 
+def slot_selection(
+    conn,
+    config: Config,
+    client: str,
+    deal: str,
+    period: str,
+    doc_type: DocType,
+    *,
+    target: date | None = None,
+    enhanced_period_check: bool = False,
+    doc_type_spec: DocTypeSpec | None = None,
+    restrict_to_client_sourced: bool = True,
+    doc_type_label: str | None = None,
+) -> SlotSelection:
+    """Resolve one (client, deal) slot through the SAME pipeline steps a run
+    uses — locate() then the Phase-2 peek-verifier verify_and_rerank().
+
+    Reusable by both the single-firm preflight table (build_selection) and the
+    later multi-search service (one slot per call, no dry-run job needed).
+
+    `doc_type_spec`: when supplied (a Smart Search profile), it is passed to
+    locate(); otherwise locate() falls back to the builtin `doc_type`.
+
+    `enhanced_period_check`: when True, a slot that did NOT resolve a verified
+    winner for the target period but whose top-scored candidate carries an
+    in-file as-of date that DISAGREES with the target is surfaced as MISFILED,
+    carrying the document's true detected period (no new extraction — the
+    peek-verifier already populates VerifyResult.asof_date, even on REJECTED).
+    When False, behavior is byte-for-byte as before.
+    """
+    slot, located = _locate_slot(
+        conn, config, client, deal, period, doc_type,
+        target=target, doc_type_spec=doc_type_spec,
+        restrict_to_client_sourced=restrict_to_client_sourced,
+        doc_type_label=doc_type_label,
+    )
+    return _verify_slot(
+        slot, located, config,
+        target=target, enhanced_period_check=enhanced_period_check, client=client,
+    )
+
+
 def _flag_misfiled(
     slot: SlotSelection,
     reranked: LocateResult,
@@ -218,11 +286,18 @@ def _flag_misfiled(
         return
     # Candidates are score-ranked (top first); pick the most relevant one whose
     # verdict carries an in-file as-of date that disagrees with the target.
+    style = config.client_period_style(client)
+    target_label = period_label(target, style)
     for cand in reranked.candidates:
         verdict = verdicts.get(cand.record.file_path)
         if verdict is None or verdict.asof_date is None:
             continue
         if verdict.asof_date == target:
+            continue
+        # Same reporting period (e.g. a Feb as-of for a Q1 target) is NOT
+        # misfiled when same-period tolerance is on — only a genuinely different
+        # period (different quarter/month) counts.
+        if config.locator.tolerate_same_period and period_label(verdict.asof_date, style) == target_label:
             continue
         slot.misfiled = True
         slot.detected_as_of = verdict.asof_date.isoformat()
@@ -241,76 +316,163 @@ def _flag_misfiled(
 _slot_for_pair = slot_selection
 
 
-def build_selection(manager: JobManager, job_id: str, config: Config) -> SelectionResponse:
-    """The per-slot selection table for a finished dry-run (preflight) job."""
-    job = manager.get(job_id)
+class _SelectionContext(BaseModel):
+    """The preview slot parameters parsed once from a dry-run job's params and
+    reused by both the full table build and a single-slot re-resolve."""
+
+    scope: str
+    period: str  # preview period
+    doc_type: str  # preview doc type (resolved value)
+    doc_types: list[str]
+    periods: list[str]
+    restrict_to_client_sourced: bool
+    client: str | None
+    deal: str | None
+    enhanced_period_check: bool
+    slot_count_multiplier: int  # len(doc_types) * len(periods)
+
+
+def _selection_context(job, config: Config) -> "_SelectionContext":
+    """Parse a dry-run job's params into the preview-slot context shared by the
+    full table build and a single-slot re-resolve. The doc-type/spec resolution
+    needs the live sqlite connection, so callers do that step themselves."""
     if job is None:
-        raise ValueError(f"unknown job {job_id!r}")
+        raise ValueError("unknown job")
     if job.kind != "run" or not job.params.get("dry_run"):
         raise ValueError("document selection requires a dry-run (preflight) job")
 
     from pv_extractor.api import run_slots as _rs
 
     params = job.params
-    scope = str(params.get("scope", ""))
-    period = str(params.get("period", ""))
     doc_type = DocType(params.get("doc_type", DocType.any_client_valuation_doc.value))
-    doc_types = list(params.get("doc_types") or [])
-    periods = list(params.get("periods") or [])
-    restrict_to_client_sourced = bool(params.get("restrict_to_client_sourced", True))
-    client = params.get("client") or None
-    deal = params.get("deal") or None
-    exclude = {(s["client"], s["deal"]) for s in params.get("exclude", []) if s.get("client")}
-    # Enhanced period check is opt-in per job; default off (config-tunable).
-    enhanced_period_check = bool(
-        params.get(
-            "enhanced_period_check",
-            config.multi_search.enhanced_period_check_default,
-        )
+    eff_doc_types = _rs.effective_doc_types(doc_type, list(params.get("doc_types") or []))
+    eff_periods = _rs.effective_periods(str(params.get("period", "")), list(params.get("periods") or []))
+    ctx = _SelectionContext(
+        scope=str(params.get("scope", "")),
+        period=eff_periods[0],
+        doc_type=eff_doc_types[0],
+        doc_types=eff_doc_types,
+        periods=eff_periods,
+        restrict_to_client_sourced=bool(params.get("restrict_to_client_sourced", True)),
+        client=params.get("client") or None,
+        deal=params.get("deal") or None,
+        enhanced_period_check=bool(
+            params.get(
+                "enhanced_period_check", config.multi_search.enhanced_period_check_default
+            )
+        ),
+        slot_count_multiplier=len(eff_doc_types) * len(eff_periods),
     )
+    return ctx
 
-    # Multi-slot fan-out: the table previews the FIRST doc type / period per deal
-    # (one row per pair); the launch runs every (pair × doc type × period).
-    eff_doc_types = _rs.effective_doc_types(doc_type, doc_types)
-    eff_periods = _rs.effective_periods(period, periods)
-    preview_period = eff_periods[0]
+
+def _slot_target(config: Config, client: str, period: str) -> date | None:
+    try:
+        return resolve_target_period(period, config.client_period_style(client))
+    except Exception:  # noqa: BLE001 — surfaced later as an ERROR slot
+        return None
+
+
+# Bounded fan-out for the verify (PDF-read/OCR) phase. I/O-bound, so a few
+# workers cut wall-clock for a large client without thrashing the share.
+_VERIFY_WORKERS = 8
+
+
+def build_selection(manager: JobManager, job_id: str, config: Config) -> SelectionResponse:
+    """The per-slot selection table for a finished dry-run (preflight) job.
+
+    Builds EVERY slot of the run — the full `pairs × periods × doc_types`
+    product — not just the first period/doc-type. Two phases: locate() each slot
+    serially on the single sqlite connection (cheap), then peek-verify the
+    located slots in parallel (the expensive, connection-free, memoized I/O).
+    The same files were already peeked by the preflight dry-run, so most reads
+    hit the cache here. The Confirm-documents UI groups the returned slots by
+    `period` (tabs) then `client` (sections)."""
+    job = manager.get(job_id)
+    ctx = _selection_context(job, config)
+
+    from pv_extractor.api import run_slots as _rs
 
     response = SelectionResponse(
-        job_id=job_id, scope=scope, period=preview_period, doc_type=eff_doc_types[0],
-        doc_types=eff_doc_types, periods=eff_periods,
+        job_id=job_id, scope=ctx.scope, period=ctx.period, doc_type=ctx.doc_type,
+        doc_types=ctx.doc_types, periods=ctx.periods,
     )
+    exclude = {(s["client"], s["deal"]) for s in job.params.get("exclude", []) if s.get("client")}
     conn = db.open_db(config.db_path, config.pv_root)
     try:
-        preview_doc_type, preview_spec = _rs.resolve_doc_type(conn, config, eff_doc_types[0])
-        pairs = _resolve_pairs(conn, scope, client, deal, exclude)
-        response.slot_count = len(pairs) * len(eff_doc_types) * len(eff_periods)
-        try:
-            target = resolve_target_period(
-                preview_period, config.client_period_style(client or "default")
-            )
-        except Exception:  # noqa: BLE001 — per-client style still resolves below
-            target = None
+        # Resolve each requested doc-type STRING once (slug -> DocType + spec).
+        resolved_types = {dt: _rs.resolve_doc_type(conn, config, dt) for dt in ctx.doc_types}
+        pairs = _resolve_pairs(conn, ctx.scope, ctx.client, ctx.deal, exclude)
+        # Phase 1 (serial, conn-bound): locate every slot across all periods and
+        # doc-types — one located_slot per (pair, period, doc_type) combination.
+        located_slots: list[tuple[SlotSelection, LocateResult | None, date | None, str]] = []
         for pair_client, pair_deal in pairs:
-            slot_target = target
-            if slot_target is None:
-                slot_target = resolve_target_period(
-                    preview_period, config.client_period_style(pair_client)
-                )
-            response.slots.append(
-                slot_selection(
-                    conn,
-                    config,
-                    pair_client,
-                    pair_deal,
-                    preview_period,
-                    preview_doc_type,
-                    target=slot_target,
-                    enhanced_period_check=enhanced_period_check,
-                    doc_type_spec=preview_spec,
-                    restrict_to_client_sourced=restrict_to_client_sourced,
-                )
-            )
+            for period in ctx.periods:
+                slot_target = _slot_target(config, pair_client, period)
+                for dt_label in ctx.doc_types:
+                    dt_resolved, dt_spec = resolved_types[dt_label]
+                    slot, located = _locate_slot(
+                        conn, config, pair_client, pair_deal, period, dt_resolved,
+                        target=slot_target, doc_type_spec=dt_spec,
+                        restrict_to_client_sourced=ctx.restrict_to_client_sourced,
+                        doc_type_label=dt_label,
+                    )
+                    located_slots.append((slot, located, slot_target, pair_client))
+        response.slot_count = len(located_slots)
     finally:
         conn.close()
+
+    # Phase 2 (parallel, connection-free): peek-verify the located slots.
+    def _verify(entry):
+        slot, located, slot_target, pair_client = entry
+        return _verify_slot(
+            slot, located, config,
+            target=slot_target, enhanced_period_check=ctx.enhanced_period_check,
+            client=pair_client,
+        )
+
+    if len(located_slots) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(_VERIFY_WORKERS, len(located_slots)),
+            thread_name_prefix="pv-selection-verify",
+        ) as pool:
+            response.slots = list(pool.map(_verify, located_slots))
+    else:
+        response.slots = [_verify(e) for e in located_slots]
+
     response.found = sum(1 for s in response.slots if s.status == ResolutionStatus.FOUND.value)
     return response
+
+
+def build_single_slot(
+    manager: JobManager, job_id: str, config: Config, client: str, deal: str,
+    *, period: str | None = None, doc_type: str | None = None,
+) -> SlotSelection:
+    """Re-resolve ONE (client, deal, period, doc_type) slot for a dry-run job —
+    used after a swap/override so the Confirm-documents table refreshes just the
+    affected row instead of re-running locate()+peek-verify for every slot in
+    scope. `period`/`doc_type` default to the run's first values for back-compat
+    with the single-period table."""
+    job = manager.get(job_id)
+    ctx = _selection_context(job, config)
+    slot_period = period or ctx.period
+    slot_doc_type = doc_type or ctx.doc_type
+
+    from pv_extractor.api import run_slots as _rs
+
+    conn = db.open_db(config.db_path, config.pv_root)
+    try:
+        dt_resolved, dt_spec = _rs.resolve_doc_type(conn, config, slot_doc_type)
+        slot_target = _slot_target(config, client, slot_period)
+        slot, located = _locate_slot(
+            conn, config, client, deal, slot_period, dt_resolved,
+            target=slot_target, doc_type_spec=dt_spec,
+            restrict_to_client_sourced=ctx.restrict_to_client_sourced,
+            doc_type_label=slot_doc_type,
+        )
+    finally:
+        conn.close()
+    return _verify_slot(
+        slot, located, config,
+        target=slot_target, enhanced_period_check=ctx.enhanced_period_check, client=client,
+    )

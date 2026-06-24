@@ -47,7 +47,8 @@ from pathlib import Path
 
 from pv_extractor.config import Config
 from pv_extractor.extract import cache as result_cache
-from pv_extractor.extract.derived import derived_specs
+from pv_extractor.extract.bands.base import ExtractionContext
+from pv_extractor.extract.derived import apply_derived, derived_specs
 from pv_extractor.extract.engine import (
     EngineResult,
     extract_memo,
@@ -56,12 +57,19 @@ from pv_extractor.extract.engine import (
 )
 from pv_extractor.indexer import db
 from pv_extractor.indexer.periods import period_label
-from pv_extractor.llm.escalate import LlmRunSummary, LlmSettings, process_memos
+from pv_extractor.llm.escalate import (
+    DealGroup,
+    LlmRunSummary,
+    LlmSettings,
+    process_deals,
+    process_memos,
+)
 from pv_extractor.locator.locate import locate
 from pv_extractor.locator.verify import verify_and_rerank
 from pv_extractor.logging_setup import log_event
 from pv_extractor.models import (
     AssetExtraction,
+    CandidateFile,
     DocType,
     DocTypeSpec,
     EscalationField,
@@ -74,6 +82,7 @@ from pv_extractor.models import (
     QaStatus,
     ResolutionStatus,
     ReviewFlag,
+    ScoreBreakdown,
     SchemaField,
     VerifyResult,
     VerifyStatus,
@@ -186,6 +195,11 @@ class _WorkItem:
     deferred: bool = False  # cancelled before this memo was processed
     timings_ms: dict[str, float] = field(default_factory=dict)
     group: str | None = None  # multi-firm event-lane label; None = run-wide path (no 'group' field emitted)
+    # Multi-doc merge: work items sharing a merge_key are extracted independently
+    # then merged into ONE row by best confidence-per-field. merge_primary marks
+    # the slot's primary (located) document; the rest are recorded extras.
+    merge_key: str | None = None
+    merge_primary: bool = False
 
 
 def _group_kw(item: _WorkItem) -> dict[str, str]:
@@ -282,6 +296,46 @@ def _verify_and_extract(
         **gkw,
     )
     return item
+
+
+def _extra_work_items(
+    conn, config: Config, client: str, deal: str, located: LocateResult,
+    doc_type_value: str, group: str | None,
+) -> list[_WorkItem]:
+    """Build work items for a slot's EXTRA source documents (Feature: multi-doc
+    merge). Each extra doc is run through the normal pipeline like an explicit
+    override pick (from_override winner); they share the primary's merge_key so
+    the post-LLM merge collapses them into one row. Returns [] for a slot with
+    no extras (the common case — zero overhead)."""
+    from pv_extractor.locator.overrides import indexed_record_for_path, lookup_extra_docs
+
+    as_of = located.query.as_of_date
+    if as_of is None:
+        return []
+    extras = lookup_extra_docs(conn, client=client, deal=deal, as_of_date=as_of, doc_type=doc_type_value)
+    if not extras:
+        return []
+    primary_path = located.winner.record.file_path if located.winner else None
+    merge_key = f"{client}|{deal}|{as_of.isoformat()}|{doc_type_value}"
+    items: list[_WorkItem] = []
+    for path in extras:
+        if path == primary_path:
+            continue  # the primary is already the located winner
+        record = indexed_record_for_path(conn, path)
+        if record is None:
+            logger.warning("extra source doc not indexed, skipped: %s", path)
+            continue
+        winner = CandidateFile(record=record, breakdown=ScoreBreakdown())
+        sub = LocateResult(
+            status=ResolutionStatus.FOUND, query=located.query,
+            candidates=[winner], winner=winner,
+            evidence=f"extra source document for {client}/{deal} (multi-doc merge)",
+            from_override=True,
+        )
+        items.append(_WorkItem(
+            client=client, deal=deal, locate_result=sub, group=group, merge_key=merge_key,
+        ))
+    return items
 
 
 def _schema_json_path() -> Path:
@@ -471,7 +525,13 @@ def run(
                     restrict_to_client_sourced=restrict_to_client_sourced,
                 )
                 located = locate(conn, config, query)  # ValueError (bad period) aborts before any processing
-                items.append(_WorkItem(client=pair_client, deal=pair_deal, locate_result=located))
+                extras = _extra_work_items(conn, config, pair_client, pair_deal, located, doc_type.value, None)
+                items.append(_WorkItem(
+                    client=pair_client, deal=pair_deal, locate_result=located,
+                    merge_key=extras[0].merge_key if extras else None,
+                    merge_primary=bool(extras),
+                ))
+                items.extend(extras)
                 control.emit(
                     "stage", client=pair_client, deal=pair_deal, stage="locate",
                     status=located.status.value,
@@ -493,8 +553,14 @@ def run(
                     # bad period) is contained: only this slot is marked ERROR
                     # so one bad slot never aborts the whole batch.
                     located = locate(conn, config, query, doc_type_spec=slot.doc_type_spec)
-                    item = _WorkItem(client=slot.client, deal=slot.deal,
-                                     locate_result=located, group=slot.group)
+                    extras = _extra_work_items(
+                        conn, config, slot.client, slot.deal, located, slot.doc_type.value, slot.group
+                    )
+                    item = _WorkItem(
+                        client=slot.client, deal=slot.deal, locate_result=located, group=slot.group,
+                        merge_key=extras[0].merge_key if extras else None,
+                        merge_primary=bool(extras),
+                    )
                     control.emit(
                         "stage", client=slot.client, deal=slot.deal, stage="locate",
                         status=located.status.value,
@@ -509,12 +575,14 @@ def run(
                     item = _WorkItem(client=slot.client, deal=slot.deal,
                                      locate_result=located, group=slot.group,
                                      error=f"{type(exc).__name__}: {exc}")
+                    extras = []
                     logger.exception("locate failed for slot %s/%s", slot.client, slot.deal)
                     control.emit(
                         "stage", client=slot.client, deal=slot.deal, stage="locate",
                         status="ERROR", file_name=None, group=slot.group,
                     )
                 items.append(item)
+                items.extend(extras)
 
         report = RunReport(run_id=run_id, run_dir=None, workbook_path=None, dry_run=dry_run)
         report.started_at = now.isoformat(timespec="seconds")
@@ -528,8 +596,13 @@ def run(
         derived_headers = {spec.header for spec in derived_specs(config.validation)}
         # force_assist makes the LLM the primary extractor: bypass the
         # deterministic result cache so the broad escalation plan is actually
-        # rebuilt (a cached memo carries the OLD, narrow plan).
-        force_assist = bool(llm_settings is not None and llm_settings.force_assist)
+        # rebuilt (a cached memo carries the OLD, narrow plan). The default
+        # one-call-per-deal mode is force-assist-equivalent: the single per-deal
+        # call extracts the whole field set, so plans must be comprehensive and
+        # the result cache (which would carry a narrow plan) is bypassed too.
+        llm_on = bool(llm_settings is not None and llm_settings.enabled)
+        one_call_per_deal = bool(llm_on and config.llm.one_call_per_deal)
+        force_assist = bool(llm_settings is not None and llm_settings.force_assist) or one_call_per_deal
         effective_force = force or force_assist
 
         # ---- verify (+extract unless dry-run) in the worker pool ----
@@ -646,18 +719,36 @@ def run(
         # A cancellation that arrived before this point skips the LLM phase
         # entirely (plans stay serialized in the audits, exactly like --no-llm).
         if llm_settings is not None and llm_settings.enabled and not control.cancelled:
-            control.emit("llm_phase", status="started",
-                         memos=sum(1 for _, m in assembled if m.escalation and m.escalation.fields))
-            report.llm = process_memos(
-                [memo for _, memo in assembled], config, llm_settings, schema_fields,
-                run_id=run_id, run_dir=run_dir, client=llm_client,
-            )
+            if one_call_per_deal:
+                # ONE Claude Code call per deal-period over the combined payload
+                # of all its documents (default). Group exactly like the
+                # multi-doc merge so the LLM hits land on the surviving row.
+                deal_groups = _build_deal_groups(assembled)
+                control.emit("llm_phase", status="started",
+                             memos=sum(1 for g in deal_groups
+                                       if g.primary.escalation and g.primary.escalation.fields))
+                report.llm = process_deals(
+                    deal_groups, config, llm_settings, schema_fields,
+                    run_id=run_id, run_dir=run_dir, client=llm_client,
+                )
+            else:
+                control.emit("llm_phase", status="started",
+                             memos=sum(1 for _, m in assembled if m.escalation and m.escalation.fields))
+                report.llm = process_memos(
+                    [memo for _, memo in assembled], config, llm_settings, schema_fields,
+                    run_id=run_id, run_dir=run_dir, client=llm_client,
+                )
             control.emit(
                 "llm_phase", status="done", attempts=report.llm.attempts,
                 cache_hits=report.llm.cache_hits, deferred=report.llm.memos_deferred,
                 total_cost_usd=report.llm.total_cost_usd,
                 cost_source="actual+estimated" if report.llm.any_actual_costs else "estimated",
             )
+
+        # Multi-doc merge: collapse each slot's per-document memos into one row
+        # (best confidence per field), AFTER the LLM pass so every doc's filled
+        # values + confidences are final. No-op when no slot has extra docs.
+        assembled = _merge_assembled(assembled, config, schema_by_header, ruleset, routing, writer)
 
         for item, memo in assembled:
             try:
@@ -773,6 +864,212 @@ def _default_template() -> Path:
     return Path(__file__).resolve().parents[2] / "reference" / "master_index_v4.xlsx"
 
 
+_MERGE_EXCLUDED_BANDS = {"QA", "THRESHOLD FLAGS"}
+
+
+def _merge_asset(
+    primary_memo: MemoResult,
+    primary_asset: AssetExtraction,
+    members: list[tuple[MemoResult, AssetExtraction]],
+    config: Config,
+    schema_by_header: dict[str, SchemaField],
+    ruleset,
+    routing: dict[str, list[str]],
+    writer: WorkbookWriter,
+    derived_headers: set[str],
+) -> AssetExtraction:
+    """Merge one asset across its source documents: per field, keep the
+    highest-confidence non-empty hit (tagged with its source file), recompute
+    derived fields from the merged inputs, then re-validate so the row's QA
+    reflects the combined data (a field missing in doc A but present in doc B
+    now counts)."""
+    meta = [h for h in primary_asset.hits if h.method == "metadata"]
+    best: dict[str, tuple[FieldHit, str]] = {}
+    for memo, asset in members:
+        for h in asset.hits:
+            if h.method == "metadata" or h.band in _MERGE_EXCLUDED_BANDS or h.field in derived_headers:
+                continue
+            if h.value is None:
+                continue
+            current = best.get(h.field)
+            if current is None or h.confidence > current[0].confidence:
+                best[h.field] = (h, memo.file_name)
+    real_hits: list[FieldHit] = []
+    for hit, source in best.values():
+        merged_hit = hit.model_copy(deep=True)
+        merged_hit.source_file = source
+        real_hits.append(merged_hit)
+
+    ctx = ExtractionContext(cfg=config.extraction)
+    with_derived = apply_derived([*meta, *real_hits], schema_by_header, config.validation, ctx)
+
+    company = next((h.value for h in with_derived if h.field == "Portfolio Company"), None)
+    fund = next((h.value for h in with_derived if h.field == "Fund Name"), None)
+    as_of = primary_memo.as_of_date
+    prior_row = (
+        writer.find_prior_row(str(company) if company else None, str(fund) if fund else None, as_of)
+        if as_of else None
+    )
+    validated = validate_asset(
+        hits=with_derived,
+        extraction_flags=list(ctx.flags),
+        schema_by_header=schema_by_header,
+        config=config,
+        ruleset=ruleset,
+        routing_table=routing,
+        as_of_date=as_of,
+        verify=primary_memo.verify,
+        prior_row=prior_row,
+        client=primary_memo.client,
+    )
+    return AssetExtraction(
+        asset_name=primary_asset.asset_name,
+        row_memo_id=primary_asset.row_memo_id,
+        hits=validated.hits,
+        flags=validated.flags,
+        qa_status=validated.qa_status,
+    )
+
+
+def _merge_memo_group(
+    primary: MemoResult,
+    memos: list[MemoResult],
+    config: Config,
+    schema_by_header: dict[str, SchemaField],
+    ruleset,
+    routing: dict[str, list[str]],
+    writer: WorkbookWriter,
+) -> MemoResult:
+    """Collapse a group of per-document memos for one investment into ONE memo
+    (one row per asset), merging fields by best confidence. Keeps the primary
+    document's identity; records the contributing source documents."""
+    derived_headers = {spec.header for spec in derived_specs(config.validation)}
+    merged = primary.model_copy(deep=True)
+    sources = [m.file_name for m in memos]
+    merged.memo_flags.append(
+        ReviewFlag(
+            category="run",
+            description=(
+                f"Merged from {len(memos)} source documents (best-confidence per field): "
+                + ", ".join(sources)
+            ),
+            severity=FlagSeverity.info,
+        )
+    )
+
+    # Group assets across memos. The common case is one asset per document for
+    # the SAME investment — but each doc may extract a slightly different name
+    # ('Accell . . vf' vs '... v1'), so when every document is single-asset we
+    # merge them into ONE bucket rather than splitting on the noisy name. Only
+    # genuine multi-asset (joint) memos bucket by normalized name.
+    buckets: dict[str, list[tuple[MemoResult, AssetExtraction]]] = {}
+    order: list[str] = []
+    single_asset = max((len(m.assets) for m in memos), default=0) <= 1
+    for memo in memos:
+        for asset in memo.assets:
+            key = "__single__" if single_asset else ((asset.asset_name or "").strip().lower() or "__single__")
+            if key not in buckets:
+                buckets[key] = []
+                order.append(key)
+            buckets[key].append((memo, asset))
+
+    merged_assets: list[AssetExtraction] = []
+    for key in order:
+        bucket = buckets[key]
+        primary_asset = next((a for m, a in bucket if m is primary), bucket[0][1])
+        merged_assets.append(
+            _merge_asset(
+                primary, primary_asset, bucket, config, schema_by_header,
+                ruleset, routing, writer, derived_headers,
+            )
+        )
+    merged.assets = merged_assets
+    return merged
+
+
+def _build_deal_groups(
+    assembled: list[tuple[_WorkItem, MemoResult]],
+) -> list[DealGroup]:
+    """Group the assembled (item, memo) pairs into one DealGroup per deal-period
+    for the one-call-per-deal LLM pass. Grouping mirrors _merge_assembled exactly
+    (merge_key, with non-merge items standalone) so the single combined call's
+    hits land on the SAME memo the multi-doc merge later keeps as the row.
+
+    The primary is the merge primary (else the largest-page member); its
+    documents lead the combined payload. Non-primary members are folded into the
+    one call (their content is sent as context) and marked not_needed so they are
+    not separately escalated."""
+    keyed: dict[str, list[tuple[_WorkItem, MemoResult]]] = {}
+    order: list[str] = []
+    for item, memo in assembled:
+        key = item.merge_key or memo.memo_id
+        if key not in keyed:
+            keyed[key] = []
+            order.append(key)
+        keyed[key].append((item, memo))
+
+    groups: list[DealGroup] = []
+    for key in order:
+        members = keyed[key]
+        _, primary_memo = next(
+            ((it, m) for it, m in members if it.merge_primary),
+            max(members, key=lambda im: im[1].page_count),
+        )
+        member_memos = [m for _, m in members]
+        files = [(primary_memo.file_path, primary_memo.file_name)]
+        files += [
+            (m.file_path, m.file_name) for m in member_memos if m is not primary_memo
+        ]
+        for m in member_memos:
+            if m is not primary_memo and m.escalation is not None:
+                m.escalation.status = "not_needed"
+        groups.append(DealGroup(primary=primary_memo, members=member_memos, files=files))
+    return groups
+
+
+def _merge_assembled(
+    assembled: list[tuple[_WorkItem, MemoResult]],
+    config: Config,
+    schema_by_header: dict[str, SchemaField],
+    ruleset,
+    routing: dict[str, list[str]],
+    writer: WorkbookWriter,
+) -> list[tuple[_WorkItem, MemoResult]]:
+    """Collapse multi-doc merge groups in the assembled list into one entry
+    each (emitted at the primary's position). Items without a merge_key, and
+    groups that ended up with a single member, pass through unchanged."""
+    keyed: dict[str, list[tuple[_WorkItem, MemoResult]]] = {}
+    for item, memo in assembled:
+        if item.merge_key:
+            keyed.setdefault(item.merge_key, []).append((item, memo))
+
+    out: list[tuple[_WorkItem, MemoResult]] = []
+    emitted: set[str] = set()
+    for item, memo in assembled:
+        if not item.merge_key:
+            out.append((item, memo))
+            continue
+        if item.merge_key in emitted:
+            continue
+        emitted.add(item.merge_key)
+        members = keyed[item.merge_key]
+        if len(members) == 1:
+            out.append(members[0])
+            continue
+        primary_item, primary_memo = next(
+            ((it, m) for it, m in members if it.merge_primary), members[0]
+        )
+        merged = _merge_memo_group(
+            primary_memo, [m for _, m in members], config, schema_by_header, ruleset, routing, writer
+        )
+        log_event(
+            logger, "multi-doc merge", merge_key=item.merge_key,
+            documents=len(members), memo_id=merged.memo_id,
+        )
+        out.append((primary_item, merged))
+    return out
+
+
 def _assemble_memo(
     item: _WorkItem,
     config: Config,
@@ -872,6 +1169,7 @@ def _assemble_memo(
             as_of_date=as_of,
             verify=item.verify,
             prior_row=prior_row,
+            client=item.client,
         )
         memo.assets.append(
             AssetExtraction(

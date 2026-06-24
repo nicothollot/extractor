@@ -80,6 +80,50 @@ def render_page(
     return png_path
 
 
+def render_file_page(config: Config, file_path: str, page_number: int) -> Path:
+    """Render one page of an ARBITRARY (read-only) PDF to a cached PNG —
+    used by the New Run 'Confirm documents' candidate preview, which has no
+    run/audit record to key off. The source must be a PDF under pv_root (the
+    only place candidates come from); rendering is read-only and cached under
+    output_dir/gui/preview keyed on (path, mtime, size, page, dpi)."""
+    from pv_extractor.io_guard import is_under_pv_root
+
+    if not is_under_pv_root(file_path, config.pv_root):
+        raise EvidenceError("file is outside pv_root")
+    if Path(file_path).suffix.lower() != ".pdf":
+        raise EvidenceError("page preview is only available for PDF sources")
+    try:
+        st = Path(file_path).stat()
+        ident = f"{file_path}|{st.st_mtime_ns}|{st.st_size}"
+    except OSError as exc:
+        raise EvidenceError(f"could not stat source: {exc}") from exc
+
+    dpi = config.gui.evidence_dpi
+    key = hashlib.sha1(f"{ident}|{page_number}|{dpi}".encode("utf-8")).hexdigest()[:20]
+    png_path = Path(config.output_dir) / "gui" / "preview" / f"p{page_number}_{key}.png"
+    if png_path.exists():
+        return png_path
+
+    with open_read(file_path) as fh:
+        data = fh.read()
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as exc:  # noqa: BLE001 — surfaced as an API error
+        raise EvidenceError(f"could not open source document: {exc}") from exc
+    try:
+        if not 1 <= page_number <= doc.page_count:
+            raise EvidenceError(f"page {page_number} out of range (1..{doc.page_count})")
+        zoom = dpi / 72.0
+        pixmap = doc[page_number - 1].get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+        png_bytes = pixmap.tobytes("png")
+    finally:
+        doc.close()
+
+    with guarded_open_write(png_path, config.pv_root, mode="wb") as fh:
+        fh.write(png_bytes)
+    return png_path
+
+
 def page_words(run_dir: Path, config: Config, memo_id: str, page_number: int) -> dict:
     """Page geometry + word boxes (PDF points) for the Add-Value highlighter.
 

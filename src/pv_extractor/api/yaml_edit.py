@@ -12,6 +12,7 @@ import io
 from pathlib import Path
 
 from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
 
 from pv_extractor.io_guard import guarded_open_write, open_read
 
@@ -37,16 +38,22 @@ def _dump_text(data) -> str:
 
 def set_dotted(data, dotted_path: str, value) -> None:
     """Set a dotted path (e.g. 'llm.auto.retry_model') in a ruamel tree.
-    Intermediate maps must already exist — the GUI edits known settings,
-    it never invents new config sections."""
+
+    Missing intermediate maps and a missing leaf are CREATED — config keys
+    added in a newer release won't yet exist in an older user's config.yaml,
+    and the GUI must still be able to set them. This is safe because every
+    caller route gates the dotted path against an editable-key whitelist
+    first, and update_config_yaml re-validates the whole file through the
+    typed Config model before writing, so an invented junk section can never
+    land on disk. An existing non-map node in the path is still an error."""
     keys = dotted_path.split(".")
     node = data
     for key in keys[:-1]:
-        if key not in node or not hasattr(node[key], "__setitem__"):
-            raise YamlEditError(f"unknown config section {key!r} in {dotted_path!r}")
+        if key not in node:
+            node[key] = CommentedMap()
+        elif not hasattr(node[key], "__setitem__"):
+            raise YamlEditError(f"{key!r} in {dotted_path!r} is a value, not a section")
         node = node[key]
-    if keys[-1] not in node:
-        raise YamlEditError(f"unknown config key {dotted_path!r}")
     node[keys[-1]] = value
 
 

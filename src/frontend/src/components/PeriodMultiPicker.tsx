@@ -4,15 +4,17 @@ import { useLoad } from "../lib/hooks";
 import { Button, Field, inputCls } from "./ui";
 
 interface Period {
-  as_of_date: string;
+  period: string; // the submit value (reporting-period label, e.g. "Q1 2026")
+  as_of_date: string; // representative underlying date, for display only
   label: string;
 }
 
 /** Multi-period picker for a run: toggle discovered periods, or add a range
- *  (start..end) that expands to every period between. Selected periods are
- *  stored as resolved as-of dates (ISO) so they round-trip under any client
- *  cadence; chips show the human label. An empty list = the single primary
- *  period chosen above. */
+ *  (start..end) that expands to every period between. Periods are DEDUPED to one
+ *  entry per reporting period (one "Q1 2026", never one per month-end), and the
+ *  stored value is the period label so a run finds every deal in that quarter
+ *  regardless of its exact month-end. Chips show the human label. An empty list
+ *  = the single primary period chosen above. */
 export function PeriodMultiPicker({
   client,
   deal,
@@ -38,7 +40,7 @@ export function PeriodMultiPicker({
   const discovered = periods.data?.periods ?? [];
   const labelByValue = useMemo(() => {
     const m = new Map<string, string>();
-    for (const p of discovered) m.set(p.as_of_date, p.label);
+    for (const p of discovered) m.set(p.period, p.label);
     return m;
   }, [discovered]);
 
@@ -67,8 +69,8 @@ export function PeriodMultiPicker({
         setRangeErr(res.error);
         return;
       }
-      for (const p of res.periods) labelByValue.set(p.as_of_date, p.label);
-      merge(res.periods.map((p) => p.as_of_date));
+      for (const p of res.periods) labelByValue.set(p.period, p.label);
+      merge(res.periods.map((p) => p.period));
       setStart("");
       setEnd("");
     } catch (e) {
@@ -85,11 +87,11 @@ export function PeriodMultiPicker({
         <div className="flex flex-wrap gap-1.5">
           {discovered.map((p) => (
             <button
-              key={p.as_of_date}
+              key={p.period}
               type="button"
-              onClick={() => toggle(p.as_of_date)}
+              onClick={() => toggle(p.period)}
               className={`px-2 py-0.5 text-[12px] rounded border ${
-                has(p.as_of_date)
+                has(p.period)
                   ? "bg-info-soft border-[var(--hl-blue)] text-ink-900"
                   : "bg-paper border-line text-ink-600 hover:bg-ink-50"
               }`}

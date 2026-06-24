@@ -20,6 +20,7 @@ interface DealFolderInfo {
 }
 
 interface Period {
+  period: string; // submit value (reporting-period label, e.g. "Q1 2026")
   as_of_date: string;
   label: string;
 }
@@ -164,12 +165,12 @@ export function FirmRegion({
 
           {/* period ---------------------------------------------------- */}
           <div className="grid grid-cols-2 gap-4">
-            <Field label="Period (date folders in the index)">
+            <Field label="Period (reporting periods in the index)">
               <select className={inputCls} value={firm.period} onChange={(e) => set({ period: e.target.value })}>
                 <option value="">— select period —</option>
                 {(periods.data?.periods ?? []).map((p) => (
-                  <option key={p.as_of_date} value={p.as_of_date}>
-                    {p.label} ({p.as_of_date})
+                  <option key={p.period} value={p.period}>
+                    {p.label}
                   </option>
                 ))}
               </select>
