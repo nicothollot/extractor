@@ -1,6 +1,5 @@
-"""D3 schema builder: strict JSON schema (additionalProperties:false
-everywhere, everything required) and byte-stable static prompts built
-verbatim from the compiled workbook row-3 descriptions."""
+"""Schema builder: sparse schema-v5 output, strict JSON schema, byte-stable
+prompts, and legacy response decode compatibility."""
 
 from __future__ import annotations
 
@@ -13,9 +12,11 @@ import re
 from pv_extractor.extract.engine import load_schema_fields
 from pv_extractor.llm.schema_builder import (
     build_call_prompt,
+    build_legacy_response_schema,
     build_response_schema,
     build_static_prompt,
-    response_key_map,
+    decode_structured_response,
+    sparse_response_key_map,
     schema_json_bytes,
 )
 
@@ -37,21 +38,20 @@ def _walk_objects(schema: dict):
         yield schema
         for sub in schema.get("properties", {}).values():
             yield from _walk_objects(sub)
+        for sub in schema.get("$defs", {}).values():
+            yield from _walk_objects(sub)
 
 
 def test_schema_is_strict_everywhere(fields):
     schema = build_response_schema(fields)
-    # the per-field shape is defined once under $defs and referenced by $ref
-    assert "fieldresult" in schema["$defs"]
-    objects = list(_walk_objects(schema))  # root + bands + the $defs field shape
-    assert len(objects) >= 1 + 1 + 1
+    assert "candidate" in schema["$defs"]
+    assert "conflictcandidate" in schema["$defs"]
+    objects = list(_walk_objects(schema))
+    assert len(objects) >= 2
     for obj in objects:
         assert obj["additionalProperties"] is False
         assert sorted(obj["required"]) == sorted(obj["properties"])
-    # every field property is a $ref to the shared shape (keeps the schema small)
-    for band in schema["properties"].values():
-        for prop in band["properties"].values():
-            assert prop == {"$ref": "#/$defs/fieldresult"}
+    assert schema["properties"]["values"]["items"] == {"$ref": "#/$defs/candidate"}
 
 
 def _all_property_keys(schema: dict):
@@ -71,40 +71,38 @@ def test_schema_property_keys_are_api_legal(fields):
         assert _KEY_OK.match(key), f"illegal schema key: {key!r}"
 
 
-def test_schema_is_band_grouped_and_reverses_to_headers(fields):
+def test_sparse_schema_reverses_field_keys_to_headers(fields):
     schema = build_response_schema(fields)
-    key_map = response_key_map(fields)
-    bands = {f.band for f in fields}
-    # one top-level (sanitized) key per band, reversing to the band names
-    assert set(schema["properties"]) == set(key_map)
-    # the reverse map recovers exactly the escalated headers, nothing else
-    headers_in_map = {h for fmap in key_map.values() for h in fmap.values()}
+    key_map = sparse_response_key_map(fields)
+    assert set(schema["properties"]) == {
+        "schema_version", "scope", "values", "not_found", "conflicts", "warnings"
+    }
+    headers_in_map = set(key_map.values())
     assert headers_in_map == set(HEADERS)
-    assert len(key_map) == len(bands)
-    # every schema field key has a header in the reverse map
-    for band_key, band_obj in schema["properties"].items():
-        assert set(band_obj["properties"]) == set(key_map[band_key])
+    allowed = set(schema["properties"]["not_found"]["items"]["enum"])
+    assert allowed == set(key_map)
 
 
 def test_field_object_carries_embedded_provenance(fields):
     schema = build_response_schema(fields)
-    field_obj = schema["$defs"]["fieldresult"]  # the shared $ref target
+    field_obj = schema["$defs"]["candidate"]
     assert field_obj["additionalProperties"] is False
     assert set(field_obj["properties"]) == {
-        "value", "unit", "page", "verbatim_quote", "confidence", "not_found",
+        "field_id", "value", "unit", "document_id", "page", "as_of_date",
+        "quote", "evidence_kind", "model_confidence",
     }
     assert sorted(field_obj["required"]) == sorted(field_obj["properties"])
-    assert field_obj["properties"]["confidence"]["enum"] == ["high", "medium", "low"]
+    assert field_obj["properties"]["model_confidence"]["type"] == "number"
 
 
-def test_ref_schema_is_compact_enough_for_windows_cmdline(fields):
+def test_sparse_schema_is_compact_enough_for_windows_cmdline(fields):
     """The schema is passed inline on the `claude` command line; Windows caps
     that at ~32 KB. $ref keeps even a large field set well under it."""
     from pv_extractor.extract.engine import load_schema_fields
 
     big = load_schema_fields()[:200]
     size = len(schema_json_bytes(build_response_schema(big)))
-    assert size < 20_000, f"$ref schema for 200 fields is {size} bytes — too big for Windows"
+    assert size < 20_000, f"sparse schema for 200 fields is {size} bytes — too big for Windows"
 
 
 def test_schema_and_prompt_are_byte_stable_and_order_independent(fields):
@@ -118,18 +116,42 @@ def test_schema_and_prompt_are_byte_stable_and_order_independent(fields):
 
 
 def test_response_round_trips_sanitized_keys_back_to_headers(fields):
-    """A model response keyed by the sanitized schema keys must flatten back to
-    the workbook headers the merge step expects."""
-    from pv_extractor.llm.escalate import _flatten_response
+    key_map = sparse_response_key_map(fields)
+    structured = {
+        "schema_version": 5,
+        "scope": {"type": "document", "id": "D01"},
+        "values": [
+            {
+                "field_id": field_key,
+                "value": 1.0,
+                "unit": None,
+                "document_id": "D01",
+                "page": 1,
+                "as_of_date": None,
+                "quote": "x",
+                "evidence_kind": "explicit_label",
+                "model_confidence": 0.92,
+            }
+            for field_key in key_map
+        ],
+        "not_found": [],
+        "conflicts": [],
+        "warnings": [],
+    }
+    flat = decode_structured_response(structured, fields)
+    assert set(flat) == set(HEADERS)
+    assert all(v["verbatim_quote"] == "x" for v in flat.values())
 
-    schema = build_response_schema(fields)
+
+def test_legacy_response_still_decodes(fields):
+    legacy_schema = build_legacy_response_schema(fields)
     answer = {"value": 1.0, "unit": None, "page": 1, "verbatim_quote": "x",
               "confidence": "high", "not_found": False}
     structured = {
-        band_key: {field_key: answer for field_key in band_obj["properties"]}
-        for band_key, band_obj in schema["properties"].items()
+        band_key: {field_key: answer for field_key in band_obj["properties"].keys()}
+        for band_key, band_obj in legacy_schema["properties"].items()
     }
-    flat = _flatten_response(structured, fields)
+    flat = decode_structured_response(structured, fields)
     assert set(flat) == set(HEADERS)
 
 
@@ -141,8 +163,9 @@ def test_prompt_carries_row3_descriptions_verbatim(fields):
         collapsed = " ".join(field.description.split())
         if collapsed:
             assert collapsed in prompt
-    # provenance contract is spelled out for the model
-    assert "verbatim_quote" in prompt and "not_found" in prompt and "DISCARDED" in prompt
+    # sparse provenance/accounting contract is spelled out for the model
+    assert "quote" in prompt and "not_found" in prompt and "field_id" in prompt
+    assert "model_confidence" in prompt
 
 
 def test_prompt_contains_only_requested_fields(fields):
@@ -156,7 +179,7 @@ def test_call_prompt_is_cache_first(fields):
     prompt cache instead of re-uploading it behind a varying field list."""
     pages = "== DOCUMENT PAGES ==\n--- page 1 (TEXT) ---\nEnterprise Value 100"
     prompt = build_call_prompt(fields, pages)
-    i_rules = prompt.index("You are extracting")
+    i_rules = prompt.index("evidence-grounded extraction engine")
     i_pages = prompt.index("DOCUMENT PAGES")
     i_fields = prompt.index("Fields to extract")
     assert i_rules < i_pages < i_fields  # rules -> pages (stable prefix) -> fields

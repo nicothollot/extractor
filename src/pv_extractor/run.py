@@ -25,7 +25,7 @@ Design points:
     plan. force_assist additionally bypasses the deterministic result cache (a
     cached memo carries the OLD narrow plan) and is never written back to it.
     When LLM settings are supplied (CLI default unless --no-llm), the plans are executed through
-    hidden local Claude Code sessions (llm/escalate.py) AFTER the deterministic
+    hidden local provider sessions (llm/escalate.py) AFTER the deterministic
     result cache is populated and BEFORE rows/audits are written — merged
     values land in the workbook, attempts/costs land in the audit record and
     the run's cost ledger, session ids land in the Run Log "Batch Sessions"
@@ -36,6 +36,7 @@ Design points:
 from __future__ import annotations
 
 import logging
+import json
 import sqlite3
 import threading
 import time
@@ -47,8 +48,7 @@ from pathlib import Path
 
 from pv_extractor.config import Config
 from pv_extractor.extract import cache as result_cache
-from pv_extractor.extract.bands.base import ExtractionContext
-from pv_extractor.extract.derived import apply_derived, derived_specs
+from pv_extractor.extract.derived import derived_specs
 from pv_extractor.extract.engine import (
     EngineResult,
     extract_memo,
@@ -56,6 +56,7 @@ from pv_extractor.extract.engine import (
     load_schema_fields,
 )
 from pv_extractor.indexer import db
+from pv_extractor.io_guard import guarded_open_write
 from pv_extractor.indexer.periods import period_label
 from pv_extractor.llm.escalate import (
     DealGroup,
@@ -64,6 +65,7 @@ from pv_extractor.llm.escalate import (
     process_deals,
     process_memos,
 )
+from pv_extractor.llm.model_registry import ExtractionPlanMetrics, ModelRegistry
 from pv_extractor.locator.locate import locate
 from pv_extractor.locator.verify import verify_and_rerank
 from pv_extractor.logging_setup import log_event
@@ -87,7 +89,8 @@ from pv_extractor.models import (
     VerifyResult,
     VerifyStatus,
 )
-from pv_extractor.validate import load_rules, validate_asset
+from pv_extractor.validate import load_rules
+from pv_extractor.validate.finalize import finalize_asset_after_assistance
 from pv_extractor.write import WorkbookWriter, copy_template, write_audit
 
 logger = logging.getLogger(__name__)
@@ -173,6 +176,7 @@ class RunReport:
     started_at: str = ""  # ISO wall-clock run start
     finished_at: str = ""  # ISO wall-clock run finish
     llm: LlmRunSummary | None = None
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
     def qa_counts(self) -> dict[str, int]:
         counts = {status.value: 0 for status in QaStatus}
@@ -364,6 +368,16 @@ def _metadata_hits(
     return hits
 
 
+def _attach_evidence_source(hits: list[FieldHit], *, source_id: str, source_file: str) -> None:
+    for hit in hits:
+        if hit.evidence_ref is None:
+            continue
+        if hit.evidence_ref.source_id is None:
+            hit.evidence_ref.source_id = source_id
+        if hit.evidence_ref.source_file is None:
+            hit.evidence_ref.source_file = source_file
+
+
 # Bands that are never extracted from the document (run identity, QA verdicts,
 # threshold flags) and so are never escalated to the LLM. Derived/computed
 # fields (rule 7) are excluded separately, by header, via derived_headers.
@@ -426,15 +440,22 @@ def _build_escalation(
                     candidate_pages=page_band_map.get(hit.band, []),
                 )
             )
+        low_confidence_headers = {
+            hit.field
+            for hit in asset.hits
+            if hit.method not in ("metadata", "computed") and hit.confidence < threshold
+        }
         for schema_field in schema_by_header.values():
-            if schema_field.header in populated:
+            if not _is_llm_extractable(schema_field, derived_headers):
                 continue
-            if schema_field.required:
+            if schema_field.header in low_confidence_headers:
+                reason = "below_confidence"
+            elif schema_field.required and schema_field.header not in populated:
                 reason = "required_empty"
-            elif broad and _is_llm_extractable(schema_field, derived_headers):
+            elif broad:
                 reason = "force_llm_assist" if force_assist else "qa_fail_rescue"
             else:
-                continue
+                reason = "primary_catalog"
             key = (asset.row_memo_id, schema_field.header)
             if key in seen:
                 continue
@@ -474,7 +495,7 @@ def run(
     """Execute one extraction run. See module docstring for the pipeline.
     llm_settings=None keeps pure Phase-2 behavior (escalation plans are
     serialized but never executed); the CLI builds settings from config.llm
-    plus the --llm-* flags. llm_client overrides the Claude Code subprocess
+    plus the --llm-* flags. llm_client overrides the local provider subprocess
     client (tests inject fakes — no test launches the real CLI). control
     is the Phase-4 GUI seam (progress events + graceful cancel); None
     keeps exact CLI behavior. exclude drops specific (client, deal) slots from
@@ -596,13 +617,14 @@ def run(
         derived_headers = {spec.header for spec in derived_specs(config.validation)}
         # force_assist makes the LLM the primary extractor: bypass the
         # deterministic result cache so the broad escalation plan is actually
-        # rebuilt (a cached memo carries the OLD, narrow plan). The default
-        # one-call-per-deal mode is force-assist-equivalent: the single per-deal
-        # call extracts the whole field set, so plans must be comprehensive and
-        # the result cache (which would carry a narrow plan) is bypassed too.
+        # rebuilt (a cached memo carries the OLD, narrow plan). Deal-document
+        # grouping is only a batching choice; it must not broaden fields and
+        # must not bypass deterministic cache.
         llm_on = bool(llm_settings is not None and llm_settings.enabled)
-        one_call_per_deal = bool(llm_on and config.llm.one_call_per_deal)
-        force_assist = bool(llm_settings is not None and llm_settings.force_assist) or one_call_per_deal
+        combine_deal_documents = bool(
+            llm_on and (config.llm.combine_deal_documents or config.llm.one_call_per_deal)
+        )
+        force_assist = bool(llm_settings is not None and llm_settings.force_assist)
         effective_force = force or force_assist
 
         # ---- verify (+extract unless dry-run) in the worker pool ----
@@ -714,30 +736,32 @@ def run(
                 logger.exception("assembly failed for %s/%s", item.client, item.deal)
                 _mark_coverage_error(report, item, exc)
 
-        # Phase-3 second pass: Claude Code CLI fallback over the escalation
+        # Phase-3 second pass: local CLI LLM assist over the escalation
         # plans (merged hits mutate the memos before rows/audits are written).
         # A cancellation that arrived before this point skips the LLM phase
         # entirely (plans stay serialized in the audits, exactly like --no-llm).
         if llm_settings is not None and llm_settings.enabled and not control.cancelled:
-            if one_call_per_deal:
-                # ONE Claude Code call per deal-period over the combined payload
-                # of all its documents (default). Group exactly like the
-                # multi-doc merge so the LLM hits land on the surviving row.
-                deal_groups = _build_deal_groups(assembled)
-                control.emit("llm_phase", status="started",
-                             memos=sum(1 for g in deal_groups
-                                       if g.primary.escalation and g.primary.escalation.fields))
-                report.llm = process_deals(
+            all_groups = _build_deal_groups(assembled)
+            deal_groups, document_memos, routing_diag = _route_llm_groups(all_groups, config, llm_settings)
+            control.emit(
+                "llm_phase",
+                status="started",
+                memos=len(document_memos) + len(deal_groups),
+                routing_mode=llm_settings.mode,
+            )
+            report.llm = LlmRunSummary(enabled=True, executed=True, diagnostics=routing_diag)
+            if deal_groups:
+                deal_summary = process_deals(
                     deal_groups, config, llm_settings, schema_fields,
                     run_id=run_id, run_dir=run_dir, client=llm_client,
                 )
-            else:
-                control.emit("llm_phase", status="started",
-                             memos=sum(1 for _, m in assembled if m.escalation and m.escalation.fields))
-                report.llm = process_memos(
-                    [memo for _, memo in assembled], config, llm_settings, schema_fields,
+                report.llm = _merge_llm_summaries(report.llm, deal_summary)
+            if document_memos:
+                doc_summary = process_memos(
+                    document_memos, config, llm_settings, schema_fields,
                     run_id=run_id, run_dir=run_dir, client=llm_client,
                 )
+                report.llm = _merge_llm_summaries(report.llm, doc_summary)
             control.emit(
                 "llm_phase", status="done", attempts=report.llm.attempts,
                 cache_hits=report.llm.cache_hits, deferred=report.llm.memos_deferred,
@@ -749,6 +773,36 @@ def run(
         # (best confidence per field), AFTER the LLM pass so every doc's filled
         # values + confidences are final. No-op when no slot has extra docs.
         assembled = _merge_assembled(assembled, config, schema_by_header, ruleset, routing, writer)
+        finalization_ms = 0.0
+        final_started = time.perf_counter()
+        for _, memo in assembled:
+            _finalize_memo_assets(memo, config, schema_by_header, ruleset, routing, writer)
+        finalization_ms += (time.perf_counter() - final_started) * 1000
+
+        if (
+            llm_settings is not None
+            and llm_settings.enabled
+            and config.llm.planner.rescue_enabled
+            and config.llm.candidate_arbitration.repair_policy == "core_only"
+            and not control.cancelled
+        ):
+            rescue_memos = _prepare_rescue_wave(assembled, config, schema_by_header, derived_headers)
+            if rescue_memos:
+                control.emit("llm_phase", status="rescue_started", memos=len(rescue_memos))
+                rescue_summary = process_memos(
+                    rescue_memos, config, llm_settings, schema_fields,
+                    run_id=run_id, run_dir=run_dir, client=llm_client,
+                )
+                report.llm = _merge_llm_summaries(report.llm, rescue_summary)
+                final_started = time.perf_counter()
+                for _, memo in assembled:
+                    _finalize_memo_assets(memo, config, schema_by_header, ruleset, routing, writer)
+                finalization_ms += (time.perf_counter() - final_started) * 1000
+                control.emit(
+                    "llm_phase", status="rescue_done", attempts=rescue_summary.attempts,
+                    cache_hits=rescue_summary.cache_hits, total_cost_usd=rescue_summary.total_cost_usd,
+                )
+        report.diagnostics = _build_run_diagnostics(assembled, report.llm, finalization_ms)
 
         for item, memo in assembled:
             try:
@@ -777,7 +831,7 @@ def run(
         else:
             label = "actual+estimated" if llm.any_actual_costs else "ESTIMATED"
             notes = (
-                f"Claude Code fallback: {llm.memos_escalated} memo(s) escalated, "
+                f"LLM assist ({config.llm.provider}): {llm.memos_escalated} memo(s) escalated, "
                 f"{llm.attempts} call(s) ({llm.cache_hits} cached), "
                 f"{llm.memos_deferred} deferred, ${llm.total_cost_usd:.4f} ({label})"
             )
@@ -800,12 +854,13 @@ def run(
                     if flag.reviewer_attention
                 ),
                 "Run Duration (mins)": duration_minutes,
-                # Claude Code session identifiers (job id[:session id]) — not
+                # provider session identifiers (job id[:session id]) — not
                 # API batch ids; there is no Batch API in this architecture.
                 "Batch Sessions": "; ".join(llm.session_labels) if llm and llm.session_labels else None,
                 "Notes": notes,
             }
         )
+        _write_diagnostics(report, config)
         writer.save()
         log_event(
             logger, "run complete", run_id=run_id, memos=len(report.memos),
@@ -864,6 +919,217 @@ def _default_template() -> Path:
     return Path(__file__).resolve().parents[2] / "reference" / "master_index_v4.xlsx"
 
 
+def _prior_row_for_hits(
+    writer: WorkbookWriter,
+    hits: list[FieldHit],
+    as_of: date | None,
+) -> dict[str, object] | None:
+    if as_of is None:
+        return None
+    company = next((h.value for h in hits if h.field == "Portfolio Company"), None)
+    fund = next((h.value for h in hits if h.field == "Fund Name"), None)
+    return writer.find_prior_row(
+        str(company) if company else None,
+        str(fund) if fund else None,
+        as_of,
+    )
+
+
+def _finalize_memo_assets(
+    memo: MemoResult,
+    config: Config,
+    schema_by_header: dict[str, SchemaField],
+    ruleset,
+    routing: dict[str, list[str]],
+    writer: WorkbookWriter,
+) -> None:
+    for index, asset in enumerate(memo.assets):
+        prior_row = _prior_row_for_hits(writer, asset.hits, memo.as_of_date)
+        finalize_asset_after_assistance(
+            asset,
+            config=config,
+            schema_by_header=schema_by_header,
+            ruleset=ruleset,
+            routing_table=routing,
+            as_of_date=memo.as_of_date,
+            verify=memo.verify,
+            prior_row=prior_row,
+            client=memo.client,
+            extra_flags=memo.memo_flags if index == 0 else None,
+        )
+        _attach_evidence_source(asset.hits, source_id=memo.memo_id, source_file=memo.file_path)
+
+
+def _hit_for(asset: AssetExtraction, header: str) -> FieldHit | None:
+    return next((hit for hit in asset.hits if hit.field == header), None)
+
+
+def _rescue_pages(memo: MemoResult, asset: AssetExtraction, field: SchemaField, config: Config) -> list[int]:
+    pages: list[int] = []
+    hit = _hit_for(asset, field.header)
+    if hit is not None and hit.page is not None:
+        pages.append(hit.page)
+    pages.extend(memo.page_band_map.get(field.band, []))
+    limit = max(1, config.llm.planner.rescue_max_pages)
+    deduped: list[int] = []
+    for page in pages:
+        if page and page not in deduped:
+            deduped.append(page)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _prepare_rescue_wave(
+    assembled: list[tuple[_WorkItem, MemoResult]],
+    config: Config,
+    schema_by_header: dict[str, SchemaField],
+    derived_headers: set[str],
+) -> list[MemoResult]:
+    """Build a rescue wave only for specific unresolved hard-fail fields.
+
+    This never re-runs a whole memo: required-missing fields and field-scoped
+    hard-fail validation flags are the only candidates, capped by
+    llm.planner.rescue_max_fields.
+    """
+    rescue_memos: list[MemoResult] = []
+    max_fields = max(1, config.llm.planner.rescue_max_fields)
+    for _item, memo in assembled:
+        rescue: dict[str, EscalationField] = {}
+        for asset in memo.assets:
+            populated = {hit.field for hit in asset.hits if hit.value is not None}
+            for field in schema_by_header.values():
+                if len(rescue) >= max_fields:
+                    break
+                if not field.required or field.header in populated:
+                    continue
+                if not _is_llm_extractable(field, derived_headers):
+                    continue
+                rescue.setdefault(
+                    field.header,
+                    EscalationField(
+                        field=field.header,
+                        col_index=field.col_index,
+                        band=field.band,
+                        reason="finalization_rescue",
+                        candidate_pages=_rescue_pages(memo, asset, field, config),
+                    ),
+                )
+            for flag in asset.flags:
+                if len(rescue) >= max_fields:
+                    break
+                if flag.severity != FlagSeverity.hard_fail or not flag.field:
+                    continue
+                field = schema_by_header.get(flag.field)
+                if field is None or not _is_llm_extractable(field, derived_headers):
+                    continue
+                hit = _hit_for(asset, field.header)
+                if hit is not None and hit.method == "deterministic" and hit.confidence >= config.extraction.confidence_threshold:
+                    continue
+                rescue.setdefault(
+                    field.header,
+                    EscalationField(
+                        field=field.header,
+                        col_index=field.col_index,
+                        band=field.band,
+                        reason="finalization_rescue",
+                        confidence=hit.confidence if hit else None,
+                        candidate_pages=_rescue_pages(memo, asset, field, config),
+                    ),
+                )
+        if rescue:
+            if memo.escalation is None:
+                memo.escalation = EscalationPlan(
+                    memo_id=memo.memo_id,
+                    confidence_threshold=config.extraction.confidence_threshold,
+                    page_band_map=memo.page_band_map,
+                )
+            memo.escalation.fields = list(rescue.values())
+            memo.escalation.merge_log.append(
+                "rescue wave planned for fields: "
+                + ", ".join(field.field for field in memo.escalation.fields)
+            )
+            rescue_memos.append(memo)
+    return rescue_memos
+
+
+def _merge_counter_dict(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
+    out = dict(a)
+    for key, value in b.items():
+        out[key] = int(out.get(key, 0)) + int(value)
+    return out
+
+
+def _merge_diagnostics(a: dict[str, object], b: dict[str, object]) -> dict[str, object]:
+    out = dict(a)
+    for key, value in b.items():
+        if key == "task_count_by_wave" and isinstance(value, dict):
+            out[key] = _merge_counter_dict(
+                out.get(key, {}) if isinstance(out.get(key), dict) else {},
+                value,
+            )
+        elif isinstance(value, (int, float)) and isinstance(out.get(key), (int, float)):
+            out[key] = round(float(out[key]) + float(value), 4)
+        else:
+            out.setdefault(key, value)
+    return out
+
+
+def _merge_llm_summaries(
+    primary: LlmRunSummary | None,
+    extra: LlmRunSummary,
+) -> LlmRunSummary:
+    if primary is None:
+        return extra
+    primary.executed = primary.executed or extra.executed
+    primary.memos_escalated += extra.memos_escalated
+    primary.memos_deferred += extra.memos_deferred
+    primary.memos_failed += extra.memos_failed
+    primary.attempts += extra.attempts
+    primary.cache_hits += extra.cache_hits
+    primary.total_cost_usd = round(primary.total_cost_usd + extra.total_cost_usd, 4)
+    primary.any_actual_costs = primary.any_actual_costs or extra.any_actual_costs
+    primary.session_labels.extend(extra.session_labels)
+    primary.diagnostics = _merge_diagnostics(primary.diagnostics, extra.diagnostics)
+    return primary
+
+
+def _build_run_diagnostics(
+    assembled: list[tuple[_WorkItem, MemoResult]],
+    llm: LlmRunSummary | None,
+    finalization_ms: float,
+) -> dict[str, object]:
+    deterministic_ms = sum(
+        float(memo.timings_ms.get("extract", 0.0))
+        for _item, memo in assembled
+    )
+    return {
+        "deterministic_extraction_ms": round(deterministic_ms, 1),
+        "finalization_ms": round(finalization_ms, 1),
+        "llm": llm.diagnostics if llm else {},
+    }
+
+
+def _write_diagnostics(report: RunReport, config: Config) -> None:
+    if report.run_dir is None:
+        return
+    path = report.run_dir / "diagnostics.json"
+    with guarded_open_write(path, config.pv_root) as fh:
+        json.dump(
+            {
+                "run_id": report.run_id,
+                "started_at": report.started_at,
+                "finished_at": report.finished_at,
+                "diagnostics": report.diagnostics,
+            },
+            fh,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        fh.write("\n")
+
+
 _MERGE_EXCLUDED_BANDS = {"QA", "THRESHOLD FLAGS"}
 
 
@@ -900,34 +1166,24 @@ def _merge_asset(
         merged_hit.source_file = source
         real_hits.append(merged_hit)
 
-    ctx = ExtractionContext(cfg=config.extraction)
-    with_derived = apply_derived([*meta, *real_hits], schema_by_header, config.validation, ctx)
-
-    company = next((h.value for h in with_derived if h.field == "Portfolio Company"), None)
-    fund = next((h.value for h in with_derived if h.field == "Fund Name"), None)
-    as_of = primary_memo.as_of_date
-    prior_row = (
-        writer.find_prior_row(str(company) if company else None, str(fund) if fund else None, as_of)
-        if as_of else None
+    merged_asset = AssetExtraction(
+        asset_name=primary_asset.asset_name,
+        row_memo_id=primary_asset.row_memo_id,
+        hits=[*meta, *real_hits],
+        flags=[flag for _memo, asset in members for flag in asset.flags],
+        qa_status=primary_asset.qa_status,
     )
-    validated = validate_asset(
-        hits=with_derived,
-        extraction_flags=list(ctx.flags),
-        schema_by_header=schema_by_header,
+    prior_row = _prior_row_for_hits(writer, merged_asset.hits, primary_memo.as_of_date)
+    return finalize_asset_after_assistance(
+        merged_asset,
         config=config,
+        schema_by_header=schema_by_header,
         ruleset=ruleset,
         routing_table=routing,
-        as_of_date=as_of,
+        as_of_date=primary_memo.as_of_date,
         verify=primary_memo.verify,
         prior_row=prior_row,
         client=primary_memo.client,
-    )
-    return AssetExtraction(
-        asset_name=primary_asset.asset_name,
-        row_memo_id=primary_asset.row_memo_id,
-        hits=validated.hits,
-        flags=validated.flags,
-        qa_status=validated.qa_status,
     )
 
 
@@ -1020,11 +1276,69 @@ def _build_deal_groups(
         files += [
             (m.file_path, m.file_name) for m in member_memos if m is not primary_memo
         ]
-        for m in member_memos:
-            if m is not primary_memo and m.escalation is not None:
-                m.escalation.status = "not_needed"
         groups.append(DealGroup(primary=primary_memo, members=member_memos, files=files))
     return groups
+
+
+def _group_plan_metrics(group: DealGroup, config: Config) -> ExtractionPlanMetrics:
+    pages = sum(max(0, memo.page_count) for memo in group.members)
+    image_pages = sum(
+        1
+        for memo in group.members
+        for page_class in memo.page_classes.values()
+        if page_class.value in {"SCANNED", "IMAGE_TABLE"}
+    )
+    fields = len(group.primary.escalation.fields) if group.primary.escalation else 0
+    prompt_chars = pages * 2800 + fields * config.llm.output_tokens_per_field * 4
+    return ExtractionPlanMetrics(
+        estimated_input_tokens=int(prompt_chars / max(config.llm.chars_per_token, 1.0)),
+        documents=max(1, len(group.members)),
+        image_pages=image_pages,
+        fields=fields,
+    )
+
+
+def _route_llm_groups(
+    groups: list[DealGroup],
+    config: Config,
+    settings: LlmSettings,
+) -> tuple[list[DealGroup], list[MemoResult], dict[str, object]]:
+    registry = ModelRegistry.load(config.llm.models_path)
+    deal_groups: list[DealGroup] = []
+    document_memos: list[MemoResult] = []
+    resolved: list[dict[str, object]] = []
+    force_deal = bool(config.llm.combine_deal_documents or config.llm.one_call_per_deal)
+    for group in groups:
+        metrics = _group_plan_metrics(group, config)
+        plan = registry.resolve_extraction_plan(
+            routing_mode=settings.mode,
+            metrics=metrics,
+            auto=config.llm.auto,
+            provider=config.llm.provider,
+            manual_model=settings.manual_model,
+            manual_effort=settings.manual_effort,
+            execution_shape="deal" if force_deal else "profile",
+            allow_fable=settings.allow_fable,
+            provider_default_model=config.codex_cli.model,
+            provider_default_effort=config.codex_cli.reasoning_effort,
+            repair_policy=config.llm.candidate_arbitration.repair_policy,
+            max_repair_calls_per_deal=config.llm.candidate_arbitration.max_repair_calls_per_deal,
+        )
+        if group.primary.escalation is not None:
+            group.primary.escalation.diagnostics["resolved_launch_plan"] = plan.model_dump(
+                exclude={"selection"}
+            )
+        resolved.append({"deal_key": f"{group.primary.client}|{group.primary.deal}|{group.primary.as_of_date}", **plan.model_dump(exclude={"selection"})})
+        if plan.execution_shape == "deal" and group.primary.escalation and group.primary.escalation.fields:
+            for member in group.members:
+                if member is not group.primary and member.escalation is not None:
+                    member.escalation.status = "not_needed"
+            deal_groups.append(group)
+        else:
+            document_memos.extend(
+                member for member in group.members if member.escalation and member.escalation.fields
+            )
+    return deal_groups, document_memos, {"resolved_launch_plan": resolved}
 
 
 def _merge_assembled(
@@ -1149,37 +1463,28 @@ def _assemble_memo(
             populated,
         )
         all_hits = [*metadata, *hits]
-
-        company = next((h.value for h in all_hits if h.field == "Portfolio Company"), None)
-        fund = next((h.value for h in all_hits if h.field == "Fund Name"), None)
-        prior_row = (
-            writer.find_prior_row(str(company) if company else None, str(fund) if fund else None, as_of)
-            if as_of
-            else None
-        )
+        _attach_evidence_source(all_hits, source_id=memo_id, source_file=record.file_path)
 
         memo_level = list(memo.memo_flags) if index == 1 else []
-        validated = validate_asset(
+        asset = AssetExtraction(
+            asset_name=asset_name or resolved_asset,
+            row_memo_id=row_memo_id,
             hits=all_hits,
-            extraction_flags=[*memo_level, *extraction_flags],
-            schema_by_header=schema_by_header,
+            flags=list(extraction_flags),
+        )
+        finalize_asset_after_assistance(
+            asset,
             config=config,
+            schema_by_header=schema_by_header,
             ruleset=ruleset,
             routing_table=routing,
             as_of_date=as_of,
             verify=item.verify,
-            prior_row=prior_row,
+            prior_row=_prior_row_for_hits(writer, all_hits, as_of),
             client=item.client,
+            extra_flags=memo_level,
         )
-        memo.assets.append(
-            AssetExtraction(
-                asset_name=asset_name or resolved_asset,
-                row_memo_id=row_memo_id,
-                hits=validated.hits,
-                flags=validated.flags,
-                qa_status=validated.qa_status,
-            )
-        )
+        memo.assets.append(asset)
 
     memo.escalation = _build_escalation(
         memo_id, memo.assets, schema_by_header,

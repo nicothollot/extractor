@@ -28,6 +28,7 @@ run still writes its workbook/audits for everything completed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -53,7 +54,8 @@ from pv_extractor.run import RunControl, RunReport, run as run_pipeline
 
 logger = logging.getLogger(__name__)
 
-_PIPELINE_KINDS = {"run", "multi_run"}
+_PIPELINE_KINDS = ("multi_run", "run")
+_ACTIVE_STATUSES = ("queued", "running", "cancelling")
 
 
 def _now() -> str:
@@ -104,6 +106,83 @@ def _json_safe(value: object) -> bool:
         return False
 
 
+def _safe_text(value: object, limit: int = 800) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def _stat_token(path: str | Path | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    try:
+        p = Path(path)
+        st = p.stat()
+        return {"path": str(p), "mtime_ns": st.st_mtime_ns, "size": st.st_size}
+    except OSError:
+        return {"path": str(path), "missing": True}
+
+
+def _pipeline_fingerprint(kind: str, params: dict, config: Config) -> str:
+    payload = {
+        "kind": kind,
+        "params": params,
+        "inputs": {
+            "db": _stat_token(config.db_path),
+            "aliases": _stat_token(config.aliases_path_resolved()),
+            "rules": _stat_token(config.validation.rules_path),
+        },
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _safe_event_context(event_type: str, fields: dict) -> dict[str, object]:
+    allowed = {
+        "run_id", "stage", "status", "client", "deal", "group", "file_name",
+        "memo_id", "memos", "attempts", "cache_hits", "deferred",
+        "total_cost_usd", "cost_source",
+    }
+    context: dict[str, object] = {"event": event_type}
+    for key in allowed:
+        value = fields.get(key)
+        if value is not None and _json_safe(value):
+            context[key] = value
+    return context
+
+
+def _effective_llm_config(base: Config, llm: LlmRunOptions) -> tuple[Config, dict[str, object]]:
+    """Job-local config/options for backward-compatible LLM launch."""
+    config = base.model_copy(deep=True)
+    single = llm.single_model or {}
+    if isinstance(single, dict):
+        provider = single.get("provider")
+        if provider:
+            config.llm.provider = str(provider)
+            config.llm.single_model_provider = str(provider)
+        if single.get("model"):
+            config.llm.single_model_model = str(single["model"])
+        if single.get("effort"):
+            config.llm.single_model_effort = str(single["effort"])
+    if llm.repair_policy:
+        config.llm.candidate_arbitration.repair_policy = llm.repair_policy
+    mode = llm.routing_mode or llm.mode
+    model = llm.model or (single.get("model") if isinstance(single, dict) else None)
+    effort = llm.effort or (single.get("effort") if isinstance(single, dict) else None)
+    return config, {"mode": mode, "model": model, "effort": effort}
+
+
+def _exception_diagnostic(exc: Exception, *, stage: str, context: dict[str, object] | None = None) -> dict:
+    summary = f"{type(exc).__name__}: {_safe_text(exc)}"
+    return {
+        "summary": summary,
+        "exception_type": type(exc).__name__,
+        "stage": stage,
+        "context": context or {},
+    }
+
+
 class JobManager:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -111,7 +190,7 @@ class JobManager:
         assert_write_allowed(self.db_path, config.pv_root)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._db_lock = threading.Lock()
+        self._db_lock = threading.RLock()
         self._init_schema()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._listeners: dict[str, set[asyncio.Queue]] = {}
@@ -140,7 +219,9 @@ class JobManager:
                     run_id TEXT,
                     params_json TEXT NOT NULL,
                     result_json TEXT,
-                    error TEXT
+                    error TEXT,
+                    diagnostic_json TEXT,
+                    fingerprint TEXT
                 );
                 CREATE TABLE IF NOT EXISTS job_events (
                     job_id TEXT NOT NULL,
@@ -152,15 +233,28 @@ class JobManager:
                 );
                 """
             )
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "diagnostic_json" not in cols:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN diagnostic_json TEXT")
+            if "fingerprint" not in cols:
+                self._conn.execute("ALTER TABLE jobs ADD COLUMN fingerprint TEXT")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_fingerprint ON jobs (fingerprint)")
             self._conn.commit()
 
     def _mark_stale_jobs(self) -> None:
         """Jobs left 'running' by a previous process can no longer finish."""
+        diagnostic = {
+            "summary": "Job interrupted because the GUI server restarted before it finished.",
+            "exception_type": "Interrupted",
+            "stage": "startup_recovery",
+            "context": {},
+        }
         with self._db_lock:
             self._conn.execute(
-                "UPDATE jobs SET status = 'interrupted', finished_at = ? "
+                "UPDATE jobs SET status = 'interrupted', finished_at = ?, "
+                "error = COALESCE(error, ?), diagnostic_json = COALESCE(diagnostic_json, ?) "
                 "WHERE status IN ('queued', 'running', 'cancelling')",
-                (_now(),),
+                (_now(), diagnostic["summary"], json.dumps(diagnostic, ensure_ascii=False)),
             )
             self._conn.commit()
 
@@ -173,24 +267,28 @@ class JobManager:
             self._conn.execute(f"UPDATE jobs SET {sets} WHERE id = ?", (*cols.values(), job_id))
             self._conn.commit()
 
-    def get(self, job_id: str) -> JobInfo | None:
-        with self._db_lock:
-            row = self._conn.execute(
-                "SELECT id, kind, status, created_at, started_at, finished_at, run_id, "
-                "params_json, result_json, error FROM jobs WHERE id = ?",
-                (job_id,),
-            ).fetchone()
-            seq_row = self._conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) FROM job_events WHERE job_id = ?", (job_id,)
-            ).fetchone()
-        if row is None:
-            return None
+    def _job_from_row_locked(self, row) -> JobInfo:
+        seq_row = self._conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM job_events WHERE job_id = ?", (row[0],)
+        ).fetchone()
         return JobInfo(
             id=row[0], kind=row[1], status=row[2], created_at=row[3], started_at=row[4],
             finished_at=row[5], run_id=row[6], params=json.loads(row[7]),
             result=json.loads(row[8]) if row[8] else None, error=row[9],
+            diagnostics=json.loads(row[10]) if row[10] else None,
             last_seq=seq_row[0],
         )
+
+    def get(self, job_id: str) -> JobInfo | None:
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT id, kind, status, created_at, started_at, finished_at, run_id, "
+                "params_json, result_json, error, diagnostic_json FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._job_from_row_locked(row)
 
     def list_jobs(self, *, kind: str | None = None, limit: int = 50) -> list[JobInfo]:
         sql = (
@@ -253,33 +351,105 @@ class JobManager:
     # ------------------------------------------------------------------
 
     def active_pipeline_job(self) -> JobInfo | None:
-        placeholders = ", ".join("?" for _ in _PIPELINE_KINDS)
         with self._db_lock:
             row = self._conn.execute(
-                f"SELECT id FROM jobs WHERE kind IN ({placeholders}) "
+                f"SELECT id, kind, status, created_at, started_at, finished_at, run_id, "
+                f"params_json, result_json, error, diagnostic_json FROM jobs "
+                f"WHERE kind IN ({', '.join('?' for _ in _PIPELINE_KINDS)}) "
                 "AND status IN ('queued', 'running', 'cancelling') "
                 "ORDER BY created_at DESC LIMIT 1",
-                tuple(_PIPELINE_KINDS),
+                _PIPELINE_KINDS,
             ).fetchone()
-        return self.get(row[0]) if row else None
+            return self._job_from_row_locked(row) if row else None
 
-    def _create(self, kind: str, params: dict) -> JobInfo:
+    def _create(self, kind: str, params: dict, *, fingerprint: str | None = None) -> JobInfo:
         job_id = f"JOB_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}"
         with self._db_lock:
             self._conn.execute(
-                "INSERT INTO jobs (id, kind, status, created_at, params_json) VALUES (?, ?, 'queued', ?, ?)",
-                (job_id, kind, _now(), json.dumps(params, ensure_ascii=False, default=str)),
+                "INSERT INTO jobs (id, kind, status, created_at, params_json, fingerprint) "
+                "VALUES (?, ?, 'queued', ?, ?, ?)",
+                (job_id, kind, _now(), json.dumps(params, ensure_ascii=False, default=str), fingerprint),
             )
             self._conn.commit()
         info = self.get(job_id)
         assert info is not None
         return info
 
+    def _reserve_pipeline(
+        self,
+        kind: str,
+        params: dict,
+        *,
+        fingerprint: str | None = None,
+        reuse_completed: bool = False,
+    ) -> tuple[JobInfo, bool]:
+        """Atomically reserve the single pipeline slot.
+
+        Returns (job, created). For idempotent dry-run preflights, an identical
+        active or completed job is returned with created=False instead of
+        enqueueing hidden duplicate work.
+        """
+        job_id = f"JOB_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}"
+        params_json = json.dumps(params, ensure_ascii=False, default=str)
+        select_cols = (
+            "id, kind, status, created_at, started_at, finished_at, run_id, "
+            "params_json, result_json, error, diagnostic_json, fingerprint"
+        )
+        with self._db_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                active = self._conn.execute(
+                    f"SELECT {select_cols} FROM jobs "
+                    f"WHERE kind IN ({', '.join('?' for _ in _PIPELINE_KINDS)}) "
+                    "AND status IN ('queued', 'running', 'cancelling') "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    _PIPELINE_KINDS,
+                ).fetchone()
+                if active is not None:
+                    active_job = self._job_from_row_locked(active)
+                    if fingerprint and active[11] == fingerprint:
+                        self._conn.commit()
+                        return active_job, False
+                    self._conn.rollback()
+                    raise JobConflict(active_job)
+
+                if fingerprint and reuse_completed:
+                    previous = self._conn.execute(
+                        f"SELECT {select_cols} FROM jobs "
+                        "WHERE kind = ? AND fingerprint = ? AND status = 'completed' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (kind, fingerprint),
+                    ).fetchone()
+                    if previous is not None:
+                        job = self._job_from_row_locked(previous)
+                        self._conn.commit()
+                        return job, False
+
+                self._conn.execute(
+                    "INSERT INTO jobs (id, kind, status, created_at, params_json, fingerprint) "
+                    "VALUES (?, ?, 'queued', ?, ?, ?)",
+                    (job_id, kind, _now(), params_json, fingerprint),
+                )
+                row = self._conn.execute(f"SELECT {select_cols} FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                assert row is not None
+                job = self._job_from_row_locked(row)
+                self._conn.commit()
+                return job, True
+            except JobConflict:
+                raise
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def start_run(self, request: RunRequest) -> JobInfo:
         """Queue one pipeline run; refuses while another is active."""
-        if self.active_pipeline_job() is not None:
-            raise JobConflict("a pipeline run is already active")
-        job = self._create("run", request.model_dump(mode="json"))
+        params = request.model_dump(mode="json")
+        fingerprint = _pipeline_fingerprint("run", params, self.config) if request.dry_run else None
+        job, created = self._reserve_pipeline(
+            "run", params, fingerprint=fingerprint, reuse_completed=request.dry_run
+        )
+        if not created:
+            return job
         cancel = threading.Event()
         self._cancel_events[job.id] = cancel
         self._pipeline_pool.submit(self._execute_run, job.id, request, cancel)
@@ -289,9 +459,13 @@ class JobManager:
         """Queue one firm-level batch run (Phase C); refuses while another
         pipeline run is active (same single-slot guard as start_run). The whole
         batch is ONE pipeline run / ONE workbook, with events laned by firm."""
-        if self.active_pipeline_job() is not None:
-            raise JobConflict("a pipeline run is already active")
-        job = self._create("multi_run", request.model_dump(mode="json"))
+        params = request.model_dump(mode="json")
+        fingerprint = _pipeline_fingerprint("multi_run", params, self.config) if request.dry_run else None
+        job, created = self._reserve_pipeline(
+            "multi_run", params, fingerprint=fingerprint, reuse_completed=request.dry_run
+        )
+        if not created:
+            return job
         cancel = threading.Event()
         self._cancel_events[job.id] = cancel
         self._pipeline_pool.submit(self._execute_multi_run, job.id, request, cancel)
@@ -346,8 +520,14 @@ class JobManager:
             self.emit_event(job_id, "done", {"status": status})
         except Exception as exc:  # noqa: BLE001 — job isolation
             logger.exception("utility job %s failed", job_id)
-            self._update(job_id, status="failed", finished_at=_now(), error=f"{type(exc).__name__}: {exc}")
-            self.emit_event(job_id, "done", {"status": "failed", "error": str(exc)})
+            diagnostic = _exception_diagnostic(exc, stage="utility", context={"job_id": job_id})
+            self._update(
+                job_id, status="failed", finished_at=_now(), error=diagnostic["summary"],
+                diagnostic_json=json.dumps(diagnostic, ensure_ascii=False, default=str),
+            )
+            self.emit_event(job_id, "done", {
+                "status": "failed", "error": diagnostic["summary"], "diagnostics": diagnostic,
+            })
         finally:
             self._cancel_events.pop(job_id, None)
 
@@ -360,19 +540,24 @@ class JobManager:
         run_dir = None if request.dry_run else Path(self.config.output_dir) / run_id
         self._update(job_id, run_id=run_id)
 
-        control = RunControl(
-            on_event=lambda event, fields: self.emit_event(job_id, event, dict(fields)),
-            cancel_event=cancel,
-        )
+        last_context: dict[str, object] = {"job_id": job_id}
+
+        def on_event(event: str, fields: dict) -> None:
+            nonlocal last_context
+            last_context = _safe_event_context(event, dict(fields))
+            self.emit_event(job_id, event, dict(fields))
+
+        control = RunControl(on_event=on_event, cancel_event=cancel)
         bridge = _JobLogBridge(self, job_id, run_dir)
         pv_logger = logging.getLogger("pv_extractor")
         pv_logger.addHandler(bridge)
         try:
             llm = request.llm
+            run_config, llm_args = _effective_llm_config(self.config, llm)
             settings = resolve_settings(
-                self.config,
+                run_config,
                 no_llm=not llm.enabled,
-                mode=llm.mode, model=llm.model, effort=llm.effort,
+                mode=llm_args["mode"], model=llm_args["model"], effort=llm_args["effort"],
                 budget=llm.budget_usd, force=llm.force_llm,
                 force_assist=llm.force_llm_assist, allow_fable=llm.allow_fable,
             )
@@ -382,10 +567,10 @@ class JobManager:
             from pv_extractor.api import run_slots as _rs
 
             if _rs.needs_expansion(request.doc_type, request.doc_types, request.period, request.periods):
-                conn = db.open_db(self.config.db_path, self.config.pv_root)
+                conn = db.open_db(run_config.db_path, run_config.pv_root)
                 try:
                     slots = _rs.build_run_slots(
-                        conn, self.config,
+                        conn, run_config,
                         scope=request.scope, client=request.client, deal=request.deal,
                         exclude=exclude, doc_type=request.doc_type, doc_types=request.doc_types,
                         period=request.period, periods=request.periods,
@@ -394,13 +579,13 @@ class JobManager:
                 finally:
                     conn.close()
                 report = run_pipeline(
-                    self.config, scope=request.scope, period=request.period,
+                    run_config, scope=request.scope, period=request.period,
                     template=request.template, dry_run=request.dry_run, force=request.force,
                     now=now, llm_settings=settings, control=control, slots=slots,
                 )
             else:
                 report = run_pipeline(
-                    self.config,
+                    run_config,
                     scope=request.scope, period=request.period,
                     client=request.client, deal=request.deal, doc_type=request.doc_type,
                     restrict_to_client_sourced=request.restrict_to_client_sourced,
@@ -409,7 +594,7 @@ class JobManager:
                 )
             result = _report_summary(report, request)
             if not request.dry_run and report.run_dir is not None:
-                _write_run_summary(report, request, self.config, cancelled=cancel.is_set())
+                _write_run_summary(report, request, run_config, cancelled=cancel.is_set())
             status = "cancelled" if cancel.is_set() else "completed"
             self._update(
                 job_id, status=status, finished_at=_now(),
@@ -418,8 +603,14 @@ class JobManager:
             self.emit_event(job_id, "done", {"status": status})
         except Exception as exc:  # noqa: BLE001 — job isolation
             logger.exception("run job %s failed", job_id)
-            self._update(job_id, status="failed", finished_at=_now(), error=f"{type(exc).__name__}: {exc}")
-            self.emit_event(job_id, "done", {"status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            diagnostic = _exception_diagnostic(exc, stage="pipeline", context=last_context)
+            self._update(
+                job_id, status="failed", finished_at=_now(), error=diagnostic["summary"],
+                diagnostic_json=json.dumps(diagnostic, ensure_ascii=False, default=str),
+            )
+            self.emit_event(job_id, "done", {
+                "status": "failed", "error": diagnostic["summary"], "diagnostics": diagnostic,
+            })
         finally:
             pv_logger.removeHandler(bridge)
             self._cancel_events.pop(job_id, None)
@@ -439,38 +630,43 @@ class JobManager:
         run_dir = None if request.dry_run else Path(self.config.output_dir) / run_id
         self._update(job_id, run_id=run_id)
 
-        control = RunControl(
-            on_event=lambda event, fields: self.emit_event(job_id, event, dict(fields)),
-            cancel_event=cancel,
-        )
+        last_context: dict[str, object] = {"job_id": job_id}
+
+        def on_event(event: str, fields: dict) -> None:
+            nonlocal last_context
+            last_context = _safe_event_context(event, dict(fields))
+            self.emit_event(job_id, event, dict(fields))
+
+        control = RunControl(on_event=on_event, cancel_event=cancel)
         bridge = _JobLogBridge(self, job_id, run_dir)
         pv_logger = logging.getLogger("pv_extractor")
         pv_logger.addHandler(bridge)
         try:
-            conn = db.open_db(self.config.db_path, self.config.pv_root)
+            llm = request.llm
+            run_config, llm_args = _effective_llm_config(self.config, llm)
+            conn = db.open_db(run_config.db_path, run_config.pv_root)
             try:
-                slots = multi_search_service.expand_slots(conn, self.config, request)
+                slots = multi_search_service.expand_slots(conn, run_config, request)
             finally:
                 conn.close()
-            llm = request.llm
             settings = resolve_settings(
-                self.config,
+                run_config,
                 no_llm=not llm.enabled,
-                mode=llm.mode, model=llm.model, effort=llm.effort,
+                mode=llm_args["mode"], model=llm_args["model"], effort=llm_args["effort"],
                 budget=llm.budget_usd, force=llm.force_llm,
                 force_assist=llm.force_llm_assist, allow_fable=llm.allow_fable,
             )
             # The slots path ignores scope/period/client/deal/doc_type for
             # pairing (it pairs off `slots`); pass benign placeholders.
             report = run_pipeline(
-                self.config,
+                run_config,
                 scope="all", period="",
                 template=request.template, dry_run=request.dry_run, force=request.force,
                 now=now, llm_settings=settings, control=control, slots=slots,
             )
             result = _multi_report_summary(report, request, len(slots))
             if not request.dry_run and report.run_dir is not None:
-                _write_multi_run_summary(report, request, self.config, len(slots), cancelled=cancel.is_set())
+                _write_multi_run_summary(report, request, run_config, len(slots), cancelled=cancel.is_set())
             status = "cancelled" if cancel.is_set() else "completed"
             self._update(
                 job_id, status=status, finished_at=_now(),
@@ -479,8 +675,14 @@ class JobManager:
             self.emit_event(job_id, "done", {"status": status})
         except Exception as exc:  # noqa: BLE001 — job isolation
             logger.exception("multi-run job %s failed", job_id)
-            self._update(job_id, status="failed", finished_at=_now(), error=f"{type(exc).__name__}: {exc}")
-            self.emit_event(job_id, "done", {"status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+            diagnostic = _exception_diagnostic(exc, stage="pipeline", context=last_context)
+            self._update(
+                job_id, status="failed", finished_at=_now(), error=diagnostic["summary"],
+                diagnostic_json=json.dumps(diagnostic, ensure_ascii=False, default=str),
+            )
+            self.emit_event(job_id, "done", {
+                "status": "failed", "error": diagnostic["summary"], "diagnostics": diagnostic,
+            })
         finally:
             pv_logger.removeHandler(bridge)
             self._cancel_events.pop(job_id, None)
@@ -488,6 +690,22 @@ class JobManager:
 
 class JobConflict(RuntimeError):
     """A pipeline run is already active (single-slot executor)."""
+
+    def __init__(self, active_job: JobInfo) -> None:
+        self.active_job = active_job
+        super().__init__("a pipeline run is already active")
+
+    def detail(self) -> dict:
+        return {
+            "code": "active_pipeline_job",
+            "message": str(self),
+            "active_job": {
+                "id": self.active_job.id,
+                "kind": self.active_job.kind,
+                "status": self.active_job.status,
+                "created_at": self.active_job.created_at,
+            },
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +771,7 @@ def _report_summary(report: RunReport, request: RunRequest) -> dict:
             ),
             "detail": llm.detail if llm else "",
         },
+        "diagnostics": report.diagnostics,
     }
 
 

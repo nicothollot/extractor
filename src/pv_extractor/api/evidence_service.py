@@ -15,6 +15,7 @@ import pymupdf
 
 from pv_extractor.api import runs_service
 from pv_extractor.config import Config
+from pv_extractor.evidence import clamp_bbox
 from pv_extractor.io_guard import guarded_open_write, open_read
 
 _HIGHLIGHT_STROKE = (0.85, 0.42, 0.04)  # restrained amber, not a neon marker
@@ -61,14 +62,16 @@ def render_page(
             raise EvidenceError(f"page {page_number} out of range (1..{doc.page_count})")
         page = doc[page_number - 1]
         if bbox is not None:
-            rect = pymupdf.Rect(*bbox)
-            shape = page.new_shape()
-            shape.draw_rect(rect)
-            shape.finish(
-                color=_HIGHLIGHT_STROKE, width=1.5,
-                fill=_HIGHLIGHT_FILL, fill_opacity=0.25,
-            )
-            shape.commit()
+            safe_bbox = clamp_bbox(bbox, page.rect.width, page.rect.height)
+            if safe_bbox is not None:
+                rect = pymupdf.Rect(*safe_bbox)
+                shape = page.new_shape()
+                shape.draw_rect(rect)
+                shape.finish(
+                    color=_HIGHLIGHT_STROKE, width=1.5,
+                    fill=_HIGHLIGHT_FILL, fill_opacity=0.25,
+                )
+                shape.commit()
         zoom = dpi / 72.0
         pixmap = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
         png_bytes = pixmap.tobytes("png")

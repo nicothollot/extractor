@@ -222,7 +222,9 @@ def test_accell_multiples_golden(golden) -> None:
     _assert_confidence_bands(memo)
     assert memo.assets[0].qa_status is QaStatus.qa_pass
     assert memo.assets[0].flags == []
-    assert memo.escalation is not None and memo.escalation.fields == []
+    assert memo.escalation is not None
+    assert memo.escalation.fields
+    assert {f.reason for f in memo.escalation.fields} <= {"primary_catalog", "below_confidence", "required_empty"}
     # conflicting-candidate audit trail: derived field keeps the extracted loser
     nav_change = next(h for h in memo.assets[0].hits if h.field == "NAV Change Abs ($M)")
     assert nav_change.conflicts and nav_change.conflicts[0].value == 5.3
@@ -579,7 +581,8 @@ def test_andover_scanned_ocr_golden(golden) -> None:
     assert memo.escalation is not None
     escalated = {field.field for field in memo.escalation.fields}
     assert {"Cap Rate Selected %", "Fund Share Equity Value ($M)", "MOIC"} <= escalated
-    assert all(f.reason == "below_confidence" for f in memo.escalation.fields)
+    assert any(f.reason == "below_confidence" for f in memo.escalation.fields)
+    assert {f.reason for f in memo.escalation.fields} <= {"primary_catalog", "below_confidence", "required_empty"}
     assert memo.escalation.status == "llm_fallback_disabled"
     assert memo.escalation.page_band_map  # Phase 3 reuses the page routing
 

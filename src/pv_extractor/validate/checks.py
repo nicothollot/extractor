@@ -42,10 +42,10 @@ def check_hits(
 
         if field.dtype in _NUMERIC_DTYPES:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                flags.append(_flag(hit, f"expected a {field.dtype} value, got {value!r}"))
+                flags.append(_flag(hit, f"expected a {field.dtype} value, got {value!r}", "type_mismatch"))
                 continue
         if field.dtype == "boolean" and not isinstance(value, bool):
-            flags.append(_flag(hit, f"expected a boolean, got {value!r}"))
+            flags.append(_flag(hit, f"expected a boolean, got {value!r}", "type_mismatch"))
             continue
 
         if field.dtype == "percent" and isinstance(value, (int, float)):
@@ -55,15 +55,15 @@ def check_hits(
                 low = override.get("min", low)
                 high = override.get("max", high)
             if not low <= float(value) <= high:
-                flags.append(_flag(hit, f"{value} % outside [{low}, {high}]"))
+                flags.append(_flag(hit, f"{value} % outside [{low}, {high}]", "percent_range"))
             if "weight" in hit.field.lower() and float(value) < 0:
-                flags.append(_flag(hit, f"weight {value} % is negative"))
+                flags.append(_flag(hit, f"weight {value} % is negative", "negative_weight"))
 
         if field.dtype == "date" and isinstance(value, str):
             try:
                 parsed = date.fromisoformat(value)
             except ValueError:
-                flags.append(_flag(hit, f"unparseable date {value!r}"))
+                flags.append(_flag(hit, f"unparseable date {value!r}", "date_parse"))
                 continue
             year_min = validation.date_year_min
             latest = (
@@ -77,19 +77,22 @@ def check_hits(
                         hit,
                         f"date {parsed.isoformat()} outside [{year_min}, "
                         f"as-of + {validation.date_max_years_after_asof}y]",
+                        "date_range",
                     )
                 )
 
         if field.controlled_vocab and isinstance(value, str) and value not in field.controlled_vocab:
-            flags.append(_flag(hit, f"{value!r} is not in the controlled vocabulary"))
+            flags.append(_flag(hit, f"{value!r} is not in the controlled vocabulary", "controlled_vocab"))
 
     return flags
 
 
-def _flag(hit: FieldHit, detail: str) -> ReviewFlag:
+def _flag(hit: FieldHit, detail: str, code: str) -> ReviewFlag:
     return ReviewFlag(
         category="range",
         description=f"{hit.field}: {detail}",
         severity=FlagSeverity.warning,
         field=hit.field,
+        origin="validation",
+        code=code,
     )

@@ -2,8 +2,9 @@ import { AnimatePresence, motion } from "framer-motion";
 import { type MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Button, Card, CardHeader, ConfidenceBar, EmptyState, ErrorState, Field, MethodChip, Panel, SkeletonRows, StatusChip, inputCls } from "../components/ui";
-import { PageWords, ReviewItem, RunResult, evidenceUrl, get, post } from "../lib/api";
+import { MemoIssue, PageWords, ReviewItem, ReviewQueueResponse, RunResult, evidenceUrl, get, post } from "../lib/api";
 import { useLoad } from "../lib/hooks";
+import { bboxToPercentStyle, memoIssuesForSelected, overlayForPage, selectedHighlight } from "../lib/reviewEvidence";
 import { useStickyState } from "../lib/uiState";
 
 export default function ReviewQueue() {
@@ -56,7 +57,7 @@ export default function ReviewQueue() {
 }
 
 function QueueForRun({ runId }: { runId: string }) {
-  const queue = useLoad<{ items: ReviewItem[]; confidence_threshold: number }>(`/api/runs/${runId}/review`);
+  const queue = useLoad<ReviewQueueResponse>(`/api/runs/${runId}/review`);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showResolved, setShowResolved] = useStickyState("review.showResolved", false);
   const [categoryFilter, setCategoryFilter] = useStickyState<string>("review.categoryFilter", "");
@@ -87,6 +88,11 @@ function QueueForRun({ runId }: { runId: string }) {
 
   const selected = items.find((i) => i.id === selectedId) ?? items[0] ?? null;
   const selectedIndex = selected ? items.indexOf(selected) : -1;
+  const highlight = useMemo(() => selectedHighlight(selected), [selected]);
+  const selectedMemoIssues = useMemo(
+    () => memoIssuesForSelected(queue.data?.memo_issues ?? [], selected),
+    [queue.data?.memo_issues, selected],
+  );
 
   useEffect(() => {
     if (selected && selectedId !== selected.id) setSelectedId(selected.id);
@@ -250,6 +256,10 @@ function QueueForRun({ runId }: { runId: string }) {
       )}
 
       {items.length > 0 && (
+        <>
+        {selectedMemoIssues.length > 0 && (
+          <MemoIssueSummary issues={selectedMemoIssues} />
+        )}
         <div className="grid grid-cols-[minmax(380px,1fr)_minmax(480px,1.2fr)] gap-4 items-start">
           <Card>
             <div ref={listRef} className="max-h-[70vh] overflow-auto">
@@ -300,18 +310,6 @@ function QueueForRun({ runId }: { runId: string }) {
                 right={<StatusChip value={selected.qa_status || selected.severity} />}
               />
               <div className="px-4 pb-4 space-y-3">
-                {selected.qa_status === "qa_fail" && selected.qa_fail_reasons.length > 0 && (
-                  <div className="rounded border border-err/40 bg-err-soft px-3 py-2">
-                    <p className="text-[11px] uppercase tracking-wide text-err font-semibold">
-                      Why this memo failed QA
-                    </p>
-                    <ul className="mt-1 text-[12.5px] text-ink-800 list-disc list-inside space-y-0.5">
-                      {selected.qa_fail_reasons.map((reason, i) => (
-                        <li key={i}>{reason}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
                 <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-[13px]">
                   <div>
                     <p className="text-[11px] uppercase tracking-wide text-ink-400">Extracted value</p>
@@ -322,9 +320,10 @@ function QueueForRun({ runId }: { runId: string }) {
                   </div>
                   <div>
                     <p className="text-[11px] uppercase tracking-wide text-ink-400">Method · confidence</p>
-                    <p className="flex items-center gap-2">
+                    <p className="flex items-center gap-2 flex-wrap">
                       <MethodChip method={selected.method} />
                       <ConfidenceBar value={selected.confidence} />
+                      <GroundingChip item={selected} />
                     </p>
                   </div>
                   <div className="col-span-2">
@@ -338,6 +337,9 @@ function QueueForRun({ runId }: { runId: string }) {
                     <p className="font-mono text-[12px] bg-surface border border-line rounded px-2 py-1.5 mt-1 whitespace-pre-wrap break-words">
                       {selected.evidence || selected.raw_text || "—"}
                     </p>
+                    {selected.grounding_status === "page_only" && (
+                      <p className="text-[11.5px] text-warn mt-1">{selected.grounding_reason || "page evidence available, exact box unavailable"}</p>
+                    )}
                   </div>
                   {selected.conflicts.length > 0 && (
                     <div className="col-span-2">
@@ -353,11 +355,11 @@ function QueueForRun({ runId }: { runId: string }) {
                   )}
                 </div>
 
-                {selected.has_page_image && selected.page && (
+                {selected.has_page_image && highlight.highlightPage && (
                   <div>
                     <div className="flex items-center justify-between mb-1">
                       <p className="text-[11px] uppercase tracking-wide text-ink-400">
-                        Source page {selected.page} {selected.bbox ? "(evidence region highlighted)" : ""}
+                        Source page {highlight.highlightPage} {highlight.highlightBbox ? "(evidence region highlighted)" : ""}
                       </p>
                       {selected.reader === "pdf" && selected.source_page_count > 0 && (
                         <button
@@ -369,14 +371,17 @@ function QueueForRun({ runId }: { runId: string }) {
                         </button>
                       )}
                     </div>
-                    <div className="border border-line rounded overflow-auto max-h-[45vh] bg-ink-100">
-                      <img
-                        src={evidenceUrl(selected.run_id, selected.memo_id, selected.page, selected.bbox)}
-                        alt={`page ${selected.page} of ${selected.source_filename}`}
-                        className="w-full"
-                        loading="lazy"
-                      />
-                    </div>
+                    <EvidencePageImage
+                      runId={selected.run_id}
+                      memoId={selected.memo_id}
+                      fileName={selected.source_filename}
+                      page={highlight.highlightPage}
+                      bbox={highlight.highlightBbox}
+                      className="max-h-[45vh]"
+                    />
+                    {highlight.fallbackMessage && (
+                      <p className="text-[11.5px] text-warn mt-1">{highlight.fallbackMessage}</p>
+                    )}
                   </div>
                 )}
                 {!selected.has_page_image && selected.reader === "pdf" && selected.source_page_count > 0 && (
@@ -461,6 +466,7 @@ function QueueForRun({ runId }: { runId: string }) {
             </Card>
           )}
         </div>
+        </>
       )}
 
       {viewerOpen && selected && (
@@ -469,7 +475,10 @@ function QueueForRun({ runId }: { runId: string }) {
           memoId={selected.memo_id}
           fileName={selected.source_filename}
           pageCount={selected.source_page_count}
-          startPage={selected.page ?? 1}
+          startPage={highlight.highlightPage ?? 1}
+          highlightPage={highlight.highlightPage}
+          highlightBbox={highlight.highlightBbox}
+          evidenceMeta={highlight}
           onClose={() => setViewerOpen(false)}
         />
       )}
@@ -482,6 +491,98 @@ function QueueForRun({ runId }: { runId: string }) {
         />
       )}
     </Panel>
+  );
+}
+
+function MemoIssueSummary({ issues }: { issues: MemoIssue[] }) {
+  const descriptions = issues.flatMap((issue) => issue.descriptions);
+  return (
+    <div className="rounded border border-err/40 bg-err-soft px-3 py-2">
+      <p className="text-[11px] uppercase tracking-wide text-err font-semibold">Memo QA summary</p>
+      <ul className="mt-1 text-[12.5px] text-ink-800 list-disc list-inside space-y-0.5">
+        {descriptions.map((reason, i) => (
+          <li key={`${reason}-${i}`}>{reason}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function GroundingChip({ item }: { item: ReviewItem }) {
+  const label =
+    item.grounding_status === "box"
+      ? "grounded box"
+      : item.grounding_status === "page_only"
+        ? "page only"
+        : "no grounding";
+  const title =
+    item.evidence_ref?.match_method || item.grounding_reason
+      ? `${item.evidence_ref?.match_method ?? "page_only"}${item.evidence_ref?.match_score !== null && item.evidence_ref?.match_score !== undefined ? ` · ${(item.evidence_ref.match_score * 100).toFixed(0)}%` : ""}${item.grounding_reason ? ` · ${item.grounding_reason}` : ""}`
+      : undefined;
+  return (
+    <span
+      title={title}
+      className={`text-[10.5px] uppercase tracking-wide px-1.5 py-0.5 rounded border ${
+        item.grounding_status === "box"
+          ? "border-ok/30 text-ok bg-ok/10"
+          : item.grounding_status === "page_only"
+            ? "border-warn/40 text-warn bg-warn/10"
+            : "border-line text-ink-400 bg-surface"
+      }`}
+    >
+      {label}
+    </span>
+  );
+}
+
+function EvidencePageImage({
+  runId,
+  memoId,
+  fileName,
+  page,
+  bbox,
+  className = "",
+}: {
+  runId: string;
+  memoId: string;
+  fileName: string;
+  page: number;
+  bbox: number[] | null;
+  className?: string;
+}) {
+  const [pageInfo, setPageInfo] = useState<PageWords | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    setPageInfo(null);
+    get<PageWords>(`/api/runs/${runId}/page-words/${memoId}?page=${page}`)
+      .then((info) => live && setPageInfo(info))
+      .catch(() => live && setPageInfo(null));
+    return () => {
+      live = false;
+    };
+  }, [runId, memoId, page]);
+
+  const style = pageInfo ? bboxToPercentStyle(bbox, { width: pageInfo.width, height: pageInfo.height }) : null;
+
+  return (
+    <div className={`border border-line rounded overflow-auto bg-ink-100 ${className}`}>
+      <div className="relative inline-block min-w-full">
+        <img
+          src={evidenceUrl(runId, memoId, page, null)}
+          alt={`page ${page} of ${fileName}`}
+          className="w-full block"
+          loading="lazy"
+        />
+        {style && (
+          <div
+            data-testid="selected-evidence-highlight"
+            className="absolute border-2 border-[var(--hl-blue)] bg-[var(--hl-blue)]/20 pointer-events-none"
+            style={style}
+          />
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -760,6 +861,9 @@ function FullDocViewer({
   fileName,
   pageCount,
   startPage,
+  highlightPage,
+  highlightBbox,
+  evidenceMeta,
   onClose,
 }: {
   runId: string;
@@ -767,6 +871,9 @@ function FullDocViewer({
   fileName: string;
   pageCount: number;
   startPage: number;
+  highlightPage: number | null;
+  highlightBbox: number[] | null;
+  evidenceMeta: ReturnType<typeof selectedHighlight>;
   onClose: () => void;
 }) {
   const [page, setPage] = useState(Math.min(Math.max(1, startPage), pageCount));
@@ -774,6 +881,12 @@ function FullDocViewer({
     (delta: number) => setPage((p) => Math.min(pageCount, Math.max(1, p + delta))),
     [pageCount],
   );
+
+  useEffect(() => {
+    if (highlightPage !== null) {
+      setPage(Math.min(Math.max(1, highlightPage), pageCount));
+    }
+  }, [highlightPage, pageCount]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -823,16 +936,22 @@ function FullDocViewer({
           </div>
         </div>
         <div className="flex-1 overflow-auto bg-ink-100 min-h-[300px] flex justify-center">
-          <img
+          <EvidencePageImage
             key={page}
-            src={evidenceUrl(runId, memoId, page, null)}
-            alt={`page ${page} of ${fileName}`}
-            className="max-w-full self-start"
+            runId={runId}
+            memoId={memoId}
+            fileName={fileName}
+            page={page}
+            bbox={overlayForPage(page, highlightPage, highlightBbox)}
+            className="border-0 rounded-none max-w-full self-start"
           />
         </div>
-        <p className="px-4 py-2 text-[10.5px] text-ink-400 border-t border-line">
-          ← / → to page · only the current page is loaded · Esc to close
-        </p>
+        <div className="px-4 py-2 text-[10.5px] text-ink-400 border-t border-line flex items-center justify-between gap-3">
+          <span>← / → to page · only the current page is loaded · Esc to close</span>
+          {evidenceMeta.fallbackMessage && page === evidenceMeta.highlightPage && (
+            <span className="text-warn">{evidenceMeta.fallbackMessage}</span>
+          )}
+        </div>
       </div>
     </div>
   );

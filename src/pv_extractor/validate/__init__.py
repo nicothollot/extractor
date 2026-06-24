@@ -27,6 +27,7 @@ from pv_extractor.models import (
 )
 from pv_extractor.indexer.periods import period_label
 from pv_extractor.validate.checks import check_hits
+from pv_extractor.validate.flags import deduplicate_review_flags
 from pv_extractor.validate.qoq import qoq_checks
 from pv_extractor.validate.rules import RuleSet, load_rules, run_rules
 
@@ -80,6 +81,7 @@ def validate_asset(
     prior_row: dict[str, object] | None,
     client: str | None = None,
 ) -> ValidatedAsset:
+    """Return a validated copy of `hits`; input hit/flag lists are not mutated."""
     validation = config.validation
     flags: list[ReviewFlag] = list(extraction_flags)
 
@@ -99,6 +101,8 @@ def validate_asset(
                 description="no valuation value found (none of the headline/methodology value fields populated)",
                 severity=FlagSeverity.hard_fail,
                 reviewer_attention=True,
+                origin="qa",
+                code="no_valuation_value",
             )
         )
     if (
@@ -117,8 +121,12 @@ def validate_asset(
                 ),
                 severity=FlagSeverity.hard_fail,
                 reviewer_attention=True,
+                origin="qa",
+                code="asof_mismatch",
             )
         )
+
+    flags = deduplicate_review_flags(flags)
 
     if any(flag.severity is FlagSeverity.hard_fail for flag in flags):
         qa_status = QaStatus.qa_fail

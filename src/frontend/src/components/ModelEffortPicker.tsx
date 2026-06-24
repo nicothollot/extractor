@@ -1,17 +1,16 @@
 import { ModelEntry } from "../lib/api";
 import { Field, inputCls } from "./ui";
 
-/** The five Claude Code reasoning-effort levels (model_registry.EFFORT_LEVELS). */
+/** The supported provider reasoning-effort levels (model_registry.EFFORT_LEVELS). */
 export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 const CUSTOM = "__custom__";
 
-/** Model + effort selector used everywhere a Claude model is chosen.
+/** Model + effort selector used everywhere a provider model is chosen.
  *
  *  The model list comes from the live catalog (GET /api/models, sourced from
- *  config/models.yaml). Aliases (sonnet/opus/haiku/fable) FLOAT to the newest
- *  tier as the local `claude` CLI updates — so picking "opus" automatically
- *  uses Opus 4.9 once it ships and the CLI is updated, no app change needed.
+ *  config/models.yaml). Aliases can float to the newest provider tier when the
+ *  local CLI supports that behavior.
  *  "Custom…" lets you type ANY model id (a pinned historical id, or a brand-new
  *  one the catalog hasn't been told about yet). Effort is always selectable. */
 export function ModelEffortPicker({

@@ -25,6 +25,7 @@ export function ModelPricingTable({
   const [saving, setSaving] = useState(false);
 
   const startEdit = (m: ModelEntry) => {
+    if (!m.pricing_per_mtok) return;
     setEditing(m.alias);
     setSaveError(null);
     setDraft({
@@ -57,7 +58,11 @@ export function ModelPricingTable({
     }
   };
 
-  const priceCell = (m: ModelEntry, key: keyof ModelEntry["pricing_per_mtok"]) =>
+  type PriceKey = "input" | "output" | "cache_hit" | "cache_write_5m" | "cache_write_1h";
+  const priceCell = (m: ModelEntry, key: PriceKey) =>
+    !m.pricing_per_mtok ? (
+      <span className="text-[12px] text-ink-400">unavailable</span>
+    ) :
     editing === m.alias ? (
       <input
         className={`${inputCls} w-20 text-right font-mono`}
@@ -83,6 +88,9 @@ export function ModelPricingTable({
             render: (m) => (
               <span>
                 <span className="font-medium text-ink-900">{m.display_name}</span>
+                {m.provider !== "claude" && (
+                  <span className="ml-2 text-[10px] uppercase tracking-wide text-ink-400">{m.provider}</span>
+                )}
                 {m.requires_explicit_enable && (
                   <span className="ml-2 text-[10px] uppercase tracking-wide text-err">explicit enable</span>
                 )}
@@ -109,11 +117,11 @@ export function ModelPricingTable({
             render: (m) => <span className="font-mono text-[12px]">{m.context_window.toLocaleString()}</span>,
             sortValue: (m) => m.context_window,
           },
-          { key: "in", header: "In $/1M", align: "right", render: (m) => priceCell(m, "input"), sortValue: (m) => m.pricing_per_mtok.input },
-          { key: "out", header: "Out $/1M", align: "right", render: (m) => priceCell(m, "output"), sortValue: (m) => m.pricing_per_mtok.output },
-          { key: "chit", header: "Cache read", align: "right", render: (m) => priceCell(m, "cache_hit"), sortValue: (m) => m.pricing_per_mtok.cache_hit },
-          { key: "cw5", header: "Cache write 5m", align: "right", render: (m) => priceCell(m, "cache_write_5m"), sortValue: (m) => m.pricing_per_mtok.cache_write_5m },
-          { key: "cw1h", header: "Cache write 1h", align: "right", render: (m) => priceCell(m, "cache_write_1h"), sortValue: (m) => m.pricing_per_mtok.cache_write_1h },
+          { key: "in", header: "In $/1M", align: "right", render: (m) => priceCell(m, "input"), sortValue: (m) => m.pricing_per_mtok?.input ?? -1 },
+          { key: "out", header: "Out $/1M", align: "right", render: (m) => priceCell(m, "output"), sortValue: (m) => m.pricing_per_mtok?.output ?? -1 },
+          { key: "chit", header: "Cache read", align: "right", render: (m) => priceCell(m, "cache_hit"), sortValue: (m) => m.pricing_per_mtok?.cache_hit ?? -1 },
+          { key: "cw5", header: "Cache write 5m", align: "right", render: (m) => priceCell(m, "cache_write_5m"), sortValue: (m) => m.pricing_per_mtok?.cache_write_5m ?? -1 },
+          { key: "cw1h", header: "Cache write 1h", align: "right", render: (m) => priceCell(m, "cache_write_1h"), sortValue: (m) => m.pricing_per_mtok?.cache_write_1h ?? -1 },
           {
             key: "reviewed",
             header: "Last reviewed",
@@ -133,7 +141,7 @@ export function ModelPricingTable({
                   </Button>
                 </span>
               ) : (
-                <Button kind="ghost" onClick={() => startEdit(m)}>
+                <Button kind="ghost" disabled={!m.pricing_per_mtok} onClick={() => startEdit(m)}>
                   Edit
                 </Button>
               ),

@@ -69,6 +69,35 @@ export default function RunProgress() {
   const active = job ? ["queued", "running", "cancelling"].includes(job.status) : true;
   const result = job?.result as RunResult | null;
   const llmEnabled = llmParams.enabled !== false;
+  const llmDiag = (result?.diagnostics?.llm ?? {}) as Record<string, unknown>;
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
+  const diagnosticText = useMemo(
+    () =>
+      JSON.stringify(
+        {
+          job: job
+            ? {
+                id: job.id,
+                kind: job.kind,
+                status: job.status,
+                run_id: job.run_id,
+                error: job.error,
+                diagnostics: job.diagnostics ?? null,
+              }
+            : null,
+          run: result?.diagnostics ?? null,
+        },
+        null,
+        2,
+      ),
+    [job, result?.diagnostics],
+  );
+
+  const copyDiagnostics = async () => {
+    await navigator.clipboard.writeText(diagnosticText);
+    setDiagnosticsCopied(true);
+    window.setTimeout(() => setDiagnosticsCopied(false), 2000);
+  };
 
   // Review is the natural last step: a completed non-dry run flows into the
   // review queue automatically (with an opt-out so the analyst can linger).
@@ -112,8 +141,20 @@ export default function RunProgress() {
       </div>
 
       {job?.error && (
-        <Card className="px-4 py-3">
-          <p className="text-[13px] text-err font-medium">{job.error}</p>
+        <Card className="px-4 py-3 space-y-2">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-[13px] text-err font-medium">{job.error}</p>
+              {job.diagnostics?.context && (
+                <p className="text-[12px] text-ink-600 mt-1">
+                  context <span className="font-mono">{JSON.stringify(job.diagnostics.context)}</span>
+                </p>
+              )}
+            </div>
+            <Button kind="secondary" onClick={copyDiagnostics}>
+              {diagnosticsCopied ? "Copied" : "Copy diagnostics"}
+            </Button>
+          </div>
         </Card>
       )}
 
@@ -205,6 +246,17 @@ export default function RunProgress() {
                     LLM: {result.llm.attempts} call(s), {result.llm.cache_hits} cached,{" "}
                     <span className="font-mono">${result.llm.total_cost_usd.toFixed(4)}</span>{" "}
                     <span className="uppercase text-[10px] text-ink-400">{result.llm.cost_source}</span>
+                  </p>
+                )}
+                {result.diagnostics && (
+                  <p className="text-ink-500">
+                    diagnostics: {String(llmDiag.task_count_by_wave ? JSON.stringify(llmDiag.task_count_by_wave) : "0")} tasks by wave
+                    {typeof llmDiag.selected_page_count === "number" && <> · {llmDiag.selected_page_count} page selections</>}
+                    {typeof llmDiag.timeouts === "number" && llmDiag.timeouts > 0 && <> · {llmDiag.timeouts} timeout(s)</>}
+                    {" "}
+                    <button className="underline" onClick={copyDiagnostics}>
+                      {diagnosticsCopied ? "copied" : "copy summary"}
+                    </button>
                   </p>
                 )}
               </>

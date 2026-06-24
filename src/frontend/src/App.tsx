@@ -32,7 +32,8 @@ function StartupCard() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
   const [failed, setFailed] = useState<string | null>(null);
-  const job = useJobPolling(jobId);
+  const jobPolling = useJobPolling(jobId);
+  const job = jobPolling.job;
 
   useEffect(() => {
     get<{ auto_update_on_start: boolean }>("/api/health")
@@ -62,6 +63,7 @@ function StartupCard() {
         <StatusChip value={status} />
         <span className="text-[12px] text-ink-500">
           {failed ?? (status === "completed" ? "CLI is up to date" : "running `claude update`…")}
+          {!failed && jobPolling.degraded ? ` (${jobPolling.lastError})` : ""}
         </span>
       </div>
     </div>
@@ -72,7 +74,7 @@ function StartupCard() {
     the analyst can tell indexing is still running from any tab. */
 function ScanIndicator() {
   const { scanJobId } = useScanJob();
-  const job = useJobPolling(scanJobId);
+  const { job } = useJobPolling(scanJobId);
   if (!scanJobId || !job || !["queued", "running", "cancelling"].includes(job.status)) return null;
   return (
     <span

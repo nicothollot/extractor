@@ -147,6 +147,7 @@ def _run_ocr(path: str | Path, content: DocumentContent, config: Config, result:
         page.text_char_count = len(ocr_result.text.strip())
         page.ocr_engine = ocr_result.engine
         page.ocr_mean_confidence = round(ocr_result.mean_confidence, 4)
+        page.words = ocr_result.words
 
 
 def _asset_scopes(content: DocumentContent) -> list[tuple[str | None, set[int]]]:

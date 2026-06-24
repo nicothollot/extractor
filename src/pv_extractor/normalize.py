@@ -12,6 +12,7 @@ as a trailing token without the dot, e.g.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from pv_extractor.models import VersionSignal
 
@@ -24,11 +25,71 @@ _FINAL_RE = re.compile(r"(?:^|[ _\-.(])(vf|final)(?:[ _\-.)]|$)", re.IGNORECASE)
 _VNUM_RE = re.compile(r"(?:^|[ _\-.(])v(\d{1,3})(?:[ _\-.)]|$)", re.IGNORECASE)
 _COPY_RE = re.compile(r"\((\d{3})\)\s*$")
 _DO_NOT_USE_RE = re.compile(r"do\s*not\s*use|superseded|\bold\b", re.IGNORECASE)
+_SPACE_RE = re.compile(r"\s+")
+_HYPHENATED_BREAK_RE = re.compile(r"(?<=\w)-\s+(?=\w)")
+_DIGIT_COMMA_RE = re.compile(r"(?<=\d),(?=\d)")
+_CURRENCY_SPACE_RE = re.compile(r"([$€£])\s+")
+_PERCENT_SPACE_RE = re.compile(r"\s+%")
+_EVIDENCE_TRANSLATE = str.maketrans(
+    {
+        "\u00a0": " ",
+        "\u1680": " ",
+        "\u2000": " ",
+        "\u2001": " ",
+        "\u2002": " ",
+        "\u2003": " ",
+        "\u2004": " ",
+        "\u2005": " ",
+        "\u2006": " ",
+        "\u2007": " ",
+        "\u2008": " ",
+        "\u2009": " ",
+        "\u200a": " ",
+        "\u202f": " ",
+        "\u205f": " ",
+        "\u3000": " ",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201a": "'",
+        "\u201b": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201e": '"',
+        "\ufb00": "ff",
+        "\ufb01": "fi",
+        "\ufb02": "fl",
+        "\ufb03": "ffi",
+        "\ufb04": "ffl",
+    }
+)
 
 
 def normalize_text(text: str) -> str:
     """Lowercase, non-alphanumerics to spaces, collapse runs, strip ends."""
     return _NON_ALNUM.sub(" ", text.lower()).strip()
+
+
+def normalize_evidence_text(text: str) -> str:
+    """Normalize memo/evidence text for quote alignment.
+
+    Unlike normalize_text, this preserves punctuation that carries financial
+    meaning while smoothing PDF/OCR artifacts such as Unicode spaces, dashes,
+    quotes, ligatures, line wrapping, thousands separators, and percent/currency
+    spacing.
+    """
+    text = unicodedata.normalize("NFKC", text or "").translate(_EVIDENCE_TRANSLATE)
+    text = _HYPHENATED_BREAK_RE.sub("", text)
+    text = _DIGIT_COMMA_RE.sub("", text)
+    text = _CURRENCY_SPACE_RE.sub(r"\1", text)
+    text = _PERCENT_SPACE_RE.sub("%", text)
+    text = text.casefold()
+    return _SPACE_RE.sub(" ", text).strip()
 
 
 def strip_extended_prefix(path: str) -> str:

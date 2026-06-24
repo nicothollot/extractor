@@ -3,9 +3,11 @@
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, detail: string) {
+  detail: unknown;
+  constructor(status: number, detail: string, rawDetail?: unknown) {
     super(detail);
     this.status = status;
+    this.detail = rawDetail ?? detail;
   }
 }
 
@@ -16,21 +18,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     let detail = res.statusText;
+    let rawDetail: unknown = detail;
     try {
       const body = await res.json();
       const d = body.detail ?? body;
+      rawDetail = d;
       // FastAPI validation errors carry detail as a list of objects — render
       // them as text, never as "[object Object]".
       detail = typeof d === "string" ? d : JSON.stringify(d);
     } catch {
       /* keep statusText */
     }
-    throw new ApiError(res.status, detail);
+    throw new ApiError(res.status, detail, rawDetail);
   }
   return res.json() as Promise<T>;
 }
 
-export const get = <T>(path: string) => request<T>(path);
+export const get = <T>(path: string, init?: RequestInit) => request<T>(path, init);
 export const post = <T>(path: string, body?: unknown) =>
   request<T>(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) });
 export const put = <T>(path: string, body: unknown) =>
@@ -50,7 +54,30 @@ export interface JobInfo {
   params: Record<string, unknown>;
   result: RunResult | Record<string, unknown> | null;
   error: string | null;
+  diagnostics?: JobDiagnostics | null;
   last_seq: number;
+}
+
+export interface JobDiagnostics {
+  summary?: string;
+  exception_type?: string;
+  stage?: string;
+  context?: Record<string, unknown>;
+  active_job?: JobConflictJob;
+  [key: string]: unknown;
+}
+
+export interface JobConflictJob {
+  id: string;
+  kind: string;
+  status: string;
+  created_at: string;
+}
+
+export interface JobConflictDetail {
+  code: "active_pipeline_job";
+  message: string;
+  active_job: JobConflictJob;
 }
 
 export interface JobEvent {
@@ -106,6 +133,7 @@ export interface RunResult {
   created_at?: string;
   workbook_path: string | null;
   llm: LlmSummary;
+  diagnostics?: Record<string, unknown>;
   source?: string;
   cancelled?: boolean;
 }
@@ -120,6 +148,38 @@ export interface IndexRow {
   headline_value: number | string | null;
   moic: number | string | null;
   qa_status: string;
+}
+
+export interface EvidenceRef {
+  source_id: string | null;
+  source_file: string | null;
+  display_page: number | null;
+  pdf_page_index: number | null;
+  quote: string;
+  raw_text: string;
+  bbox: number[] | null;
+  bbox_coordinate_system: "pdf_points_topleft_page_rect" | string;
+  match_method: "native_text" | "table_cell" | "ocr_word_alignment" | "manual_box" | "page_only";
+  match_score: number | null;
+  word_ids: string[];
+  span_ids: string[];
+  provenance: string;
+  provider: string | null;
+  extraction_method: string | null;
+  no_geometry_reason: string | null;
+}
+
+export interface MemoIssue {
+  id: string;
+  run_id: string;
+  memo_id: string;
+  source_filename: string;
+  descriptions: string[];
+  categories: string[];
+  severity: string;
+  reviewer_attention: boolean;
+  resolved: boolean;
+  resolution: Record<string, unknown> | null;
 }
 
 export interface ReviewItem {
@@ -141,6 +201,13 @@ export interface ReviewItem {
   method: string | null;
   confidence: number | null;
   evidence: string;
+  evidence_ref: EvidenceRef | null;
+  evidence_refs: EvidenceRef[];
+  grounding_status: "box" | "page_only" | "none" | string;
+  grounding_reason: string;
+  issue_code: string;
+  issue_descriptions: string[];
+  reviewer_comment: string | null;
   page: number | null;
   bbox: number[] | null;
   has_page_image: boolean;
@@ -156,6 +223,12 @@ export interface ReviewItem {
   resolution: Record<string, unknown> | null;
 }
 
+export interface ReviewQueueResponse {
+  items: ReviewItem[];
+  memo_issues: MemoIssue[];
+  confidence_threshold: number;
+}
+
 export interface PageWords {
   page: number;
   page_count: number;
@@ -165,6 +238,7 @@ export interface PageWords {
 }
 
 export interface ModelEntry {
+  provider: string;
   alias: string;
   id: string;
   display_name: string;
@@ -179,16 +253,32 @@ export interface ModelEntry {
     cache_hit: number;
     cache_write_5m: number;
     cache_write_1h: number;
+  } | null;
+  extraction_profile?: {
+    default_shape: "adaptive" | "deal" | "document";
+    deal_pass_max_input_tokens: number;
+    deal_pass_max_documents: number;
+    deal_pass_max_image_pages: number;
+    deal_pass_max_fields: number;
+    oversized_target_fields: number;
+    max_parallel_document_calls: number;
   };
 }
 
 export interface ModelsResponse {
   last_reviewed: string;
   models_path: string;
+  provider: string;
   models: ModelEntry[];
+  all_models: ModelEntry[];
   llm: {
     enabled: boolean;
+    provider: string;
+    routing_mode?: string;
     mode: string;
+    single_model_provider?: string;
+    single_model_model?: string;
+    single_model_effort?: string;
     manual_model: string;
     manual_effort: string;
     allow_fable: boolean;
@@ -227,6 +317,19 @@ export interface PreflightEstimate {
     first_tier: string;
     first_tier_usd: number;
     ladder_usd: number;
+    documents?: number;
+    pages?: number;
+    image_pages?: number;
+    fields?: number;
+    estimated_input_tokens?: number;
+    provider?: string;
+    model?: string;
+    effort?: string;
+    execution_shape?: string;
+    expected_primary_calls?: number;
+    repair_policy?: string;
+    max_repair_calls?: number;
+    reason?: string;
   }[];
   assumptions: Record<string, unknown>;
 }
@@ -304,9 +407,13 @@ export interface SelectionResponse {
    multi-search /multi-search/run request. */
 export interface LlmRunOptions {
   enabled: boolean;
+  routing_mode?: string | null;
   mode: string | null;
   model: string | null;
   effort: string | null;
+  single_model?: { provider?: string; model?: string; effort?: string } | null;
+  deal_overrides?: Record<string, unknown>[];
+  repair_policy?: "never" | "core_only" | null;
   budget_usd: number | null;
   force_llm_assist?: boolean;
 }
@@ -412,11 +519,17 @@ export interface ConfigResponse {
   output_dir: string;
   db_path: string;
   claude_code: { command: string; command_args: string[]; auto_update_on_start: boolean; default_timeout_seconds: number; allow_cli_usage: boolean };
+  codex_cli: { command: string; command_args: string[]; default_timeout_seconds: number; model: string | null; reasoning_effort: string; debug_capture_raw_response: boolean };
   first_run: { install_missing_deps: boolean };
   gui: { host: string; port: number; open_browser: boolean; evidence_dpi: number; frontend_dist: string | null };
   llm: Record<string, unknown> & {
     enabled: boolean;
+    provider: string;
+    routing_mode?: string;
     mode: string;
+    single_model_provider?: string;
+    single_model_model?: string;
+    single_model_effort?: string;
     manual_model: string;
     manual_effort: string;
     allow_fable: boolean;

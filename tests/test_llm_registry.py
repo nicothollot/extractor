@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 
 from pv_extractor.config import LlmAutoRoutingConfig
-from pv_extractor.llm.model_registry import ModelRegistry, UnknownModelError
+from pv_extractor.llm.model_registry import ExtractionPlanMetrics, ModelRegistry, UnknownModelError
 from pv_extractor.models import LlmUsage
 
 
@@ -25,12 +25,12 @@ AUTO = LlmAutoRoutingConfig()
 
 def test_seed_menu_aliases_and_ids(registry):
     by_alias = {e.alias: e for e in registry.entries}
-    assert set(by_alias) == {"fable", "opus", "sonnet", "haiku"}
+    assert {"fable", "opus", "sonnet", "haiku", "provider-default"} <= set(by_alias)
     assert by_alias["fable"].id == "claude-fable-5"
     assert by_alias["opus"].id == "claude-opus-4-8"
     assert by_alias["sonnet"].id == "claude-sonnet-4-6"
     assert by_alias["haiku"].id == "claude-haiku-4-5"
-    assert all(e.latest_alias and not e.pinned for e in registry.entries)
+    assert all(e.latest_alias and not e.pinned for e in registry.entries if e.provider == "claude")
     assert by_alias["fable"].requires_explicit_enable is True
     assert not any(
         e.requires_explicit_enable for e in registry.entries if e.alias != "fable"
@@ -46,6 +46,8 @@ def test_seed_pricing(registry):
         "haiku": (1.0, 5.0, 0.1, 1.25, 2.0),
     }
     for entry in registry.entries:
+        if entry.pricing_per_mtok is None:
+            continue
         p = entry.pricing_per_mtok
         assert (p.input, p.output, p.cache_hit, p.cache_write_5m, p.cache_write_1h) == expected[entry.alias]
 
@@ -73,24 +75,28 @@ def test_cli_model_arg_floats_unless_pinned(registry):
 # ---------------------------------------------------------------------------
 
 
-def test_auto_normal_extraction_routes_sonnet_then_opus(registry):
+def test_auto_normal_extraction_routes_single_sonnet_primary(registry):
     tiers = registry.extraction_tiers(mode="auto", auto=AUTO)
-    assert [(t.entry.alias, t.effort, t.reason) for t in tiers] == [
-        ("sonnet", "medium", "extraction"),
-        ("opus", "high", "retry"),
-    ]
+    assert [(t.entry.alias, t.effort, t.reason) for t in tiers] == [("sonnet", "medium", "auto")]
 
 
-def test_auto_ocr_hostile_goes_straight_to_opus_with_effort_bump(registry):
-    tiers = registry.extraction_tiers(mode="auto", auto=AUTO, ocr_hostile=True)
-    assert [(t.entry.alias, t.effort) for t in tiers] == [("opus", "high"), ("opus", "xhigh")]
+def test_auto_large_image_heavy_deal_uses_opus_whole_deal(registry):
+    plan = registry.resolve_extraction_plan(
+        routing_mode="auto",
+        metrics=ExtractionPlanMetrics(
+            estimated_input_tokens=220_000, documents=3, image_pages=40, fields=203
+        ),
+        auto=AUTO,
+    )
+    assert (plan.model, plan.effort, plan.execution_shape, plan.expected_primary_calls) == (
+        "opus", "high", "deal", 1,
+    )
 
 
 def test_auto_never_selects_fable_without_opt_in(registry):
     tiers = registry.extraction_tiers(mode="auto", auto=AUTO, allow_fable=False)
     assert all(t.entry.alias != "fable" for t in tiers)
-    tiers = registry.extraction_tiers(mode="auto", auto=AUTO, allow_fable=True)
-    assert tiers[-1].entry.alias == "fable" and tiers[-1].effort == AUTO.fable_effort
+    assert len(tiers) == 1
 
 
 def test_auto_rejects_explicit_only_model_as_routine_tier(registry):
@@ -103,7 +109,7 @@ def test_manual_forces_single_pass(registry):
     tiers = registry.extraction_tiers(
         mode="manual", auto=AUTO, manual_model="sonnet", manual_effort="low"
     )
-    assert [(t.entry.alias, t.effort, t.reason) for t in tiers] == [("sonnet", "low", "manual")]
+    assert [(t.entry.alias, t.effort, t.reason) for t in tiers] == [("sonnet", "low", "single_model")]
 
 
 def test_manual_sonnet_stays_sonnet_even_for_ocr_hostile(registry):
@@ -124,6 +130,25 @@ def test_manual_naming_fable_is_explicit_enablement(registry):
     assert [(t.entry.alias, t.effort) for t in tiers] == [("fable", "high")]
 
 
+def test_sonnet_profile_can_choose_deal_or_document_shape(registry):
+    small = registry.resolve_extraction_plan(
+        routing_mode="single_model",
+        metrics=ExtractionPlanMetrics(estimated_input_tokens=84_500, documents=2, image_pages=4, fields=203),
+        auto=AUTO,
+        manual_model="sonnet",
+        manual_effort="medium",
+    )
+    assert small.execution_shape == "deal"
+    larger = registry.resolve_extraction_plan(
+        routing_mode="single_model",
+        metrics=ExtractionPlanMetrics(estimated_input_tokens=120_000, documents=3, image_pages=4, fields=203),
+        auto=AUTO,
+        manual_model="sonnet",
+        manual_effort="medium",
+    )
+    assert larger.execution_shape == "document"
+
+
 def test_manual_unknown_model_and_bad_effort_raise(registry):
     with pytest.raises(UnknownModelError):
         registry.extraction_tiers(mode="manual", auto=AUTO, manual_model="nope")
@@ -131,6 +156,21 @@ def test_manual_unknown_model_and_bad_effort_raise(registry):
         registry.extraction_tiers(
             mode="manual", auto=AUTO, manual_model="sonnet", manual_effort="turbo"
         )
+
+
+def test_non_claude_provider_uses_cli_default_when_manual_model_is_claude_default(registry):
+    tiers = registry.extraction_tiers(
+        mode="manual",
+        auto=AUTO,
+        manual_model="sonnet",
+        manual_effort="high",
+        provider="codex",
+        provider_default_model=None,
+        provider_default_effort="high",
+    )
+    assert [(t.entry.provider, t.entry.alias, t.entry.id, t.effort) for t in tiers] == [
+        ("codex", "provider-default", "", "high")
+    ]
 
 
 def test_classification_tier_is_haiku(registry):

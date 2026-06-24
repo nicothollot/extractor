@@ -23,11 +23,14 @@ from dataclasses import dataclass, field as dc_field
 
 from rapidfuzz import fuzz
 
+from pv_extractor.evidence import resolve_quote_to_words
 from pv_extractor.config import ExtractionConfig
 from pv_extractor.extract import patterns
 from pv_extractor.extract.confidence import hit_confidence
 from pv_extractor.models import (
     ConflictingCandidate,
+    EvidenceMatchMethod,
+    EvidenceRef,
     FieldHit,
     FlagSeverity,
     PageContent,
@@ -357,6 +360,38 @@ def build_hit(
         from_table=winner.from_table,
         has_conflicts=has_conflicts,
     )
+    evidence_ref: EvidenceRef | None = None
+    legacy_bbox = winner.bbox
+    if winner.page is not None:
+        page_no = winner.page.page_number
+        match_method = (
+            EvidenceMatchMethod.ocr_word_alignment
+            if winner.page.ocr_engine
+            else EvidenceMatchMethod.table_cell if winner.from_table else EvidenceMatchMethod.native_text
+        )
+        resolution = resolve_quote_to_words(
+            quote=winner.evidence,
+            page_number=page_no,
+            words=winner.page.words,
+            extraction_method="deterministic",
+            match_method=match_method,
+            threshold=0.90 if winner.page.ocr_engine else 0.98,
+        )
+        evidence_ref = resolution.evidence_ref
+        if resolution.bbox is not None:
+            legacy_bbox = resolution.bbox
+        elif winner.bbox is not None:
+            evidence_ref = EvidenceRef(
+                display_page=page_no,
+                quote=winner.evidence,
+                raw_text=winner.raw_text,
+                bbox=winner.bbox,
+                match_method=EvidenceMatchMethod.table_cell,
+                match_score=confidence,
+                provenance="table_bbox_fallback",
+                extraction_method="deterministic",
+            )
+            legacy_bbox = winner.bbox
 
     conflicts: list[ConflictingCandidate] = []
     seen_keys = {_value_key(winner.value)}
@@ -393,10 +428,11 @@ def build_hit(
         value=winner.value,
         unit=winner.unit if winner.unit is not None else field.unit,
         page=winner.page.page_number if winner.page else None,
-        bbox=winner.bbox,
+        bbox=legacy_bbox,
         method="deterministic",
         confidence=confidence,
         evidence=winner.evidence,
+        evidence_ref=evidence_ref,
         confidence_components=components,
         conflicts=conflicts,
     )

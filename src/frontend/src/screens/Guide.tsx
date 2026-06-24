@@ -40,8 +40,8 @@ export default function Guide() {
           <b>Save changes</b>.
         </p>
         <p>
-          Optional: the <b>Claude Code</b> card configures the local LLM fallback. It needs the <code>claude</code> CLI
-          logged in once (<code>claude auth login</code>) — but every run also works with the LLM disabled; fields the
+          Optional: the <b>LLM provider</b> card configures local LLM assist. It uses a locally logged-in provider CLI,
+          but every run also works with the LLM disabled; fields the
           deterministic engine can&apos;t extract confidently simply stay as review flags.
         </p>
       </Step>
@@ -67,9 +67,8 @@ export default function Guide() {
         <p>
           <b>Browse</b> — choose from the deal folders found during the index scan (each with a confidence chip).{" "}
           <b>Search by name</b> — type a name for fuzzy matches with their full folder path. <b>LLM assist</b> — a local
-          Claude Code session maps the client folder and proposes its deals; pick the <b>model and effort</b> (aliases
-          like <code>sonnet</code>/<code>opus</code> float to the newest tier as your <code>claude</code> updates, or
-          type a custom model id). LLM-assisted results are <b>saved</b> — Browse shows them next time, and re-running
+          LLM session maps the client folder and proposes its deals; pick the <b>model and effort</b>. LLM-assisted
+          results are <b>saved</b> — Browse shows them next time, and re-running
           warns you that a saved discovery already exists.
         </p>
         <p>

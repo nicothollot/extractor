@@ -10,11 +10,17 @@ from pv_extractor.models import DocType, DocTypeSpec
 
 class LlmRunOptions(BaseModel):
     enabled: bool = True
-    mode: str | None = None  # auto | manual; None = config default
-    model: str | None = None  # alias/id; implies manual
+    routing_mode: str | None = None  # auto | per_deal | single_model
+    # Deprecated compatibility fields. mode=manual plus model/effort maps to
+    # routing_mode=single_model in the runtime settings resolver.
+    mode: str | None = None  # auto | manual | single_model; None = config default
+    model: str | None = None  # alias/id; implies single_model
     effort: str | None = None
+    single_model: dict | None = None
+    deal_overrides: list[dict] = Field(default_factory=list)
+    repair_policy: str | None = None  # never | core_only
     budget_usd: float | None = None
-    force_llm: bool = False  # bypass the Claude Code response cache
+    force_llm: bool = False  # bypass the local LLM response cache
     # force_llm_assist: use the LLM as the primary extractor — escalate every
     # empty extractable field, not just low-confidence / required ones (also
     # bypasses the deterministic result cache).
@@ -102,6 +108,7 @@ class JobInfo(BaseModel):
     params: dict = Field(default_factory=dict)
     result: dict | None = None
     error: str | None = None
+    diagnostics: dict | None = None
     last_seq: int = 0
 
 
@@ -199,7 +206,7 @@ class ScanRequest(BaseModel):
 
 class DealRefreshRequest(BaseModel):
     """Re-run smart deal discovery for one client, optionally with the
-    Claude Code assist pass (local CLI subprocess; no SDK, no API key)."""
+    existing local CLI LLM assist pass."""
 
     client: str
     llm: bool = False

@@ -30,7 +30,8 @@ from pv_extractor.config import Config
 from pv_extractor.extract.readers import OcrReader, reader_for_extension
 from pv_extractor.io_guard import guarded_open_write, open_read
 from pv_extractor.logging_setup import log_event
-from pv_extractor.models import EscalationField, PageClass, PageContent, TableData
+from pv_extractor.models import EscalationField, EvidenceWord, PageClass, PageContent, TableData
+from pv_extractor.normalize import normalize_evidence_text
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class MemoPayload:
     directory: Path
     pages: list[PayloadPage] = field(default_factory=list)
     page_texts: dict[int, str] = field(default_factory=dict)  # grounding text per page
+    page_words: dict[int, list[EvidenceWord]] = field(default_factory=dict)  # grounding geometry per page
     page_blocks: dict[int, str] = field(default_factory=dict)  # per-page prompt section
     dynamic_prompt: str = ""
     payload_hash: str = ""  # sha256 of the canonical manifest (incl. file hashes)
@@ -77,6 +79,61 @@ class MemoPayload:
     def scoped_image_count(self, pages: list[int]) -> int:
         wanted = set(pages)
         return sum(1 for p in self.pages if p.number in wanted and p.kind == "image")
+
+    def scoped_image_pages(self, pages: list[int]) -> list[PayloadPage]:
+        wanted = set(pages)
+        return [p for p in self.pages if p.number in wanted and p.kind == "image"]
+
+    def scoped_image_paths(self, pages: list[int]) -> list[Path]:
+        return [self.directory / p.rel_path for p in self.scoped_image_pages(pages)]
+
+    def selected_page_hashes(self, pages: list[int]) -> list[str]:
+        """Canonical page-scope hashes for LLM response caching.
+
+        Text pages use normalized page text so harmless PDF line wrapping or
+        Unicode spacing changes do not invalidate useful cache entries. Image
+        pages use the rendered image hash from the manifest.
+        """
+        page_meta = {p.number: p for p in self.pages}
+        hashes: list[str] = []
+        for number in sorted(set(pages)):
+            meta = page_meta.get(number)
+            if meta is None:
+                continue
+            if meta.kind == "image":
+                hashes.append(f"{number}:image:{meta.sha256}")
+                continue
+            text = normalize_evidence_text(self.page_texts.get(number, ""))
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            hashes.append(f"{number}:text:{digest}")
+        return hashes
+
+    def scoped_prompt_with_ocr_fallback(self, pages: list[int]) -> str:
+        """A scoped prompt where image blocks are replaced by local OCR text.
+
+        This is used only for providers whose CLI cannot attach images. Pages
+        with no OCR/text are still represented by the original block; the caller
+        is expected to fail explicitly rather than asking the model to infer
+        from an unread image.
+        """
+        blocks: list[str] = []
+        image_numbers = {p.number for p in self.scoped_image_pages(pages)}
+        for number in sorted(set(pages)):
+            block = self.page_blocks.get(number)
+            if not block:
+                continue
+            if number not in image_numbers:
+                blocks.append(block)
+                continue
+            text = (self.page_texts.get(number) or "").strip()
+            if not text:
+                blocks.append(block)
+                continue
+            heading = block.split("\n", 1)[0]
+            blocks.append(f"{heading} [OCR text fallback]\n{text}")
+        if not blocks:
+            return self.dynamic_prompt
+        return "== DOCUMENT PAGES ==\n\n" + "\n\n".join(blocks) + "\n"
 
 
 def select_pages(
@@ -187,6 +244,7 @@ def assemble_payload(
             for number, result in ocr.ocr_pdf_pages(file_path, scanned).items():
                 pages_by_number[number].text = result.text
                 pages_by_number[number].ocr_engine = result.engine
+                pages_by_number[number].words = result.words
                 ocr_conf[number] = result.mean_confidence
 
     pdf_bytes: bytes | None = None
@@ -224,6 +282,7 @@ def assemble_payload(
             )
             payload.image_count += 1
             payload.page_texts[number] = page.text  # OCR text (possibly empty)
+            payload.page_words[number] = page.words
             prompt_sections.append(
                 f"--- page {number} ({page.page_class.value}, image) ---\n"
                 f'This page is an image. View it with the Read tool: "{rel}"'
@@ -239,6 +298,7 @@ def assemble_payload(
                             rel_path=rel, sha256=digest)
             )
             payload.page_texts[number] = text_block
+            payload.page_words[number] = page.words
             prompt_sections.append(f"--- page {number} ({page.page_class.value}) ---\n{text_block}")
 
     # OCR-hostile only if a page is ACTUALLY sent as an image (a scanned page
@@ -284,7 +344,7 @@ def assemble_deal_payload(
     """Re-read EVERY document of one deal-period (read-only) into ONE payload.
 
     This backs the one-call-per-deal LLM pass: a deal's whole document set is
-    extracted in a SINGLE `claude -p` call. All documents' pages are concatenated
+    extracted in a single local provider call. All documents' pages are concatenated
     under a single GLOBAL page index (1..N) so quote-grounding still keys off
     `page` -> page_texts[page]; each block is labelled with its source document
     and that document's own page number so the model (and a reviewer) can tell
@@ -352,6 +412,7 @@ def assemble_deal_payload(
                 for number, result in ocr.ocr_pdf_pages(file_path, scanned).items():
                     pages_by_number[number].text = result.text
                     pages_by_number[number].ocr_engine = result.engine
+                    pages_by_number[number].words = result.words
                     ocr_conf[number] = result.mean_confidence
 
         pdf_bytes: bytes | None = None
@@ -386,6 +447,7 @@ def assemble_deal_payload(
                 )
                 payload.image_count += 1
                 payload.page_texts[global_no] = page.text
+                payload.page_words[global_no] = page.words
                 block_offsets.append((global_no, len(prompt_sections)))
                 prompt_sections.append(
                     f"--- page {global_no} | {label}, document page {number} "
@@ -403,6 +465,7 @@ def assemble_deal_payload(
                                 rel_path=rel, sha256=digest)
                 )
                 payload.page_texts[global_no] = text_block
+                payload.page_words[global_no] = page.words
                 block_offsets.append((global_no, len(prompt_sections)))
                 prompt_sections.append(
                     f"--- page {global_no} | {label}, document page {number} "

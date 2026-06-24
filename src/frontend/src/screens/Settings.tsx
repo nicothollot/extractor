@@ -361,6 +361,7 @@ export default function Settings() {
 
   const c = config.data;
   const auto = c?.llm.auto as Record<string, string> | undefined;
+  const activeProvider = c ? String(value("llm.provider", c.llm.provider ?? "claude")) : "claude";
   const dirty = Object.keys(draft).length > 0;
   const rawDirty = rawDraft !== null && rawDraft !== raw.data?.text;
 
@@ -798,9 +799,9 @@ export default function Settings() {
           </Card>
 
           <Card>
-            <CardHeader title="Claude Code" sub="local CLI only — no Anthropic SDK, no API key, ever" />
+            <CardHeader title="LLM provider CLI" sub="local command execution only — no hosted API call from Python" />
             <div className="px-4 pb-4 space-y-4 max-w-3xl">
-              {(() => {
+              {activeProvider === "claude" && (() => {
                 const curCmd = String(value("claude_code.command", c.claude_code.command));
                 const curArgs = (value("claude_code.command_args", c.claude_code.command_args) as string[]) ?? [];
                 const argsEqual = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -890,16 +891,50 @@ export default function Settings() {
                   <Toggle checked={Boolean(value("first_run.install_missing_deps", c.first_run.install_missing_deps))} onChange={(v) => setValue("first_run.install_missing_deps", v)} label="Auto-install missing Python deps into .venv" />
                 </div>
               </div>
+              <div className="grid grid-cols-2 gap-4 border-t border-line pt-4">
+                <Field label="Codex command">
+                  <input className={inputCls} value={String(value("codex_cli.command", c.codex_cli.command))} onChange={(e) => setValue("codex_cli.command", e.target.value)} />
+                </Field>
+                <Field label="Codex command args">
+                  <input
+                    className={inputCls}
+                    value={((value("codex_cli.command_args", c.codex_cli.command_args) as string[]) ?? []).join(" ")}
+                    onChange={(e) => setValue("codex_cli.command_args", e.target.value.trim() === "" ? [] : e.target.value.trim().split(/\s+/))}
+                  />
+                </Field>
+                <Field label="Codex timeout (seconds)">
+                  <input className={inputCls} type="number" value={Number(value("codex_cli.default_timeout_seconds", c.codex_cli.default_timeout_seconds))} onChange={(e) => setValue("codex_cli.default_timeout_seconds", Number(e.target.value))} />
+                </Field>
+                <Field label="Codex reasoning effort">
+                  <select className={inputCls} value={String(value("codex_cli.reasoning_effort", c.codex_cli.reasoning_effort))} onChange={(e) => setValue("codex_cli.reasoning_effort", e.target.value)}>
+                    {EFFORTS.map((e) => <option key={e}>{e}</option>)}
+                  </select>
+                </Field>
+              </div>
             </div>
           </Card>
 
           <Card>
-            <CardHeader title="LLM routing" sub="AUTO router tiers + MANUAL defaults + hard budget cap" />
+            <CardHeader title="LLM routing" sub="model profiles choose whole-deal or per-document extraction" />
             <div className="px-4 pb-4 grid grid-cols-3 gap-4 max-w-4xl">
+              <Field label="Provider">
+                <select
+                  className={inputCls}
+                  value={activeProvider}
+                  onChange={(e) => {
+                    setValue("llm.provider", e.target.value);
+                    if (e.target.value === "codex") setValue("llm.single_model_model", "provider-default");
+                  }}
+                >
+                  <option value="claude">claude</option>
+                  <option value="codex">codex</option>
+                </select>
+              </Field>
               <Field label="Mode">
-                <select className={inputCls} value={String(value("llm.mode", c.llm.mode))} onChange={(e) => setValue("llm.mode", e.target.value)}>
+                <select className={inputCls} value={String(value("llm.routing_mode", c.llm.routing_mode ?? c.llm.mode))} onChange={(e) => setValue("llm.routing_mode", e.target.value)}>
                   <option value="auto">auto</option>
-                  <option value="manual">manual</option>
+                  <option value="per_deal">per_deal</option>
+                  <option value="single_model">single_model</option>
                 </select>
               </Field>
               <Field label="Budget cap (USD / run)">
@@ -908,20 +943,26 @@ export default function Settings() {
               <div className="pt-6">
                 <Toggle checked={Boolean(value("llm.allow_fable", c.llm.allow_fable))} onChange={(v) => setValue("llm.allow_fable", v)} label="Allow Fable tier (most expensive — explicit opt-in)" />
               </div>
-              <Field label="MANUAL default model">
-                <select className={inputCls} value={String(value("llm.manual_model", c.llm.manual_model))} onChange={(e) => setValue("llm.manual_model", e.target.value)}>
+              <Field label="Single-model default">
+                <select className={inputCls} value={String(value("llm.single_model_model", c.llm.single_model_model ?? c.llm.manual_model))} onChange={(e) => setValue("llm.single_model_model", e.target.value)}>
                   {(models.data?.models ?? []).map((m) => (
                     <option key={m.alias} value={m.alias}>{m.alias}</option>
                   ))}
                 </select>
               </Field>
-              <Field label="MANUAL default effort">
-                <select className={inputCls} value={String(value("llm.manual_effort", c.llm.manual_effort))} onChange={(e) => setValue("llm.manual_effort", e.target.value)}>
+              <Field label="Single-model effort">
+                <select className={inputCls} value={String(value("llm.single_model_effort", c.llm.single_model_effort ?? c.llm.manual_effort))} onChange={(e) => setValue("llm.single_model_effort", e.target.value)}>
                   {EFFORTS.map((e) => <option key={e}>{e}</option>)}
                 </select>
               </Field>
               <Field label="Escalation confidence threshold">
                 <input className={inputCls} type="number" step="0.05" min="0" max="1" value={Number(value("extraction.confidence_threshold", c.extraction.confidence_threshold))} onChange={(e) => setValue("extraction.confidence_threshold", Number(e.target.value))} />
+              </Field>
+              <Field label="Repair policy">
+                <select className={inputCls} value={String(value("llm.candidate_arbitration.repair_policy", "never"))} onChange={(e) => setValue("llm.candidate_arbitration.repair_policy", e.target.value)}>
+                  <option value="never">never</option>
+                  <option value="core_only">core_only</option>
+                </select>
               </Field>
               <Field label="Confirm-documents auto-select floor (%)">
                 <input
@@ -934,14 +975,12 @@ export default function Settings() {
                   onChange={(e) => setValue("selection.min_confidence", Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
                 />
               </Field>
-              {auto &&
+              {activeProvider === "claude" && auto &&
                 ([
                   ["llm.auto.extraction_model", "AUTO: extraction model", auto.extraction_model],
                   ["llm.auto.extraction_effort", "AUTO: extraction effort", auto.extraction_effort],
-                  ["llm.auto.ocr_hostile_model", "AUTO: OCR-hostile model", auto.ocr_hostile_model],
+                  ["llm.auto.ocr_hostile_model", "AUTO: large/image model", auto.ocr_hostile_model],
                   ["llm.auto.ocr_hostile_effort", "AUTO: OCR-hostile effort", auto.ocr_hostile_effort],
-                  ["llm.auto.retry_model", "AUTO: retry model", auto.retry_model],
-                  ["llm.auto.retry_effort", "AUTO: retry effort", auto.retry_effort],
                 ] as const
                 ).map(([path, label, current]) => (
                   <Field key={path} label={label}>
@@ -1060,10 +1099,10 @@ export default function Settings() {
       <Card>
         <CardHeader
           title="Environment / doctor"
-          sub="Claude Code version, auth, configured models, actual-vs-ESTIMATED cost accounting"
+          sub="provider CLI availability, configured models, actual-vs-estimated cost accounting"
           right={
             <span className="flex gap-2">
-              <Button kind="secondary" onClick={triggerUpdate}>Update Claude Code</Button>
+              {activeProvider === "claude" && <Button kind="secondary" onClick={triggerUpdate}>Update Claude Code</Button>}
               <Button kind="primary" onClick={runDoctor} disabled={doctorBusy}>
                 {doctorBusy ? "Running checks…" : "Run doctor"}
               </Button>

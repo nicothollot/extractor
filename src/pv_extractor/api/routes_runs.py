@@ -130,6 +130,12 @@ def run_costs(run_id: str, request: Request) -> dict:
     }
 
 
+@router.get("/runs/{run_id}/diagnostics")
+def run_diagnostics(run_id: str, request: Request) -> dict:
+    run_dir = _run_dir(_config(request), run_id)
+    return {"diagnostics": runs_service.run_diagnostics(run_dir)}
+
+
 @router.get("/costs/history")
 def costs_history(request: Request) -> dict:
     return {"points": runs_service.cost_history(_config(request))}
@@ -144,8 +150,9 @@ def costs_history(request: Request) -> dict:
 def review_queue(run_id: str, request: Request) -> dict:
     config = _config(request)
     run_dir = _run_dir(config, run_id)
-    items = review_service.build_queue(run_dir, config)
+    items, memo_issues = review_service.build_review(run_dir, config)
     return {"items": [i.model_dump() for i in items],
+            "memo_issues": [i.model_dump() for i in memo_issues],
             "confidence_threshold": config.extraction.confidence_threshold}
 
 
@@ -242,7 +249,7 @@ def start_run(body: RunRequest, request: Request) -> dict:
     try:
         job = _manager(request).start_run(body)
     except JobConflict as exc:
-        raise HTTPException(409, detail=str(exc)) from exc
+        raise HTTPException(409, detail=exc.detail()) from exc
     return {"job": job.model_dump()}
 
 
@@ -278,9 +285,9 @@ def cancel_job(job_id: str, request: Request) -> dict:
 @router.get("/jobs/{job_id}/preflight")
 def job_preflight(
     job_id: str, request: Request,
-    mode: str | None = None, model: str | None = None,
+    mode: str | None = None, routing_mode: str | None = None, model: str | None = None,
     effort: str | None = None, budget: float | None = None,
-    force_assist: bool = False,
+    force_assist: bool = False, repair_policy: str | None = None,
 ) -> dict:
     """Server-side cost ESTIMATE from the dry-run job's coverage (wizard
     step d). The Run button stays disabled until this was viewed."""
@@ -295,7 +302,7 @@ def job_preflight(
         estimate = preflight_service.estimate_from_dry_run(
             manager, job_id, config,
             mode=mode, manual_model=model, manual_effort=effort, budget_usd=budget,
-            force_assist=force_assist,
+            force_assist=force_assist, routing_mode=routing_mode, repair_policy=repair_policy,
         )
     except (ValueError, OSError) as exc:
         raise HTTPException(400, detail=str(exc)) from exc
@@ -399,7 +406,7 @@ def multi_search_run(body: MultiSearchRunRequest, request: Request) -> dict:
     try:
         job = _manager(request).start_multi_run(body)
     except JobConflict as exc:
-        raise HTTPException(409, detail=str(exc)) from exc
+        raise HTTPException(409, detail=exc.detail()) from exc
     return {"job": job.model_dump()}
 
 

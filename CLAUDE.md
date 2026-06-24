@@ -15,12 +15,13 @@ database, document locator. Phase 2: deterministic extraction engine — documen
 readers + local OCR, candidate-page targeting, peek-verifier, band extractors
 with a multiplicative confidence model, validation/QA, workbook writer, run
 orchestrator. Low-confidence and required-but-empty fields land in a per-memo
-`EscalationPlan` inside the audit record. Phase 3: the Claude Code CLI fallback —
-a surgical LLM second pass executing those plans through hidden, non-interactive
-local `claude -p` sessions (NEVER the Anthropic SDK, NEVER an API key):
-pages-not-documents payloads, one call per memo per router tier, strict JSON
-schemas with embedded provenance, quote-grounding, response cache, hard per-run
-budget cap, cost ledger. The deterministic engine remains primary. Phase 4: the
+`EscalationPlan` inside the audit record. Phase 3: local CLI LLM assist — a
+surgical second pass executing those plans through a provider-neutral seam
+(Claude Code by default; temporary Codex CLI provider available; NEVER a hosted
+LLM API called directly from Python): pages-not-documents payloads, one call per
+memo per router tier, strict JSON schemas with embedded provenance,
+quote-grounding, response cache, hard per-run budget cap, cost ledger. The
+deterministic engine remains primary. Phase 4: the
 analyst-facing LOCAL web GUI — one FastAPI/uvicorn process on 127.0.0.1 (no
 auth, no telemetry, no external calls) serving a built Vite+React+TS frontend;
 it wraps the SAME pipeline functions the CLI calls as background jobs (live
@@ -64,12 +65,12 @@ comments preserved), and setup/doctor flows.
 4. **Never trust derived export columns.** The PV index export has corrupt
    derived columns (`#NAME?` from folder names starting with `+`). Everything is
    re-derived in Python from `file_path`.
-5. **No Anthropic SDK, no API keys.** No `anthropic` import; ANTHROPIC_API_KEY
-   is never required, read, or documented — `llm/claude_code_client.py` strips
-   `ANTHROPIC_*` from every child environment. The Phase-3 fallback runs
-   exclusively through local Claude Code CLI subprocesses
-   (`claude -p --output-format json --json-schema ...`), reusing the operator's
-   one-time `claude auth login`. OCR is fully local (RapidOCR/onnxruntime by
+5. **No hosted LLM API from Python, no API keys.** No `anthropic` import;
+   ANTHROPIC_API_KEY and OPENAI_API_KEY are never required for extraction. The
+   Phase-3 assist runs exclusively through local provider CLI subprocesses:
+   Claude Code (`claude -p ...`) or temporary Codex CLI (`codex exec ...`),
+   reusing the operator's local CLI login. Provider clients strip provider API
+   keys from child environments. OCR is fully local (RapidOCR/onnxruntime by
    default; pytesseract optional) — never cloud. INFO logs never carry memo
    contents, client names, or page payload (identifiers/counters only).
 6. **Nothing silent.** A numeric parse failure is a review flag, never a silent
@@ -429,13 +430,20 @@ comments preserved), and setup/doctor flows.
 - Two-digit years pivot at 70 (>=70 -> 19xx else 20xx) in `indexer/periods.py`.
 - FieldHit.method: `deterministic` (parsed from the document), `computed`
   (derived in Python), `metadata` (run identity),
-  `claude-code:<model>:<effort>` (Phase-3 merge; evidence = the grounded
+  `llm:<provider>:<model>:<effort>` (Phase-3 merge; evidence = the grounded
   verbatim quote). Workbook booleans are written 'Yes'/'No', dates as ISO
   strings, never formulas.
+- Field evidence has a first-class `EvidenceRef`. Legacy `FieldHit.page`,
+  `FieldHit.evidence`, and `FieldHit.bbox` stay populated for migration, but
+  new code should read/write `evidence_ref`. Any bbox is exactly
+  `(x0, y0, x1, y1)` in PDF points in PyMuPDF page coordinates (top-left
+  origin, `page.rect` units). Native/OCR quote alignment may produce a box;
+  otherwise keep page + quote with `match_method="page_only"` and a
+  `no_geometry_reason`. Never create a bbox from the extracted value alone.
 - Bump `extract.EXTRACTOR_VERSION` on any change that can alter extraction
   output — it invalidates the result cache. Bump `llm.LLM_VERSION` on any
   change that can alter prompts/payloads/parsing/merging — it invalidates the
-  Claude Code response cache.
+  local LLM response cache.
 
 ## Deal discovery in one paragraph
 
@@ -580,27 +588,20 @@ mismatch, corrupt file) into qa_pass / qa_pass_with_flags / qa_fail.
 
 ## LLM fallback in one paragraph
 
-ONE CALL PER DEAL (llm.one_call_per_deal, DEFAULT). The deterministic engine
-still runs first (fast/local: grounding, comps/cap tables, derived fields), but
-the LLM second pass is the primary field extractor and runs as ONE `claude -p`
-call per deal-period over the COMBINED payload of ALL that deal's documents —
-not the per-memo, per-band, per-tier fan-out (which was slow: a large memo was
-6-24 calls). run._build_deal_groups groups the assembled (item, memo) pairs
-exactly like the multi-doc merge (merge_key, non-merge items standalone) and
-hands each group to escalate.process_deals; payload.assemble_deal_payload
-concatenates every document's pages under a single GLOBAL page index (each block
-labelled with its source document + that doc's own page number, so
-quote-grounding still keys off page->page_texts[page]) and escalate._single_group
-sends the whole field set over all pages in ONE call (only max_fields_per_call
-can split it). It implies comprehensive (force_assist) escalation + result-cache
-bypass, so plans are always rebuilt complete; merged hits land on the primary and
-the multi-doc merge collapses the group to one row by best confidence per field.
-max_pages_per_deal bounds the combined payload. one_call_per_deal=false restores
-the legacy per-memo band-batched path described next (byte-for-byte unchanged).
+The deterministic engine still runs first (fast/local: grounding, comps/cap
+tables, derived fields). `llm.provider` selects the local structured-extraction
+provider (`claude` or temporary `codex`), and merged hits are labelled
+`llm:<provider>:<model>:<effort>`. Optional `llm.combine_deal_documents` groups a
+deal-period's documents into one combined payload using the same merge key as
+the multi-doc row collapse; it sends only escalated fields, does not imply
+force_assist, and does not bypass the LLM response cache. Deprecated
+`llm.one_call_per_deal` is still loaded for compatibility, maps to
+`combine_deal_documents` only when the new key is absent, and warns.
+`max_pages_per_deal` bounds the combined payload.
 
-Legacy per-memo path (one_call_per_deal=false): each memo whose EscalationPlan
+Default per-memo path (`combine_deal_documents=false`): each memo whose EscalationPlan
 has fields goes through the
-worker queue (config.llm.workers hidden Claude Code sessions). The plan
+worker queue (config.llm.workers hidden provider CLI sessions). The plan
 (run._build_escalation) is low-confidence hits + required-but-empty fields, and
 — when an asset QA-FAILS (engine recognized nothing / no valuation value) or
 force_assist is set — EVERY empty LLM-extractable field (excludes
@@ -635,7 +636,7 @@ Windows limit (max_fields_per_call default 200). Cleanly-OCR'd SCANNED pages are
 sent as OCR TEXT, not page images (prefer_ocr_text_over_image / ocr_text_min_
 confidence) — vision/Read-tool calls are slow and re-done per call; IMAGE_TABLE
 stays an image. New tunables (BOTH config.py + config.example.yaml):
-one_call_per_deal, max_pages_per_deal, band_batched,
+combine_deal_documents, max_pages_per_deal, band_batched,
 single_call_max_pages, retry_not_found, surface_ungrounded_values,
 ungrounded_confidence_cap, prefer_ocr_text_over_image, ocr_text_min_confidence,
 band_relevance_floor, max_fields_per_call, no_evidence_effort. The router picks a
@@ -646,8 +647,8 @@ chosen model); AUTO runs sonnet/medium, retries failures on opus/high
 explicit opt-in. A field the model answers not_found is RESOLVED, not retried
 (llm.retry_not_found=False default): a confirmed absence is not a failure, so it
 neither re-asks the expensive tier nor raises a NOT_EXTRACTABLE flag — only
-FAILED (call error) or REJECTED (ungrounded/type/vocab) fields escalate. Each group-tier is ONE `claude -p --output-format json
---json-schema` call (job id pv-<run>-<memo>-g<group>t<tier>; cached by
+FAILED (call error) or REJECTED (ungrounded/type/vocab) fields escalate. Each group-tier is ONE local
+provider CLI structured-output call (job id pv-<run>-<memo>-g<group>t<tier>; cached by
 prompt+payload+fields+page-scope+model+effort; budget
 reserved before launch, LLM_DEFERRED past the cap). Answers are
 quote-grounded against local page text (fuzzy vs OCR on image pages),
@@ -664,11 +665,15 @@ fields that genuinely FAILED/were rejected (not confirmed-absent) get
 NOT_EXTRACTABLE / LLM_UNCONFIRMED reviewer flags; every attempt
 (job id, session id, tokens, cost actual-vs-ESTIMATED) lands in the audit
 record, the run's cost_ledger.jsonl and the Run Log "Batch Sessions" column.
+After all LLM merges and after any multi-document merge, `finalize_asset_after_assistance`
+reruns deterministic derived fields, validation, QA, threshold fields and flag
+counts from the final hit set so stale pre-LLM failures are not persisted.
 
 ## Running
 
     python scripts/bootstrap.py            # creates .venv, editable install
-    claude auth login                      # once — Phase 3 reuses this local session
+    claude auth login                      # once when llm.provider=claude
+    codex login                            # once when llm.provider=codex (uses local CLI auth)
     .venv/bin/pv-extractor locate --client "Angelo Gordon" --deal "Accell" \
         --period "2025-01-31" --doc-type valuation_memo
     .venv/bin/pv-extractor run --scope deal --client "Angelo Gordon" \
@@ -680,12 +685,12 @@ record, the run's cost_ledger.jsonl and the Run Log "Batch Sessions" column.
     .venv/bin/pv-extractor run ... --llm-model opus --llm-effort low \
         --force-llm-assist                             # LLM as primary extractor (escalate everything)
     .venv/bin/pv-extractor deals --client "Ares Management" --refresh   # discovered deal folders
-    .venv/bin/pv-extractor deals --client "Ares Infrastructure" --llm   # + Claude Code second opinion
+    .venv/bin/pv-extractor deals --client "Ares Infrastructure" --llm   # + local LLM second opinion
     .venv/bin/pv-extractor deals --client "Ares Management" --show-learned  # learned priors + corrections
     .venv/bin/pv-extractor deals --client "Ares Management" --forget    # clear this client's corrections
     .venv/bin/pv-extractor models          # model menu + editable pricing
     .venv/bin/pv-extractor costs --run RUN_20260611_120000
-    .venv/bin/pv-extractor doctor          # claude CLI / auth / flags / menu / cost accounting
+    .venv/bin/pv-extractor doctor          # provider CLI / auth / flags / menu / cost accounting
     .venv/bin/pv-extractor gui             # Phase-4 analyst GUI (127.0.0.1, opens browser;
                                            # self-installs the gui extra per first_run config)
     .venv/bin/python -m pytest             # full suite

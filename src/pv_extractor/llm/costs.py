@@ -1,12 +1,12 @@
 """Cost ledger + token estimation (rule 9).
 
-When Claude Code reports token usage / cost the ledger records ACTUAL
-numbers; otherwise tokens are estimated from the prompt text and page images
-(heuristics in config.llm) and clearly labeled ESTIMATED. The ledger is a
-JSONL file under the run directory — `pv-extractor costs --run <id>` renders
-it — and a thread-safe budget tracker enforces the hard per-run cap: once
-projected spend would exceed the budget, jobs stop being submitted and the
-remaining memos are marked LLM_DEFERRED (the run still finishes cleanly).
+When a local LLM provider reports token usage / cost the ledger records ACTUAL
+numbers. When only a matching configured price table is available, tokens are
+estimated from the prompt text and page images and clearly labeled ESTIMATED.
+If pricing is unavailable for the provider/model, cost is recorded as zero with
+``cost_source=unavailable`` rather than invented. The ledger is a JSONL file
+under the run directory — `pv-extractor costs --run <id>` renders it — and a
+thread-safe budget tracker enforces the hard per-run cap.
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class BudgetTracker:
 
 
 class CostLedger:
-    """Append-only JSONL ledger: one line per Claude Code attempt."""
+    """Append-only JSONL ledger: one line per local LLM attempt."""
 
     def __init__(self, path: Path, pv_root: str) -> None:
         self.path = path
@@ -105,16 +105,18 @@ def read_ledger(path: Path) -> list[dict]:
 
 
 def summarize_ledger(entries: list[dict]) -> dict:
-    """Totals for CLI display: spend split by actual vs estimated source."""
+    """Totals for CLI display: spend split by actual/estimated/unavailable."""
     total = sum(e.get("cost_usd", 0.0) for e in entries)
     actual = sum(e.get("cost_usd", 0.0) for e in entries if e.get("cost_source") == "actual")
+    estimated = sum(e.get("cost_usd", 0.0) for e in entries if e.get("cost_source") == "estimated")
     return {
         "attempts": len(entries),
         "cache_hits": sum(1 for e in entries if e.get("from_cache")),
         "memos": len({e.get("memo_id") for e in entries}),
         "total_usd": round(total, 4),
         "actual_usd": round(actual, 4),
-        "estimated_usd": round(total - actual, 4),
+        "estimated_usd": round(estimated, 4),
+        "unavailable_attempts": sum(1 for e in entries if e.get("cost_source") == "unavailable"),
         "input_tokens": sum((e.get("usage") or {}).get("input_tokens", 0) for e in entries),
         "output_tokens": sum((e.get("usage") or {}).get("output_tokens", 0) for e in entries),
     }

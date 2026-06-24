@@ -1,23 +1,24 @@
 """Escalation executor (D4 + D5): consumes each memo's EscalationPlan,
-assembles the page payload, runs hidden Claude Code sessions through the
+assembles the page payload, runs hidden local provider sessions through the
 worker queue, quote-grounds the answers and merges them into the row.
 
 Cost principles enforced here:
   * LOCAL FIRST — only fields the deterministic pass scored below threshold
-    (or left empty while required) ever reach Claude Code (the plan was
+    (or left empty while required) ever reach the provider CLI (the plan was
     built that way in run.py).
-  * ONE CALL PER MEMO PER TIER — all of a memo's escalated fields ride in a
-    single band-grouped schema; the router decides the tier ladder.
+  * BOUNDED TASKS — escalated fields are packed into provider-neutral
+    AssistanceTask objects with hard field/page/prompt/output caps; a failed
+    sibling task does not discard successful merges.
   * SESSION WORKER QUEUE — a small thread pool (config.llm.workers, default
-    1-2) launches hidden `claude -p` processes named pv-<run_id>-<memo_id>-tN;
-    stdout/exit/usage/session ids are captured per attempt.
+    1-2) launches hidden provider processes; stdout/exit/usage/session ids are
+    captured per attempt.
   * HARD BUDGET — projected spend is reserved before any call; once the cap
     would be passed the memo is marked LLM_DEFERRED and the run finishes
     cleanly.
-  * RESULT CACHE — responses are cached on sha256(static prompt + payload +
-    field set + model + effort); unchanged memos never re-pay (rule 10).
+  * RESULT CACHE — responses are cached per provider/model/effort, schema and
+    prompt version, selected page hashes, and requested sparse field keys.
 
-Merge policy: a Claude Code value NEVER overwrites a deterministic value
+Merge policy: an LLM value NEVER overwrites a deterministic value
 with confidence >= threshold. It fills empty fields, or replaces a below-
 threshold deterministic value (the old value is preserved as a conflict
 entry). Every merge, overwrite and rejection lands in the plan's merge_log
@@ -31,17 +32,18 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field as dataclass_field, replace
 from pathlib import Path
-
-from rapidfuzz import fuzz
 
 from pv_extractor.config import Config
 from pv_extractor.extract.targeting import _page_score, build_band_lexicons
 from pv_extractor.io_guard import guarded_open_write
 from pv_extractor.llm import cache as llm_cache
+from pv_extractor.llm.arbitration import Candidate, arbitrate_field
 from pv_extractor.llm.claude_code_client import ClaudeCodeClient
+from pv_extractor.llm.codex_cli_client import CodexCliClient
 from pv_extractor.llm.costs import (
     LEDGER_FILENAME,
     BudgetExceeded,
@@ -56,12 +58,20 @@ from pv_extractor.llm.payload import (
     assemble_deal_payload,
     assemble_payload,
 )
+from pv_extractor.llm.grounding import GroundingResult, ground_quote
+from pv_extractor.llm.planner import AssistanceTask, plan_assistance_tasks
+from pv_extractor.llm.response_validation import StructuredResponseError
 from pv_extractor.llm.schema_builder import (
+    build_legacy_call_prompt,
+    build_legacy_response_schema,
+    build_legacy_static_prompt,
     build_call_prompt,
     build_response_schema,
     build_static_prompt,
+    decode_structured_response,
     response_key_map,
     schema_json_bytes,
+    sparse_field_keys,
     sorted_fields,
 )
 from pv_extractor.logging_setup import log_event
@@ -88,7 +98,7 @@ class LlmSettings:
     """Resolved llm runtime settings (config defaults + CLI overrides)."""
 
     enabled: bool
-    mode: str
+    mode: str  # auto | per_deal | single_model | legacy manual
     manual_model: str
     manual_effort: str
     allow_fable: bool
@@ -114,16 +124,18 @@ def resolve_settings(
     force_assist: bool = False,
     allow_fable: bool | None = None,
 ) -> LlmSettings:
-    """--llm-model without --llm-mode implies manual (the user forced one
+    """--llm-model without --llm-mode implies single_model (the user forced one
     model); everything else falls back to config.llm. force_assist turns the
     LLM into the primary extractor for this run (see LlmSettings)."""
     llm = config.llm
-    resolved_mode = mode or ("manual" if model else llm.mode)
+    resolved_mode = mode or ("single_model" if model else llm.routing_mode)
+    if resolved_mode == "manual":
+        resolved_mode = "single_model"
     return LlmSettings(
         enabled=llm.enabled and not no_llm,
         mode=resolved_mode,
-        manual_model=model or llm.manual_model,
-        manual_effort=effort or llm.manual_effort,
+        manual_model=model or llm.single_model_model or llm.manual_model,
+        manual_effort=effort or llm.single_model_effort or llm.manual_effort,
         allow_fable=llm.allow_fable if allow_fable is None else allow_fable,
         budget_usd=budget if budget is not None else llm.budget_usd,
         workers=max(1, llm.workers),
@@ -146,6 +158,7 @@ class LlmRunSummary:
     session_labels: list[str] = dataclass_field(default_factory=list)
     ledger_path: Path | None = None
     detail: str = ""
+    diagnostics: dict[str, object] = dataclass_field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -153,29 +166,11 @@ class LlmRunSummary:
 # ---------------------------------------------------------------------------
 
 
-def _normalize(text: str) -> str:
-    return " ".join(text.split()).lower()
-
-
 def quote_grounding(
     quote: str, page: int | None, payload: MemoPayload, fuzzy_threshold: int
 ) -> str:
-    """'grounded' | 'ungrounded' | 'unverifiable'. Exact normalized substring
-    on text pages; fuzzy >= threshold against local OCR text on image pages
-    (OCR noise must not reject a correct reading); no local text at all =>
-    unverifiable (merged with a flag — never silently)."""
-    if not quote.strip() or page is None or page not in payload.page_texts:
-        return "ungrounded"
-    page_text = _normalize(payload.page_texts[page])
-    needle = _normalize(quote)
-    if not page_text:
-        return "unverifiable"
-    if needle in page_text:
-        return "grounded"
-    kind = next((p.kind for p in payload.pages if p.number == page), "text")
-    if kind == "image" and fuzz.partial_ratio(needle, page_text) >= fuzzy_threshold:
-        return "grounded"
-    return "ungrounded"
+    """Backward-compatible status wrapper around structured grounding."""
+    return ground_quote(quote, page, payload, fuzzy_threshold).status
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +232,7 @@ def _match_vocab(value, vocab: list[str]):
 def _qualifying_assets(
     memo: MemoResult, header: str, threshold: float
 ) -> list[tuple[AssetExtraction, FieldHit | None]]:
-    """Assets where a Claude Code value may land: the field is missing,
+    """Assets where an LLM value may land: the field is missing,
     empty, or a below-threshold deterministic hit. Confident deterministic /
     computed / metadata values are untouchable."""
     out: list[tuple[AssetExtraction, FieldHit | None]] = []
@@ -263,7 +258,89 @@ def _merge_field(
     plan = memo.escalation
     assert plan is not None
     header = schema_field.header
-    method = f"claude-code:{selection.entry.alias}:{selection.effort}"
+    method = f"llm:{selection.entry.provider}:{selection.entry.alias}:{selection.effort}"
+
+    if result.get("conflict_candidates"):
+        candidates: list[Candidate] = []
+        for raw_candidate in result.get("conflict_candidates") or []:
+            if not isinstance(raw_candidate, dict):
+                continue
+            candidate_quote = str(
+                raw_candidate.get("verbatim_quote")
+                or raw_candidate.get("quote")
+                or raw_candidate.get("evidence_quote")
+                or ""
+            )
+            candidate_page = (
+                raw_candidate.get("page") if isinstance(raw_candidate.get("page"), int) else None
+            )
+            candidate_grounding = ground_quote(
+                candidate_quote, candidate_page, payload, config.llm.quote_match_threshold
+            )
+            candidates.append(
+                Candidate.from_result(
+                    header,
+                    {**raw_candidate, "quote": candidate_quote},
+                    provider=selection.entry.provider,
+                    model=selection.entry.alias,
+                    effort=selection.effort,
+                    prompt_version=config.llm.planner.prompt_version,
+                    grounding_status=candidate_grounding.status,
+                    source="primary",
+                )
+            )
+        decision = arbitrate_field(
+            header,
+            candidates,
+            config=config.llm.candidate_arbitration,
+            schema_field=schema_field,
+            target_as_of=memo.as_of_date,
+            document_ids=None,
+        )
+        plan.diagnostics.setdefault("confidence_decisions", {})[header] = {
+            "selected_candidate_id": decision.selected_candidate_id,
+            "raw_model_confidence": decision.raw_model_confidence,
+            "calibrated_confidence": decision.calibrated_confidence,
+            "agreement_bonus": decision.agreement_bonus,
+            "final_confidence": decision.final_confidence,
+            "runner_up_confidence": decision.runner_up_confidence,
+            "decision": decision.decision,
+            "decision_reason": decision.decision_reason,
+        }
+        if decision.selected is None:
+            _flag_first_asset(
+                memo,
+                ReviewFlag(
+                    category="llm",
+                    description=f"UNRESOLVED_LLM_CONFLICT: {header} — {decision.decision_reason}",
+                    severity=FlagSeverity.warning,
+                    reviewer_attention=True,
+                    field=header,
+                ),
+            )
+            plan.merge_log.append(f"{header}: unresolved conflict — {decision.decision_reason}")
+            return "rejected:unresolved_conflict"
+        selected = decision.selected
+        return _merge_field(
+            memo,
+            schema_field,
+            {
+                "value": selected.value,
+                "unit": selected.unit,
+                "page": selected.page,
+                "document_id": selected.document_id,
+                "as_of_date": selected.as_of_date,
+                "verbatim_quote": selected.quote,
+                "quote": selected.quote,
+                "evidence_kind": selected.evidence_kind,
+                "confidence": decision.final_confidence,
+                "model_confidence": selected.raw_model_confidence,
+                "raw_model_confidence": selected.raw_model_confidence,
+            },
+            selection,
+            payload,
+            config,
+        )
 
     if result.get("not_found") is True or result.get("value") is None:
         return "not_found"
@@ -274,7 +351,7 @@ def _merge_field(
             memo,
             ReviewFlag(
                 category="llm",
-                description=f"{header}: Claude Code value {result.get('value')!r} failed "
+                description=f"{header}: LLM value {result.get('value')!r} failed "
                 f"{schema_field.dtype} typing — discarded",
                 severity=FlagSeverity.warning, field=header,
             ),
@@ -288,22 +365,22 @@ def _merge_field(
                 memo,
                 ReviewFlag(
                     category="llm",
-                    description=f"{header}: Claude Code value outside controlled vocabulary — discarded",
+                    description=f"{header}: LLM value outside controlled vocabulary — discarded",
                     severity=FlagSeverity.warning, field=header,
                 ),
             )
             return "rejected:vocab"
 
-    quote = str(result.get("verbatim_quote") or "")
+    quote = str(result.get("verbatim_quote") or result.get("evidence_quote") or "")
     page = result.get("page") if isinstance(result.get("page"), int) else None
-    grounding = quote_grounding(quote, page, payload, config.llm.quote_match_threshold)
-    if grounding == "ungrounded" and not config.llm.surface_ungrounded_values:
+    grounding = ground_quote(quote, page, payload, config.llm.quote_match_threshold)
+    if grounding.status == "ungrounded" and not config.llm.surface_ungrounded_values:
         _flag_first_asset(
             memo,
             ReviewFlag(
                 category="llm",
                 description=f"UNGROUNDED_LLM_VALUE: {header} — quote not found on cited "
-                f"page {page}; value discarded",
+                f"page {page}; value discarded (score {grounding.score:.2f})",
                 severity=FlagSeverity.warning, reviewer_attention=True, field=header,
             ),
         )
@@ -317,8 +394,67 @@ def _merge_field(
         return "rejected:protected"  # deterministic value is confident — never overwrite
 
     asset, existing = targets[0]
-    confidence = config.llm.confidence_scores.get(str(result.get("confidence")), 0.35)
-    if grounding == "ungrounded":  # shown for review, not machine-verified -> low confidence
+    raw_confidence = result.get(
+        "model_confidence",
+        result.get("raw_model_confidence", result.get("confidence")),
+    )
+    if isinstance(raw_confidence, (int, float)) and not isinstance(raw_confidence, bool):
+        confidence = max(0.0, min(1.0, float(raw_confidence)))
+    else:
+        confidence = config.llm.confidence_scores.get(
+            str(raw_confidence),
+            config.llm.confidence_scores.get(str(result.get("confidence_label")), 0.35),
+        )
+    decision = arbitrate_field(
+        header,
+        [
+            Candidate.from_result(
+                header,
+                {
+                    **result,
+                    "value": value,
+                    "model_confidence": confidence,
+                    "quote": quote,
+                    "document_id": result.get("document_id") or "D01",
+                },
+                provider=selection.entry.provider,
+                model=selection.entry.alias,
+                effort=selection.effort,
+                prompt_version=config.llm.planner.prompt_version,
+                grounding_status=grounding.status,
+                source="primary",
+            )
+        ],
+        config=config.llm.candidate_arbitration,
+        schema_field=schema_field,
+        target_as_of=memo.as_of_date,
+        document_ids=None,
+    )
+    plan.diagnostics.setdefault("confidence_decisions", {})[header] = {
+        "selected_candidate_id": decision.selected_candidate_id,
+        "raw_model_confidence": decision.raw_model_confidence,
+        "calibrated_confidence": decision.calibrated_confidence,
+        "agreement_bonus": decision.agreement_bonus,
+        "final_confidence": decision.final_confidence,
+        "runner_up_confidence": decision.runner_up_confidence,
+        "decision": decision.decision,
+        "decision_reason": decision.decision_reason,
+    }
+    if decision.selected is None:
+        _flag_first_asset(
+            memo,
+            ReviewFlag(
+                category="llm",
+                description=f"LLM_UNRESOLVED: {header} — {decision.decision_reason}",
+                severity=FlagSeverity.warning,
+                reviewer_attention=True,
+                field=header,
+            ),
+        )
+        plan.merge_log.append(f"{header}: {decision.decision} — {decision.decision_reason}")
+        return "rejected:arbitration"
+    confidence = decision.final_confidence
+    if grounding.status == "ungrounded":  # shown for review, not machine-verified -> low confidence
         confidence = min(confidence, config.llm.ungrounded_confidence_cap)
         if existing is not None and existing.value is not None:
             # An unverified value must NEVER overwrite an existing (even
@@ -329,13 +465,14 @@ def _merge_field(
                 ConflictingCandidate(
                     raw_text=str(result.get("value")), value=value, page=page,
                     confidence=confidence, evidence=quote[: config.extraction.max_evidence_chars],
+                    evidence_ref=grounding.evidence_ref,
                 ),
             ]
             asset.flags.append(
                 ReviewFlag(
                     category="llm",
-                    description=f"UNGROUNDED_LLM_VALUE: {header} — Claude Code read {value} but the "
-                    f"quote was not matched on page {page}; kept deterministic value "
+                    description=f"UNGROUNDED_LLM_VALUE: {header} — LLM read {value} but the "
+                    f"quote was not matched on page {page} (score {grounding.score:.2f}); kept deterministic value "
                     f"{existing.value}, review both",
                     severity=FlagSeverity.warning, reviewer_attention=True, field=header,
                 )
@@ -344,13 +481,34 @@ def _merge_field(
                 f"{header}: ungrounded LLM value {value} kept as conflict; deterministic retained"
             )
             return "merged"
+    evidence_ref = (
+        grounding.evidence_ref.model_copy(
+            update={
+                "provider": selection.entry.provider,
+                "extraction_method": method,
+            }
+        )
+        if grounding.evidence_ref is not None
+        else None
+    )
     hit = FieldHit(
         field=header, col_index=schema_field.col_index, band=schema_field.band,
         raw_text=str(result.get("value")), value=value,
         unit=result.get("unit") or schema_field.unit, page=page,
+        bbox=grounding.bbox,
         method=method, confidence=confidence,
         evidence=quote[: config.extraction.max_evidence_chars],
-        confidence_components={"llm_self_reported": confidence},
+        evidence_ref=evidence_ref,
+        confidence_components={
+            "llm_self_reported": raw_confidence if isinstance(raw_confidence, (int, float)) else confidence,
+            "raw_model_confidence": decision.raw_model_confidence,
+            "calibrated_confidence": decision.calibrated_confidence,
+            "agreement_bonus": decision.agreement_bonus,
+            "final_confidence": decision.final_confidence,
+            "runner_up_confidence": decision.runner_up_confidence,
+            "grounding_score": round(grounding.score, 4),
+            "grounded": 1.0 if grounding.status == "grounded" else 0.0,
+        },
     )
     if existing is not None:
         if existing.value is not None:
@@ -359,6 +517,7 @@ def _merge_field(
                 ConflictingCandidate(
                     raw_text=existing.raw_text, value=existing.value, page=existing.page,
                     confidence=existing.confidence, evidence=existing.evidence,
+                    evidence_ref=existing.evidence_ref,
                 ),
             ]
             plan.merge_log.append(
@@ -381,17 +540,17 @@ def _merge_field(
         plan.merge_log.append(f"{header}: filled missing field via {method} [{asset.row_memo_id}]")
         asset.hits.append(hit)
 
-    if grounding == "ungrounded":
+    if grounding.status == "ungrounded":
         asset.flags.append(
             ReviewFlag(
                 category="llm",
                 description=f"UNGROUNDED_LLM_VALUE: {header}={value} — quote not found on cited "
-                f"page {page} (likely OCR/scan mismatch); value shown for review, NOT "
+                f"page {page} (score {grounding.score:.2f}; likely OCR/scan mismatch); value shown for review, NOT "
                 f"machine-verified",
                 severity=FlagSeverity.warning, reviewer_attention=True, field=header,
             )
         )
-    elif grounding == "unverifiable":
+    elif grounding.status == "unverifiable":
         asset.flags.append(
             ReviewFlag(
                 category="llm",
@@ -404,7 +563,7 @@ def _merge_field(
         asset.flags.append(
             ReviewFlag(
                 category="llm",
-                description=f"{header}: multi-asset memo — Claude Code value applied to "
+                description=f"{header}: multi-asset memo — LLM value applied to "
                 f"{asset.row_memo_id} only; review remaining assets manually",
                 severity=FlagSeverity.warning, reviewer_attention=True, field=header,
             )
@@ -418,6 +577,33 @@ def _flag_first_asset(memo: MemoResult, flag: ReviewFlag) -> None:
         memo.assets[0].flags.append(flag)
     else:
         memo.memo_flags.append(flag)
+
+
+def _flag_task_failure(
+    memo: MemoResult,
+    task: AssistanceTask,
+    error: str,
+    *,
+    timeout: bool = False,
+) -> None:
+    code = "LLM_TASK_TIMEOUT" if timeout else "LLM_TASK_FAILED"
+    fields = task.record.requested_fields
+    shown = ", ".join(fields[:8])
+    if len(fields) > 8:
+        shown += f", +{len(fields) - 8} more"
+    _flag_first_asset(
+        memo,
+        ReviewFlag(
+            category="llm",
+            description=(
+                f"{code}: task {task.record.task_id} wave {task.record.wave} "
+                f"({len(fields)} field(s): {shown}) — {error}"
+            ),
+            severity=FlagSeverity.warning,
+            reviewer_attention=True,
+            field=fields[0] if len(fields) == 1 else None,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +867,7 @@ def _pack_by_pages(units: list[_FieldGroup], config: Config) -> list[_FieldGroup
 
 
 # ---------------------------------------------------------------------------
-# one tier = one Claude Code call (rule 4)
+# one tier = one local provider call (rule 4)
 # ---------------------------------------------------------------------------
 
 
@@ -689,46 +875,86 @@ def _run_tier(
     *,
     memo: MemoResult,
     payload: MemoPayload,
-    fields: list[SchemaField],
+    task: AssistanceTask,
     selection: ModelSelection,
     tier: int,
     slug: str,
-    dynamic_prompt: str,
-    image_count: int,
-    scope_key: str,
     config: Config,
     settings: LlmSettings,
-    client: ClaudeCodeClient,
+    client,
     registry: ModelRegistry,
     budget: BudgetTracker,
     run_id: str,
+    corrective: bool = False,
 ) -> tuple[LlmAttempt, dict | None]:
+    fields = task.schema_fields
+    pages = task.record.selected_pages
     job_id = f"pv-{run_id}-{memo.memo_id}-{slug}"
-    static_prompt = build_static_prompt(fields)
+    schema_version = config.llm.planner.sparse_schema_version
+    inferable = set(config.llm.planner.inferable_fields)
+    static_prompt = build_static_prompt(fields, inferable_fields=inferable)
+    schema = build_response_schema(fields)
     schema_path = payload.directory / f"schema_{slug}.json"
     with guarded_open_write(schema_path, config.pv_root, mode="wb") as fh:
-        fh.write(schema_json_bytes(build_response_schema(fields)))
+        fh.write(schema_json_bytes(schema))
     with guarded_open_write(
         payload.directory / f"prompt_static_{slug}.txt", config.pv_root
     ) as fh:
         fh.write(static_prompt)
-    # Wire order is cache-first: stable rules + page payload precede the per-call
-    # field list, so a memo's chunks/retries READ the page payload from the
-    # prompt cache instead of re-uploading it (the response-cache key still keys
-    # off the field-set-derived static_prompt + payload hash + scope).
-    prompt = build_call_prompt(fields, dynamic_prompt)
-
-    headers = [f.header for f in fields]
-    # Fold the band's page scope into the cache key so a field asked over a
-    # different page set is not served a stale answer (LLM_VERSION also bumped).
-    key = llm_cache.cache_key(
-        static_prompt, payload.payload_hash, [*headers, f"::scope::{scope_key}"],
-        selection.entry.id, selection.effort,
+    prompt = build_call_prompt(
+        fields,
+        payload.scoped_prompt(pages),
+        inferable_fields=inferable,
+        corrective=corrective,
     )
+
+    provider_name = getattr(client, "provider_name", selection.entry.provider)
     attempt = LlmAttempt(
-        job_id=job_id, tier=tier, model_alias=selection.entry.alias,
+        job_id=job_id, task_id=task.record.task_id, wave=task.record.wave,
+        tier=tier, model_alias=selection.entry.alias,
         model_id=selection.entry.id, effort=selection.effort,
+        provider=provider_name,
+        schema_version=schema_version,
+        prompt_version=config.llm.planner.prompt_version,
+        selected_pages=list(pages),
+        selected_page_count=len(pages),
+        selected_image_count=task.record.image_count,
+        estimated_prompt_chars=task.record.estimated_prompt_chars,
+        estimated_prompt_tokens=task.record.estimated_prompt_tokens,
+        estimated_output_tokens=task.record.estimated_output_tokens,
         fields_requested=len(fields),
+    )
+    image_paths = payload.scoped_image_paths(pages)
+    if image_paths and hasattr(client, "capabilities"):
+        caps = client.capabilities()
+        if not caps.image_input:
+            image_pages = payload.scoped_image_pages(pages)
+            unsupported_pages = [
+                p.number for p in image_pages if not (payload.page_texts.get(p.number) or "").strip()
+            ]
+            if unsupported_pages:
+                attempt.error = (
+                    "image input unsupported by provider CLI and no OCR/text is available "
+                    f"for page(s): {', '.join(str(p) for p in unsupported_pages)}"
+                )
+                attempt.retry_status = "non_retryable"
+                return attempt, None
+            prompt = build_call_prompt(
+                fields,
+                payload.scoped_prompt_with_ocr_fallback(pages),
+                inferable_fields=inferable,
+                corrective=corrective,
+            )
+            image_paths = []
+
+    key = llm_cache.task_cache_key(
+        provider=provider_name,
+        model_id=selection.entry.id or selection.entry.alias,
+        effort=selection.effort,
+        schema_version=schema_version,
+        prompt_version=config.llm.planner.prompt_version,
+        page_hashes=payload.selected_page_hashes(pages),
+        field_keys=sparse_field_keys(fields),
     )
 
     if config.llm.cache_enabled and not settings.force:
@@ -739,25 +965,51 @@ def _run_tier(
         finally:
             conn.close()
         if cached is not None:
-            attempt.from_cache = True
-            attempt.session_id = cached["session_id"]
-            attempt.usage = cached["usage"] or attempt.usage
-            attempt.cost_usd = 0.0  # no new spend on a cache hit
-            attempt.cost_source = "cache"
-            return attempt, cached["structured"]
+            try:
+                decode_structured_response(cached["structured"], fields)
+            except StructuredResponseError as exc:
+                plan_detail = f"cached structured output failed accounting validation: {exc}"
+                log_event(logger, "llm cache entry ignored", task_id=task.record.task_id, error=plan_detail)
+                cached = None
+            if cached is not None:
+                attempt.from_cache = True
+                attempt.session_id = cached["session_id"]
+                attempt.usage = cached["usage"] or attempt.usage
+                attempt.cost_usd = 0.0  # no new spend on a cache hit
+                attempt.cost_source = "cache"
+                return attempt, cached["structured"]
 
     estimated = estimate_usage(
-        prompt_chars=len(prompt), image_count=image_count,
+        prompt_chars=len(prompt), image_count=task.record.image_count,
         field_count=len(fields), cfg=config.llm,
     )
-    estimated_cost = registry.cost_usd(estimated, selection.entry)
+    estimated_cost_maybe = registry.cost_usd(estimated, selection.entry)
+    estimated_cost = estimated_cost_maybe if estimated_cost_maybe is not None else 0.0
     budget.reserve(estimated_cost)  # BudgetExceeded propagates: memo deferred, no call made
 
-    result = client.extract_json(
-        job_id=job_id, prompt=prompt, schema_path=schema_path,
-        model=selection.entry.cli_model_arg(), effort=selection.effort,
-        cwd=payload.directory, allow_read_tool=True,
+    result = _call_provider(
+        client=client, job_id=job_id, prompt=prompt, schema=schema,
+        schema_path=schema_path, image_paths=image_paths,
+        selection=selection, payload=payload, config=config,
     )
+    if _should_fallback_legacy(result.error) and not result.ok:
+        legacy_schema = build_legacy_response_schema(fields)
+        legacy_schema_path = payload.directory / f"schema_{slug}_legacy.json"
+        with guarded_open_write(legacy_schema_path, config.pv_root, mode="wb") as fh:
+            fh.write(schema_json_bytes(legacy_schema))
+        legacy_prompt = build_legacy_call_prompt(
+            fields,
+            payload.scoped_prompt_with_ocr_fallback(pages) if not image_paths else payload.scoped_prompt(pages),
+            corrective=corrective,
+        )
+        result = _call_provider(
+            client=client, job_id=f"{job_id}-legacy", prompt=legacy_prompt,
+            schema=legacy_schema, schema_path=legacy_schema_path, image_paths=image_paths,
+            selection=selection, payload=payload, config=config,
+        )
+        schema_version = 1
+        attempt.schema_version = 1
+        attempt.prompt_version = f"{config.llm.planner.prompt_version}:legacy"
     attempt.exit_code = result.exit_code
     attempt.duration_seconds = result.duration_seconds
     attempt.session_id = result.session_id
@@ -765,21 +1017,48 @@ def _run_tier(
     if result.total_cost_usd is not None:
         attempt.cost_usd, attempt.cost_source = round(result.total_cost_usd, 6), "actual"
     elif result.usage is not None:
-        attempt.cost_usd = registry.cost_usd(result.usage, selection.entry)
-        attempt.cost_source = "actual"  # actual tokens, configured prices
+        actual_cost = registry.cost_usd(result.usage, selection.entry)
+        if actual_cost is None:
+            attempt.cost_usd = 0.0
+            attempt.cost_source = "unavailable"
+        else:
+            attempt.cost_usd = actual_cost
+            attempt.cost_source = "actual"  # actual tokens, configured prices
     else:
-        attempt.cost_usd, attempt.cost_source = estimated_cost, "estimated"
+        if estimated_cost_maybe is None:
+            attempt.cost_usd, attempt.cost_source = 0.0, "unavailable"
+        else:
+            attempt.cost_usd, attempt.cost_source = estimated_cost, "estimated"
     budget.settle(estimated_cost, attempt.cost_usd)
 
     if not result.ok or result.structured is None:
         attempt.error = result.error or "no structured output"
+        attempt.retry_status = "retryable" if _is_retryable_error(attempt.error) else "non_retryable"
         return attempt, None
+    try:
+        decode_structured_response(result.structured, fields)
+    except StructuredResponseError as exc:
+        attempt.error = f"structured output failed accounting validation: {exc}"
+        attempt.retry_status = "retryable"
+        return attempt, None
+
+    cache_store_key = key
+    if schema_version == 1:
+        cache_store_key = llm_cache.task_cache_key(
+            provider=provider_name,
+            model_id=selection.entry.id or selection.entry.alias,
+            effort=selection.effort,
+            schema_version=1,
+            prompt_version=f"{config.llm.planner.prompt_version}:legacy",
+            page_hashes=payload.selected_page_hashes(pages),
+            field_keys=sparse_field_keys(fields),
+        )
 
     conn = sqlite3.connect(str(config.db_path), timeout=30)
     try:
         llm_cache.init_cache(conn)
         llm_cache.put_cached(
-            conn, key, model_id=selection.entry.id, effort=selection.effort,
+            conn, cache_store_key, model_id=selection.entry.id, effort=selection.effort,
             structured=result.structured, session_id=result.session_id,
             usage=result.usage, cost_usd=attempt.cost_usd, cost_source=attempt.cost_source,
         )
@@ -788,22 +1067,54 @@ def _run_tier(
     return attempt, result.structured
 
 
+def _call_provider(
+    *,
+    client,
+    job_id: str,
+    prompt: str,
+    schema: dict,
+    schema_path: Path,
+    image_paths: list[Path],
+    selection: ModelSelection,
+    payload: MemoPayload,
+    config: Config,
+):
+    if hasattr(client, "extract_structured"):
+        return client.extract_structured(
+            job_id=job_id, prompt=prompt, schema=schema, images=image_paths,
+            timeout=config.llm.timeout_seconds, model=selection.entry.cli_model_arg() or None,
+            effort=selection.effort, cwd=payload.directory,
+        )
+    return client.extract_json(
+        job_id=job_id, prompt=prompt, schema_path=schema_path,
+        model=selection.entry.cli_model_arg() or None, effort=selection.effort,
+        cwd=payload.directory, allow_read_tool=True, timeout=config.llm.timeout_seconds,
+    )
+
+
+def _should_fallback_legacy(error: str | None) -> bool:
+    if not error:
+        return False
+    text = error.lower()
+    return "schema" in text and any(
+        needle in text for needle in ("unsupported", "invalid", "failed schema validation", "not accepted")
+    )
+
+
+def _is_retryable_error(error: str | None) -> bool:
+    if not error:
+        return False
+    text = error.lower()
+    non_retryable = ("auth", "login", "not authenticated", "not found on path", "unsupported", "api key")
+    if any(part in text for part in non_retryable):
+        return False
+    retryable = ("timed out", "timeout", "non-json", "invalid json", "schema validation", "no structured")
+    return any(part in text for part in retryable)
+
+
 def _flatten_response(structured: dict, fields: list[SchemaField]) -> dict[str, dict]:
-    """Band-grouped response (keyed by the sanitized schema keys) -> {workbook
-    header: field object}. The reverse key map is rebuilt from the SAME field
-    set used to build the schema, so the model's short keys resolve back to
-    headers; unknown keys are ignored (defensive)."""
-    key_map = response_key_map(fields)
-    flat: dict[str, dict] = {}
-    for band_key, band_obj in structured.items():
-        if not isinstance(band_obj, dict):
-            continue
-        field_map = key_map.get(band_key, {})
-        for field_key, result in band_obj.items():
-            header = field_map.get(field_key)
-            if header is not None and isinstance(result, dict):
-                flat[header] = result
-    return flat
+    """Sparse v2 or legacy v1 -> {workbook header: field object}."""
+    return decode_structured_response(structured, fields)
 
 
 # ---------------------------------------------------------------------------
@@ -853,82 +1164,61 @@ def _escalate_memo(
         )
         return
 
-    # In deal mode the whole document set goes in ONE call over all its pages
-    # (no band-batching); only the field-count cap can split it into a couple of
-    # same-page chunks. Otherwise honor the per-memo band-batching policy.
-    groups = (
-        _single_group(plan.fields, payload, config)
-        if deal_files is not None
-        else _build_groups(plan.fields, payload, schema_by_header, config)
+    provider_name = getattr(client, "provider_name", config.llm.provider)
+    planned = plan_assistance_tasks(
+        memo=memo, plan=plan, payload=payload, schema_by_header=schema_by_header,
+        config=config, settings=settings, registry=registry, provider=provider_name,
     )
-    # Every unique unresolved field across the memo — leftovers are surfaced
-    # once at the end (each field belongs to exactly one group).
+    tasks = planned.tasks
+    plan.tasks.extend(task.record for task in tasks)
+    prior_planner_ms = float(plan.diagnostics.get("planner_duration_ms", 0.0))
+    plan.diagnostics.update(planned.diagnostics)
+    plan.diagnostics["planner_duration_ms"] = round(
+        prior_planner_ms + float(planned.diagnostics.get("planner_duration_ms", 0.0)), 1
+    )
     unresolved: dict[str, EscalationField] = {}
-    for group in groups:
-        for escalated in group.fields:
+    for task in tasks:
+        for escalated in task.escalation_fields:
             unresolved.setdefault(escalated.field, escalated)
     log_event(
         logger, "memo escalation plan", memo_id=memo.memo_id, fields=len(unresolved),
-        groups=len(groups),
-        priority_groups=sum(1 for g in groups if g.priority),
+        tasks=len(tasks), task_count_by_wave=planned.diagnostics.get("task_count_by_wave"),
+        planner_duration_ms=planned.duration_ms,
     )
 
     deferred = False
     any_merged = False
     any_ok_attempt = False
-    for gi, group in enumerate(groups):
+    for task_index, task in enumerate(tasks):
         if deferred:
             break
-        remaining = {f.field: f for f in group.fields if f.field in unresolved}
+        remaining = {f.field: f for f in task.escalation_fields if f.field in unresolved}
         if not remaining:
             continue
-        tiers = registry.extraction_tiers(
-            mode=settings.mode, auto=config.llm.auto,
-            manual_model=settings.manual_model, manual_effort=settings.manual_effort,
-            ocr_hostile=group.ocr_hostile, allow_fable=settings.allow_fable,
-        )
-        # The no-evidence sweep gets ONE cheap pass, never the expensive retry
-        # ladder — the document showed no anchor evidence for these bands.
-        if not group.priority and tiers:
-            base = tiers[0]
-            tiers = [
-                ModelSelection(
-                    entry=base.entry, effort=config.llm.no_evidence_effort or base.effort,
-                    reason="no_evidence",
-                )
-            ]
-        dynamic_prompt = payload.scoped_prompt(group.pages)
-        image_count = payload.scoped_image_count(group.pages)
-        scope_key = ",".join(str(p) for p in group.pages)
-
-        for tier, selection in enumerate(tiers):
+        selection = task.first_selection
+        for tier, selection in enumerate([selection]):
             if not remaining:
                 break
-            fields = sorted_fields(
-                [schema_by_header[h] for h in remaining if h in schema_by_header]
-            )
-            if not fields:
-                break
-            slug = f"g{gi}t{tier}"
+            slug = f"{task.record.task_id}-t{tier}"
             try:
                 attempt, structured = _run_tier(
-                    memo=memo, payload=payload, fields=fields, selection=selection,
-                    tier=tier, slug=slug, dynamic_prompt=dynamic_prompt,
-                    image_count=image_count, scope_key=scope_key,
+                    memo=memo, payload=payload, task=task, selection=selection,
+                    tier=tier, slug=slug,
                     config=config, settings=settings, client=client,
                     registry=registry, budget=budget, run_id=run_id,
+                    corrective=tier > 0,
                 )
             except BudgetExceeded as exc:
                 deferred = True
                 plan.merge_log.append(
-                    f"{group.label} [{slug}] ({selection.entry.alias}): deferred — {exc}"
+                    f"{task.record.task_id} [{slug}] ({selection.entry.alias}): deferred — {exc}"
                 )
                 _flag_first_asset(
                     memo,
                     ReviewFlag(
                         category="llm",
                         description=f"LLM_DEFERRED: run budget reached before "
-                        f"{memo.memo_id} {group.label} — fields left for a later run",
+                        f"{memo.memo_id} task {task.record.task_id} — fields left for a later run",
                         severity=FlagSeverity.warning, reviewer_attention=True,
                     ),
                 )
@@ -936,18 +1226,47 @@ def _escalate_memo(
 
             if structured is None:
                 plan.merge_log.append(
-                    f"{group.label} [{slug}] ({selection.entry.alias}:{selection.effort}): "
+                    f"{task.record.task_id} [{slug}] ({selection.entry.alias}:{selection.effort}): "
                     f"failed — {attempt.error}"
                 )
+                if attempt.error and "timed out" in attempt.error.lower():
+                    _flag_task_failure(memo, task, attempt.error, timeout=True)
+                _flag_task_failure(memo, task, attempt.error or "provider call failed")
+                plan.attempts.append(attempt)
+                ledger.append(run_id=run_id, memo_id=memo.memo_id, attempt=attempt)
+                break
             else:
+                try:
+                    flat = _flatten_response(structured, task.schema_fields)
+                except StructuredResponseError as exc:
+                    attempt.error = f"structured output failed accounting validation: {exc}"
+                    attempt.retry_status = "retryable"
+                    plan.merge_log.append(
+                        f"{task.record.task_id} [{slug}] ({selection.entry.alias}:{selection.effort}): "
+                        f"failed — {attempt.error}"
+                    )
+                    plan.attempts.append(attempt)
+                    ledger.append(run_id=run_id, memo_id=memo.memo_id, attempt=attempt)
+                    _flag_task_failure(memo, task, attempt.error)
+                    continue
                 any_ok_attempt = True
-                flat = _flatten_response(structured, fields)
                 attempt.fields_returned = sum(1 for h in remaining if h in flat)
                 for header in list(remaining):
                     schema_field = schema_by_header.get(header)
                     result = flat.get(header)
                     if schema_field is None or result is None:
                         continue
+                    if result.get("not_found") is not True:
+                        grounding = ground_quote(
+                            str(result.get("verbatim_quote") or ""),
+                            result.get("page") if isinstance(result.get("page"), int) else None,
+                            payload,
+                            config.llm.quote_match_threshold,
+                        )
+                        if grounding.status == "grounded":
+                            attempt.fields_grounded += 1
+                        elif grounding.status == "ungrounded":
+                            attempt.fields_ungrounded += 1
                     disposition = _merge_field(memo, schema_field, result, selection, payload, config)
                     if disposition == "merged":
                         attempt.fields_merged += 1
@@ -969,12 +1288,14 @@ def _escalate_memo(
                         plan.merge_log.append(f"{header}: {disposition} ({slug})")
             plan.attempts.append(attempt)
             ledger.append(run_id=run_id, memo_id=memo.memo_id, attempt=attempt)
+            if structured is None and not _is_retryable_error(attempt.error):
+                break
 
     # Leftovers after every group: surface, never invent (D5).
     if not deferred:
         call_errors = [a.error for a in plan.attempts if a.error]
         if not any_ok_attempt and call_errors:
-            # EVERY Claude Code call failed — emit ONE actionable error carrying
+            # EVERY provider call failed — emit ONE actionable error carrying
             # the CLI's real reason, instead of an identical "no value" flag per
             # unresolved field (hundreds of those bury the actual cause and tell
             # the analyst nothing). The fields are still recorded as
@@ -984,7 +1305,7 @@ def _escalate_memo(
                 memo,
                 ReviewFlag(
                     category="llm",
-                    description=f"LLM_PASS_FAILED: every Claude Code call failed "
+                    description=f"LLM_PASS_FAILED: every provider call failed "
                     f"({len(plan.attempts)} attempt(s)) — {call_errors[0]}. No fields could "
                     f"be extracted by the LLM; fix this error and re-run.",
                     severity=FlagSeverity.hard_fail, reviewer_attention=True,
@@ -999,7 +1320,7 @@ def _escalate_memo(
                         ReviewFlag(
                             category="llm",
                             description=f"NOT_EXTRACTABLE: {header} — deterministic extraction "
-                            f"and all Claude Code passes failed",
+                            f"and all LLM passes failed",
                             severity=FlagSeverity.warning, reviewer_attention=True, field=header,
                         ),
                     )
@@ -1009,7 +1330,7 @@ def _escalate_memo(
                         ReviewFlag(
                             category="llm",
                             description=f"LLM_UNCONFIRMED: {header} — low-confidence value "
-                            f"could not be improved by Claude Code",
+                            f"could not be improved by the LLM",
                             severity=FlagSeverity.warning, reviewer_attention=True, field=header,
                         ),
                     )
@@ -1143,7 +1464,7 @@ def process_deals(
     client: ClaudeCodeClient | None = None,
     registry: ModelRegistry | None = None,
 ) -> LlmRunSummary:
-    """One-call-per-deal second pass: ONE Claude Code call per deal-period over
+    """Combined-deal second pass: one provider call per deal-period over
     the combined payload of all its documents. Mirrors process_memos (shared
     setup/accounting) but the unit of work is a DealGroup, not a single memo."""
     summary = LlmRunSummary(enabled=settings.enabled)
@@ -1213,6 +1534,15 @@ def process_deals(
     return summary
 
 
+def _provider_client(config: Config):
+    provider = (config.llm.provider or "claude").strip().lower()
+    if provider == "codex":
+        return CodexCliClient(config)
+    if provider == "claude":
+        return ClaudeCodeClient(config)
+    raise ValueError(f"unknown llm.provider {provider!r} (expected claude|codex)")
+
+
 def _setup_escalation(
     config: Config,
     settings: LlmSettings,
@@ -1221,25 +1551,32 @@ def _setup_escalation(
     *,
     client: ClaudeCodeClient | None,
     registry: ModelRegistry | None,
-) -> tuple[ModelRegistry, ClaudeCodeClient, CostLedger, BudgetTracker, dict[str, SchemaField]] | str:
-    """Shared LLM-pass setup: load the model registry, locate + auth the local
-    claude CLI, and build the cost ledger / budget tracker / header index.
+) -> tuple[ModelRegistry, object, CostLedger, BudgetTracker, dict[str, SchemaField]] | str:
+    """Shared LLM-pass setup: load model routing, locate/auth the local
+    provider CLI, and build the cost ledger / budget tracker / header index.
     Returns the assembled tuple, or an error-detail STRING the caller surfaces
     (and fails the pass with). Used by both process_memos and process_deals."""
     try:
         registry = registry or ModelRegistry.load(config.llm.models_path)
     except (OSError, ValueError) as exc:
         return f"models.yaml unusable: {exc}"
-    client = client or ClaudeCodeClient(config)
+    try:
+        client = client or _provider_client(config)
+    except ValueError as exc:
+        return str(exc)
     if client.binary_path() is None:
+        provider = getattr(client, "provider_name", config.llm.provider)
+        command = config.codex_cli.command if provider == "codex" else config.claude_code.command
         return (
-            f"claude CLI ({config.claude_code.command!r}) not found on PATH — "
-            "install Claude Code or set claude_code.command in config.yaml"
+            f"{provider} CLI ({command!r}) not found on PATH — install/configure the local CLI"
         )
-    auth_ok, auth_detail = client.auth_status()
+    if hasattr(client, "check_available"):
+        auth_ok, auth_detail = client.check_available()
+    else:
+        auth_ok, auth_detail = client.auth_status()
     if not auth_ok:
         return auth_detail
-    if config.claude_code.auto_update_on_start:
+    if getattr(client, "provider_name", "claude") == "claude" and config.claude_code.auto_update_on_start:
         client.update()
     registry.refresh_cli_status(client)
     ledger = CostLedger(run_dir / "llm" / LEDGER_FILENAME, config.pv_root)
@@ -1250,6 +1587,23 @@ def _setup_escalation(
 
 def _accumulate_summary(summary: LlmRunSummary, memos: list[MemoResult]) -> None:
     """Fold each memo's escalation plan attempts/status into the run summary."""
+    diagnostics = {
+        "task_count_by_wave": {},
+        "requested_fields": 0,
+        "found_fields": 0,
+        "not_found_fields": 0,
+        "grounded_fields": 0,
+        "ungrounded_fields": 0,
+        "selected_page_count": 0,
+        "selected_image_count": 0,
+        "estimated_prompt_chars": 0,
+        "estimated_output_tokens": 0,
+        "provider_duration_seconds": 0.0,
+        "timeouts": 0,
+        "retries": 0,
+        "cache_hits": 0,
+        "planner_duration_ms": 0.0,
+    }
     for memo in memos:
         plan = memo.escalation
         if plan is None:
@@ -1259,6 +1613,19 @@ def _accumulate_summary(summary: LlmRunSummary, memos: list[MemoResult]) -> None
             summary.memos_deferred += 1
         if plan.status == "llm_failed":
             summary.memos_failed += 1
+        diagnostics["planner_duration_ms"] = round(
+            float(diagnostics["planner_duration_ms"]) + float(plan.diagnostics.get("planner_duration_ms", 0.0)),
+            1,
+        )
+        for task in plan.tasks:
+            wave_key = str(task.wave)
+            by_wave = diagnostics["task_count_by_wave"]
+            by_wave[wave_key] = by_wave.get(wave_key, 0) + 1
+            diagnostics["requested_fields"] += len(task.requested_fields)
+            diagnostics["selected_page_count"] += len(task.selected_pages)
+            diagnostics["selected_image_count"] += task.image_count
+            diagnostics["estimated_prompt_chars"] += task.estimated_prompt_chars
+            diagnostics["estimated_output_tokens"] += task.estimated_output_tokens
         for attempt in plan.attempts:
             summary.attempts += 1
             summary.cache_hits += 1 if attempt.from_cache else 0
@@ -1266,7 +1633,19 @@ def _accumulate_summary(summary: LlmRunSummary, memos: list[MemoResult]) -> None
             summary.any_actual_costs = summary.any_actual_costs or attempt.cost_source == "actual"
             label = attempt.job_id + (f":{attempt.session_id}" if attempt.session_id else "")
             summary.session_labels.append(label)
+            diagnostics["found_fields"] += attempt.fields_merged + attempt.fields_rejected
+            diagnostics["not_found_fields"] += attempt.fields_not_found
+            diagnostics["grounded_fields"] += attempt.fields_grounded
+            diagnostics["ungrounded_fields"] += attempt.fields_ungrounded
+            diagnostics["provider_duration_seconds"] = round(
+                float(diagnostics["provider_duration_seconds"]) + attempt.duration_seconds,
+                2,
+            )
+            diagnostics["timeouts"] += 1 if attempt.error and "timed out" in attempt.error.lower() else 0
+            diagnostics["retries"] += 1 if attempt.tier > 0 else 0
+            diagnostics["cache_hits"] += 1 if attempt.from_cache else 0
     summary.total_cost_usd = round(summary.total_cost_usd, 4)
+    summary.diagnostics = diagnostics
 
 
 def _fail_all(memos: list[MemoResult], detail: str) -> None:

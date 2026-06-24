@@ -57,6 +57,16 @@ def ledger_entries(run_dir: Path) -> list[dict]:
     return read_ledger(path) if path.exists() else []
 
 
+def run_diagnostics(run_dir: Path) -> dict:
+    path = run_dir / "diagnostics.json"
+    if not path.exists():
+        return {}
+    with open_read(path) as fh:
+        data = json.loads(fh.read().decode("utf-8"))
+    diagnostics = data.get("diagnostics")
+    return diagnostics if isinstance(diagnostics, dict) else {}
+
+
 def workbook_path(run_dir: Path) -> Path | None:
     matches = sorted(run_dir.glob("master_index_*.xlsx"))
     return matches[0] if matches else None
@@ -164,6 +174,7 @@ def _derive_summary(run_dir: Path) -> dict:
             ),
             "detail": "",
         },
+        "diagnostics": run_diagnostics(run_dir),
     }
 
 

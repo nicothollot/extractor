@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { useEffect, useMemo, useState } from "react";
+import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { HLWorkingHints } from "../components/branding";
 import { DataTable } from "../components/DataTable";
@@ -14,6 +14,8 @@ import { Button, Card, CardHeader, Field, Panel, StatusChip, Toggle, inputCls } 
 import {
   ConfigResponse,
   CoverageEntry,
+  ApiError,
+  JobConflictDetail,
   JobInfo,
   ModelsResponse,
   MultiFirmSelection,
@@ -103,6 +105,68 @@ const slotKeyParts = (key: string): { client: string; deal: string } => {
   return { client: parts[0] ?? "", deal: parts[1] ?? "" };
 };
 
+const ACTIVE_JOB_STATUSES = new Set(["queued", "running", "cancelling"]);
+const TERMINAL_PROBLEM_STATUSES = new Set(["failed", "cancelled", "interrupted"]);
+
+const parseJobConflict = (error: unknown): JobConflictDetail | null => {
+  if (!(error instanceof ApiError) || error.status !== 409) return null;
+  const detail = error.detail;
+  if (
+    detail &&
+    typeof detail === "object" &&
+    (detail as { code?: unknown }).code === "active_pipeline_job" &&
+    typeof (detail as { active_job?: { id?: unknown } }).active_job?.id === "string"
+  ) {
+    return detail as JobConflictDetail;
+  }
+  return null;
+};
+
+function ActiveJobConflictPanel({
+  conflict,
+  onOpen,
+}: {
+  conflict: JobConflictDetail;
+  onOpen: (jobId: string) => void;
+}) {
+  const active = conflict.active_job;
+  return (
+    <div className="mt-3 rounded border border-warn bg-warn-soft px-3 py-2 text-[12.5px] text-ink-800 space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="font-semibold">Another pipeline job is active</p>
+          <p>
+            {conflict.message}{" "}
+            <span className="font-mono">
+              {active.id} · {active.kind} · {active.status}
+            </span>
+          </p>
+          <p className="text-[11.5px] text-ink-500">created {new Date(active.created_at).toLocaleString()}</p>
+        </div>
+        <Button kind="secondary" onClick={() => onOpen(active.id)}>
+          Open active job
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function InlineActionPanel({
+  tone,
+  children,
+}: {
+  tone: "warn" | "err" | "info";
+  children: ReactNode;
+}) {
+  const cls =
+    tone === "err"
+      ? "border-err bg-err-soft"
+      : tone === "warn"
+        ? "border-warn bg-warn-soft"
+        : "border-info bg-info-soft";
+  return <div className={`mt-3 rounded border ${cls} px-3 py-2 text-[12.5px] text-ink-800 space-y-2`}>{children}</div>;
+}
+
 /* Top-level mode switch. Single Search is the existing wizard, byte-for-behavior
    unchanged; Multi Search is purely additive. The choice persists on the wizard
    state so it survives tab switches. */
@@ -163,7 +227,11 @@ function SingleRun() {
   const [llmDiscoverJobId, setLlmDiscoverJobId] = useState<string | null>(null);
   const [llmDiscoverError, setLlmDiscoverError] = useState<string | null>(null);
   const [estimateError, setEstimateError] = useState<string | null>(null);
+  const [estimateLoading, setEstimateLoading] = useState(false);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  const [activeConflict, setActiveConflict] = useState<JobConflictDetail | null>(null);
+  const [preflightSubmitting, setPreflightSubmitting] = useState(false);
+  const preflightSubmitRef = useRef(false);
 
   const clients = useLoad<{ clients: string[] }>("/api/index/clients");
   const deals = useLoad<{
@@ -201,7 +269,8 @@ function SingleRun() {
   );
 
   // LLM-assisted discovery job
-  const llmDiscoverJob = useJobPolling(llmDiscoverJobId);
+  const llmDiscoverPolling = useJobPolling(llmDiscoverJobId);
+  const llmDiscoverJob = llmDiscoverPolling.job;
   useEffect(() => {
     if (llmDiscoverJob?.status === "completed") deals.reload();
     if (llmDiscoverJob?.status === "failed") setLlmDiscoverError(llmDiscoverJob.error ?? "discovery failed");
@@ -260,8 +329,8 @@ function SingleRun() {
     if (models.data && !state.aiInitialized) {
       patch({
         budget: budget || String(models.data.llm.budget_usd),
-        manualModel: models.data.llm.manual_model,
-        manualEffort: models.data.llm.manual_effort,
+        manualModel: models.data.llm.single_model_model ?? models.data.llm.manual_model,
+        manualEffort: models.data.llm.single_model_effort ?? models.data.llm.manual_effort,
         aiInitialized: true,
       });
     }
@@ -278,25 +347,37 @@ function SingleRun() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [templates.data]);
 
-  const preflightJob = useJobPolling(preflightJobId);
-  useEffect(() => {
-    if (preflightJob?.status === "completed" && preflightJobId && !estimate) {
-      const params = new URLSearchParams();
-      if (llmEnabled) {
-        params.set("mode", mode);
-        if (mode === "manual") {
-          params.set("model", manualModel);
-          params.set("effort", manualEffort);
-        }
-        if (budget) params.set("budget", budget);
-        if (forceLlmAssist) params.set("force_assist", "true");
+  const preflightPolling = useJobPolling(preflightJobId);
+  const preflightJob = preflightPolling.job;
+  const fetchEstimate = useCallback(async () => {
+    if (!preflightJobId) return;
+    setEstimateLoading(true);
+    setEstimateError(null);
+    const params = new URLSearchParams();
+    if (llmEnabled) {
+      params.set("routing_mode", mode);
+      if (mode === "single_model") {
+        params.set("model", manualModel);
+        params.set("effort", manualEffort);
       }
-      get<PreflightEstimate>(`/api/jobs/${preflightJobId}/preflight?${params}`)
-        .then((e) => patch({ estimate: e }))
-        .catch((e: Error) => setEstimateError(e.message));
+      if (budget) params.set("budget", budget);
+      if (forceLlmAssist) params.set("force_assist", "true");
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [preflightJob?.status, estimate]);
+    try {
+      const e = await get<PreflightEstimate>(`/api/jobs/${preflightJobId}/preflight?${params}`);
+      patch({ estimate: e });
+    } catch (e) {
+      setEstimateError((e as Error).message);
+    } finally {
+      setEstimateLoading(false);
+    }
+  }, [budget, forceLlmAssist, llmEnabled, manualEffort, manualModel, mode, patch, preflightJobId]);
+
+  useEffect(() => {
+    if (preflightJob?.status === "completed" && preflightJobId && !estimate && !estimateLoading && !estimateError) {
+      void fetchEstimate();
+    }
+  }, [estimate, estimateError, estimateLoading, fetchEstimate, preflightJob?.status, preflightJobId]);
 
   const scopeValid =
     (period.trim() !== "" || periods.length > 0) &&
@@ -319,34 +400,56 @@ function SingleRun() {
     exclude: removedSlots.map(slotKeyParts),
     llm: {
       enabled: llmEnabled,
+      routing_mode: llmEnabled ? mode : null,
       mode: llmEnabled ? mode : null,
-      model: llmEnabled && mode === "manual" ? manualModel : null,
-      effort: llmEnabled && mode === "manual" ? manualEffort : null,
+      model: llmEnabled && mode === "single_model" ? manualModel : null,
+      effort: llmEnabled && mode === "single_model" ? manualEffort : null,
+      single_model: llmEnabled && mode === "single_model" ? { provider: models.data?.llm.provider ?? "claude", model: manualModel, effort: manualEffort } : null,
+      repair_policy: "never",
       budget_usd: llmEnabled && budget ? Number(budget) : null,
       force_llm_assist: llmEnabled && forceLlmAssist,
     },
   });
 
   const startPreflight = async () => {
+    if (preflightSubmitRef.current) return;
+    preflightSubmitRef.current = true;
+    setPreflightSubmitting(true);
     setEstimateError(null);
     setLaunchError(null);
+    setActiveConflict(null);
     patch({ estimate: null, docsConfirmed: false });
     try {
       const r = await post<{ job: JobInfo }>("/api/jobs/run", runRequest(true));
       patch({ preflightJobId: r.job.id });
     } catch (e) {
-      setEstimateError((e as Error).message);
+      const conflict = parseJobConflict(e);
+      if (conflict) {
+        setActiveConflict(conflict);
+      } else {
+        setEstimateError((e as Error).message);
+      }
+    } finally {
+      preflightSubmitRef.current = false;
+      setPreflightSubmitting(false);
     }
   };
 
   const launchRun = async () => {
     setLaunchError(null);
+    setActiveConflict(null);
     try {
       const r = await post<{ job: JobInfo }>("/api/jobs/run", runRequest(dryRunOnly));
       patch({ runJobId: r.job.id, runId: r.job.run_id, step: 6 });
       navigate(`/jobs/${r.job.id}/progress`);
     } catch (e) {
-      setLaunchError((e as Error).message);
+      const conflict = parseJobConflict(e);
+      if (conflict) {
+        setActiveConflict(conflict);
+        setLaunchError(conflict.message);
+      } else {
+        setLaunchError((e as Error).message);
+      }
     }
   };
 
@@ -354,6 +457,8 @@ function SingleRun() {
     const result = preflightJob?.result as RunResult | null;
     return result?.coverage ?? null;
   }, [preflightJob]);
+  const preflightActive = ACTIVE_JOB_STATUSES.has(preflightJob?.status ?? "");
+  const preflightTerminalProblem = preflightJob && TERMINAL_PROBLEM_STATUSES.has(preflightJob.status);
 
   const auto = models.data?.llm.auto;
 
@@ -434,7 +539,7 @@ function SingleRun() {
                     <p className="text-[11px] text-ink-400 mt-1">
                       {discoveryMode === "browse" && "Pick from the deal folders discovered during the index scan."}
                       {discoveryMode === "search" && "Type names — fuzzy search shows matching folders with their full path so you can confirm the right one."}
-                      {discoveryMode === "llm" && "A local Claude Code session maps the client folder and proposes its deal folders (no API key — your claude login)."}
+                      {discoveryMode === "llm" && "A local LLM session maps the client folder and proposes its deal folders (no API key)."}
                     </p>
                   </Field>
                 )}
@@ -619,7 +724,7 @@ function SingleRun() {
                   </div>
                 )}
 
-                {/* ---- llm mode: discover-with-Claude panel ---- */}
+                {/* ---- llm mode: local LLM discovery panel ---- */}
                 {scope === "deal" && discoveryMode === "llm" && client && (
                   <div className="space-y-2">
                     {deals.data?.last_llm_discovery && (
@@ -640,7 +745,7 @@ function SingleRun() {
                           effort={llmDiscoverEffort}
                           onModel={(m) => patch({ llmDiscoverModel: m })}
                           onEffort={(e) => patch({ llmDiscoverEffort: e })}
-                          modelLabel="Model (aliases float to the newest of each tier as claude updates)"
+                          modelLabel="Model (aliases float to the newest configured model in each tier)"
                           effortLabel="Effort"
                         />
                       </div>
@@ -653,6 +758,14 @@ function SingleRun() {
                       </Button>
                     </div>
                     {llmDiscoverError && <p className="text-[12px] text-err">{llmDiscoverError}</p>}
+                    {llmDiscoverPolling.degraded && (
+                      <p className="text-[12px] text-warn">
+                        discovery status polling degraded: {llmDiscoverPolling.lastError}{" "}
+                        <button className="underline" onClick={llmDiscoverPolling.refresh}>
+                          retry
+                        </button>
+                      </p>
+                    )}
                     {llmDiscoveredDeals && (
                       <div className="border border-line rounded-[var(--hl-radius)] divide-y divide-line overflow-hidden">
                         {llmDiscoveredDeals.map((m) => (
@@ -772,16 +885,17 @@ function SingleRun() {
           {step === 2 && (
             <div className="space-y-4">
               <Card>
-                <CardHeader title="AI / model settings" sub="Claude Code CLI fallback — local sessions, never an API key" />
+                <CardHeader title="AI / model settings" sub="Local LLM assist — local sessions, never an API key" />
                 <div className="px-4 pb-4 space-y-4 max-w-3xl">
                   <Toggle checked={llmEnabled} onChange={(v) => patchAi({ llmEnabled: v })} label="LLM fallback enabled (escalated fields only)" />
                   {llmEnabled && (
                     <>
                       <div className="grid grid-cols-3 gap-4">
                         <Field label="Routing">
-                          <select className={inputCls} value={mode} onChange={(e) => patchAi({ mode: e.target.value as "auto" | "manual" })}>
-                            <option value="auto">AUTO — route by task</option>
-                            <option value="manual">MANUAL — one model for everything</option>
+                          <select className={inputCls} value={mode} onChange={(e) => patchAi({ mode: e.target.value as "auto" | "per_deal" | "single_model" })}>
+                            <option value="auto">AUTO — choose the best plan for each deal</option>
+                            <option value="per_deal">MANUAL — choose per deal</option>
+                            <option value="single_model">SINGLE MODEL — use one model for every deal</option>
                           </select>
                         </Field>
                         <Field label="Budget cap (USD, hard)">
@@ -792,16 +906,13 @@ function SingleRun() {
                         <div className="bg-surface border border-line rounded-[var(--hl-radius)] px-3 py-2 text-[12.5px] text-ink-700 space-y-1">
                           <p className="font-semibold text-ink-800 text-[12px] uppercase tracking-wide">Router rules (config)</p>
                           <p>
-                            extraction → <span className="font-mono">{auto.extraction_model}/{auto.extraction_effort}</span> · OCR-hostile memos →{" "}
+                            extraction → <span className="font-mono">{auto.extraction_model}/{auto.extraction_effort}</span> · image-heavy or large deals →{" "}
                             <span className="font-mono">{auto.ocr_hostile_model}/{auto.ocr_hostile_effort}</span>
                           </p>
-                          <p>
-                            retry → <span className="font-mono">{auto.retry_model}/{auto.retry_effort}</span> (effort bump{" "}
-                            <span className="font-mono">{auto.retry_effort_bump}</span> when the tier repeats) · fable only on explicit opt-in
-                          </p>
+                          <p>repair disabled by default · whole-deal/per-document shape comes from editable model profiles</p>
                         </div>
                       )}
-                      {mode === "manual" && (
+                      {mode === "single_model" && (
                         <div className="max-w-md">
                           <ModelEffortPicker
                             models={models.data?.models}
@@ -843,15 +954,81 @@ function SingleRun() {
                   title="Preflight"
                   sub="server-side dry run + cost ESTIMATE — required before confirming documents"
                   right={
-                    <Button kind="secondary" onClick={startPreflight} disabled={preflightJob?.status === "running" || preflightJob?.status === "queued"}>
-                      {preflightJobId ? "Re-run preflight" : "Run preflight"}
+                    <Button kind="secondary" onClick={startPreflight} disabled={preflightSubmitting || preflightActive}>
+                      {preflightSubmitting ? "Starting…" : preflightJobId ? "Re-run preflight" : "Run preflight"}
                     </Button>
                   }
                 />
                 <div className="px-4 pb-4">
                   {!preflightJobId && <p className="text-[12.5px] text-ink-500">Preflight locates and verifies every document in scope without writing anything.</p>}
-                  {preflightJob && ["queued", "running"].includes(preflightJob.status) && (
-                    <HLWorkingHints messages={PREFLIGHT_HINTS} />
+                  {preflightJobId && preflightPolling.initialLoading && !preflightJob && !preflightPolling.notFound && (
+                    <InlineActionPanel tone="info">
+                      <p>
+                        Loading preflight job <span className="font-mono">{preflightJobId}</span>…
+                      </p>
+                    </InlineActionPanel>
+                  )}
+                  {activeConflict && <ActiveJobConflictPanel conflict={activeConflict} onOpen={(jobId) => navigate(`/jobs/${jobId}/progress`)} />}
+                  {preflightPolling.notFound && (
+                    <InlineActionPanel tone="err">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="font-semibold">Preflight job was not found</p>
+                          <p>
+                            Job <span className="font-mono">{preflightJobId}</span> is no longer available. {preflightPolling.lastError}
+                          </p>
+                        </div>
+                        <Button kind="secondary" onClick={preflightPolling.refresh}>
+                          Refresh
+                        </Button>
+                      </div>
+                    </InlineActionPanel>
+                  )}
+                  {preflightPolling.degraded && !preflightPolling.notFound && (
+                    <InlineActionPanel tone="warn">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="font-semibold">Still trying to reach the preflight job</p>
+                          <p>
+                            Job <span className="font-mono">{preflightJobId}</span> status polling has failed{" "}
+                            {preflightPolling.retryCount} time{preflightPolling.retryCount === 1 ? "" : "s"}: {preflightPolling.lastError}
+                          </p>
+                        </div>
+                        <Button kind="secondary" onClick={preflightPolling.refresh}>
+                          Retry now
+                        </Button>
+                      </div>
+                    </InlineActionPanel>
+                  )}
+                  {preflightJob && preflightActive && (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 text-[12.5px] text-ink-600">
+                        <StatusChip value={preflightJob.status} />
+                        <span>
+                          job <span className="font-mono">{preflightJob.id}</span>
+                        </span>
+                      </div>
+                      <HLWorkingHints messages={PREFLIGHT_HINTS} />
+                    </div>
+                  )}
+                  {preflightTerminalProblem && (
+                    <InlineActionPanel tone={preflightJob.status === "failed" ? "err" : "warn"}>
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="font-semibold">
+                            Preflight <StatusChip value={preflightJob.status} />
+                          </p>
+                          <p>
+                            job <span className="font-mono">{preflightJob.id}</span>
+                          </p>
+                          {preflightJob.error && <p className="text-err">{preflightJob.error}</p>}
+                          {preflightJob.diagnostics?.summary && <p>{preflightJob.diagnostics.summary}</p>}
+                        </div>
+                        <Button kind="secondary" onClick={startPreflight} disabled={preflightSubmitting}>
+                          Run Preflight again
+                        </Button>
+                      </div>
+                    </InlineActionPanel>
                   )}
                   {preflightCoverage && (
                     <DataTable<CoverageEntry>
@@ -865,7 +1042,26 @@ function SingleRun() {
                       ]}
                     />
                   )}
-                  {estimateError && <p className="text-[12px] text-err mt-2">{estimateError}</p>}
+                  {estimateLoading && (
+                    <p className="text-[12px] text-ink-500 mt-2">
+                      Fetching estimate for job <span className="font-mono">{preflightJobId}</span>…
+                    </p>
+                  )}
+                  {estimateError && (
+                    <InlineActionPanel tone="err">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="font-semibold">Estimate request failed</p>
+                          <p>
+                            job <span className="font-mono">{preflightJobId}</span>: {estimateError}
+                          </p>
+                        </div>
+                        <Button kind="secondary" onClick={fetchEstimate} disabled={estimateLoading || preflightJob?.status !== "completed"}>
+                          Retry Estimate
+                        </Button>
+                      </div>
+                    </InlineActionPanel>
+                  )}
                 </div>
               </Card>
 
@@ -922,7 +1118,7 @@ function SingleRun() {
                   <p>period{periods.length > 1 ? "s" : ""} <span className="font-medium text-ink-900">{periods.length > 0 ? `${periods.length} selected` : period}</span></p>
                   <p>document type{docTypes.length > 1 ? "s" : ""} <span className="font-mono">{docTypes.length > 0 ? docTypes.join(", ") : docType.replace(/_/g, " ")}</span></p>
                   <p>removed slots <span className="font-mono">{removedSlots.length}</span></p>
-                  <p>LLM fallback <span className="font-medium">{llmEnabled ? `${mode}${mode === "manual" ? ` · ${manualModel}/${manualEffort}` : ""}${forceLlmAssist ? " · force assist (LLM primary)" : ""}` : "disabled"}</span></p>
+                  <p>LLM extraction <span className="font-medium">{llmEnabled ? `${mode}${mode === "single_model" ? ` · ${manualModel}/${manualEffort}` : ""}${forceLlmAssist ? " · force assist (LLM primary)" : ""}` : "disabled"}</span></p>
                   {estimate && <p>est. first-tier cost <span className="font-mono">{fmtUsd(estimate.estimated_total_usd, 4)}</span></p>}
                 </div>
                 <p className="text-[12px] text-ink-500 border-t border-line pt-3">
@@ -931,6 +1127,7 @@ function SingleRun() {
                 {!docsConfirmed && <p className="text-[12px] text-warn">Confirm the document selection (step 5) before launching.</p>}
                 {!preflightDone && <p className="text-[12px] text-warn">Run preflight (step 4) before launching.</p>}
                 {launchError && <p className="text-[12px] text-err">{launchError}</p>}
+                {activeConflict && <ActiveJobConflictPanel conflict={activeConflict} onOpen={(jobId) => navigate(`/jobs/${jobId}/progress`)} />}
               </div>
             </Card>
           )}
@@ -1024,6 +1221,8 @@ function MultiRun() {
   const [previewing, setPreviewing] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  const [activeConflict, setActiveConflict] = useState<JobConflictDetail | null>(null);
+  const [launching, setLaunching] = useState(false);
 
   const models = useLoad<ModelsResponse>("/api/models");
   const clientsStatus = useLoad<{ folders: { name: string; path: string; files: number }[] }>(
@@ -1096,9 +1295,12 @@ function MultiRun() {
 
   const llmOptions = () => ({
     enabled: llmEnabled,
+    routing_mode: llmEnabled ? mode : null,
     mode: llmEnabled ? mode : null,
-    model: llmEnabled && mode === "manual" ? manualModel : null,
-    effort: llmEnabled && mode === "manual" ? manualEffort : null,
+    model: llmEnabled && mode === "single_model" ? manualModel : null,
+    effort: llmEnabled && mode === "single_model" ? manualEffort : null,
+    single_model: llmEnabled && mode === "single_model" ? { provider: models.data?.llm.provider ?? "claude", model: manualModel, effort: manualEffort } : null,
+    repair_policy: "never" as const,
     budget_usd: llmEnabled && budget ? Number(budget) : null,
     force_llm_assist: llmEnabled && forceLlmAssist,
   });
@@ -1120,7 +1322,10 @@ function MultiRun() {
   };
 
   const launch = async () => {
+    if (launching) return;
+    setLaunching(true);
     setLaunchError(null);
+    setActiveConflict(null);
     const body: MultiSearchRunRequest = {
       firms: multiFirms.map(firmToApi),
       template: multiTemplate,
@@ -1132,12 +1337,15 @@ function MultiRun() {
       patch({ multiRunJobId: r.job.id, multiRunId: r.job.run_id });
       navigate(`/jobs/${r.job.id}/progress`);
     } catch (e) {
-      const err = e as { status?: number; message: string };
-      setLaunchError(
-        err.status === 409
-          ? "A pipeline run is already active. Wait for it to finish (or cancel it) before launching a multi-firm run."
-          : err.message,
-      );
+      const conflict = parseJobConflict(e);
+      if (conflict) {
+        setActiveConflict(conflict);
+        setLaunchError(conflict.message);
+      } else {
+        setLaunchError((e as Error).message);
+      }
+    } finally {
+      setLaunching(false);
     }
   };
 
@@ -1236,15 +1444,16 @@ function MultiRun() {
               {llmEnabled && (
                 <div className="grid grid-cols-3 gap-4">
                   <Field label="Routing">
-                    <select className={inputCls} value={mode} onChange={(e) => patch({ mode: e.target.value as "auto" | "manual" })}>
-                      <option value="auto">AUTO — route by task</option>
-                      <option value="manual">MANUAL — one model for everything</option>
+                    <select className={inputCls} value={mode} onChange={(e) => patch({ mode: e.target.value as "auto" | "per_deal" | "single_model" })}>
+                      <option value="auto">AUTO — choose the best plan for each deal</option>
+                      <option value="per_deal">MANUAL — choose per deal</option>
+                      <option value="single_model">SINGLE MODEL — use one model for every deal</option>
                     </select>
                   </Field>
                   <Field label="Budget cap (USD, hard)">
                     <input className={inputCls} type="number" min="0" step="0.5" value={budget} onChange={(e) => patch({ budget: e.target.value })} />
                   </Field>
-                  {mode === "manual" && (
+                  {mode === "single_model" && (
                     <div className="col-span-2">
                       <ModelEffortPicker
                         models={models.data?.models}
@@ -1308,8 +1517,9 @@ function MultiRun() {
       )}
 
       {launchError && (
-        <Card className="px-4 py-3">
+        <Card className="px-4 py-3 space-y-2">
           <p className="text-[12.5px] text-err">{launchError}</p>
+          {activeConflict && <ActiveJobConflictPanel conflict={activeConflict} onOpen={(jobId) => navigate(`/jobs/${jobId}/progress`)} />}
         </Card>
       )}
 
@@ -1317,7 +1527,7 @@ function MultiRun() {
         <Button
           kind="primary"
           onClick={launch}
-          disabled={!firmsValid || !multiSelection || !multiConfirmed}
+          disabled={launching || !firmsValid || !multiSelection || !multiConfirmed}
           title={
             !firmsValid
               ? "Add firms and give each a period"
@@ -1328,7 +1538,7 @@ function MultiRun() {
                   : undefined
           }
         >
-          {multiDryRunOnly ? "Launch multi dry run" : "Launch multi run"}
+          {launching ? "Launching…" : multiDryRunOnly ? "Launch multi dry run" : "Launch multi run"}
         </Button>
       </div>
 
@@ -2134,7 +2344,8 @@ function ConfirmDocuments({
 
 function ReviewStep({ runJobId, runId, onReset }: { runJobId: string | null; runId: string | null; onReset: () => void }) {
   const navigate = useNavigate();
-  const job = useJobPolling(runJobId);
+  const jobPolling = useJobPolling(runJobId);
+  const job = jobPolling.job;
   const status = job?.status ?? "running";
   const done = !["queued", "running", "cancelling"].includes(status);
   const resolvedRunId = job?.run_id ?? runId;
@@ -2156,6 +2367,30 @@ function ReviewStep({ runJobId, runId, onReset }: { runJobId: string | null; run
                 ? "Run finished. Review every flagged and low-confidence field, with the source page beside each value."
                 : "Run in progress — the live pipeline view is open. You can keep working; this opens in the review queue when complete."}
             </p>
+            {jobPolling.degraded && (
+              <InlineActionPanel tone="warn">
+                <div className="flex items-center justify-between gap-3">
+                  <p>
+                    Run status polling degraded for <span className="font-mono">{runJobId}</span>: {jobPolling.lastError}
+                  </p>
+                  <Button kind="secondary" onClick={jobPolling.refresh}>
+                    Retry now
+                  </Button>
+                </div>
+              </InlineActionPanel>
+            )}
+            {jobPolling.notFound && (
+              <InlineActionPanel tone="err">
+                <div className="flex items-center justify-between gap-3">
+                  <p>
+                    Run job <span className="font-mono">{runJobId}</span> was not found: {jobPolling.lastError}
+                  </p>
+                  <Button kind="secondary" onClick={jobPolling.refresh}>
+                    Refresh
+                  </Button>
+                </div>
+              </InlineActionPanel>
+            )}
             <div className="flex gap-2">
               <Button kind="secondary" onClick={() => navigate(`/jobs/${runJobId}/progress`)}>
                 Live progress →

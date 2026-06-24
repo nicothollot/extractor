@@ -34,6 +34,14 @@ claude_code:
   default_timeout_seconds: 120
   allow_cli_usage: true          # master switch; Phase 1 only runs auth/version checks, never sends memo data
 
+codex_cli:
+  command: codex                 # temporary provider: local authenticated Codex CLI only
+  command_args: []               # extra argv before codex's own args, if a local wrapper is needed
+  default_timeout_seconds: 180
+  model:                         # null = use local Codex CLI/config default
+  reasoning_effort: high
+  debug_capture_raw_response: false  # only true when debugging malformed structured output
+
 indexer:
   batch_size: 5000               # executemany chunk size for bulk ingest
   follow_symlinks: false         # never follow symlinks/junctions while scanning
@@ -378,36 +386,38 @@ selection:
   # value). 0.0 = keep every located document (no confidence filtering).
   min_confidence: 0.0
 
-# --- Phase 3: Claude Code CLI fallback (LLM second pass) ---
-# No Anthropic SDK, no ANTHROPIC_API_KEY: hidden local `claude -p` sessions
-# reuse the operator's one-time `claude auth login`. The deterministic engine
-# stays primary; only escalated fields (below extraction.confidence_threshold
-# or required-but-empty) reach Claude Code, and only their candidate pages are
-# sent (plus pages 1-3) — never whole documents.
+# --- Phase 3: local CLI LLM extraction ---
+# Normal path: choose one model/profile per deal, choose whole-deal or
+# per-document, extract once, validate/ground, confidence-arbitrate locally,
+# finalize, then review unresolved fields. Repair is optional and off by
+# default.
+# Python never calls a hosted LLM API directly. provider: claude uses the
+# existing local Claude Code behavior; provider: codex shells out to `codex exec`.
 llm:
   enabled: true                    # --no-llm at run time gives pure Phase-2 behavior
-  mode: manual                     # auto = route by task | manual = one forced model+effort
-  manual_model: sonnet             # used when mode: manual (alias or full id from config/models.yaml)
+  provider: claude                 # claude | codex
+  routing_mode: auto               # auto | per_deal | single_model
+  mode: auto                       # deprecated compatibility spelling; manual maps to single_model
+  single_model_provider: claude
+  single_model_model: sonnet       # used when routing_mode: single_model
+  single_model_effort: medium
+  manual_model: sonnet             # deprecated; old manual configs map to single_model
   manual_effort: low
   allow_fable: false               # Fable is the most expensive tier: explicit opt-in only
   budget_usd: 25.0                 # hard per-run cap; past it memos are marked LLM_DEFERRED
-  workers: 2                       # hidden Claude Code session concurrency (don't hammer CLI/share)
-  models_path: ./config/models.yaml  # model menu + editable pricing assumptions
-  cache_enabled: true              # response cache keyed on prompt+payload+fields+model+effort
-  timeout_seconds: 600             # per extraction call
-  max_pages_per_memo: 20           # payload cap: candidate pages + pages 1-3
-  one_call_per_deal: true          # ONE claude -p call per deal-period over ALL its documents' pages +
-                                   #   the whole field set (deterministic engine still runs first for
-                                   #   grounding/comps/derived). Far faster than per-band multi-call
-                                   #   fan-out; implies comprehensive escalation + result-cache bypass.
-                                   #   false = legacy per-memo band-batched path (unchanged).
+  workers: 2                       # hidden local CLI session concurrency (don't hammer CLI/share)
+  models_path: ./config/models.yaml  # provider model menu + editable pricing assumptions
+  cache_enabled: true              # task cache keyed on provider/model/effort/schema/prompt/page hashes/fields
+  timeout_seconds: 180             # per primary provider request
+  max_pages_per_memo: 20           # per-document payload page cap before provider transport
+  combine_deal_documents: false    # legacy override forcing whole-deal payload shape; normal routing
+                                   #   should use routing_mode/model profiles instead.
+  one_call_per_deal: false         # deprecated legacy spelling; use combine_deal_documents
   max_pages_per_deal: 40           # total page cap for the combined per-deal payload (across its docs)
   image_max_long_edge: 1080        # SCANNED/IMAGE_TABLE pages render to PNG at most this long edge
   quote_match_threshold: 85        # fuzzy quote-grounding floor for OCR'd pages
-  band_batched: true               # focused per-band LLM calls (relevance-ordered) vs one giant call
-  single_call_max_pages: 8         # when the LLM payload is <= this many pages, ignore band_batched
-                                   #   and make ONE call over the whole doc + all fields (cheaper/faster
-                                   #   for short client memos; large memos still band-batch). 0 disables.
+  band_batched: true               # legacy compatibility knob; normal path ignores small field batches
+  single_call_max_pages: 0         # disabled: do not collapse into whole-document/all-field calls
   retry_not_found: false           # false = a field the model marks not_found is RESOLVED (no expensive
                                    #   retry tier, no NOT_EXTRACTABLE flag — a confirmed absence is not a
                                    #   failure); failed/rejected fields still escalate. true = old behavior.
@@ -416,17 +426,75 @@ llm:
                                    #   flagged hit for review, not discarded. false = discard it (stricter).
   ungrounded_confidence_cap: 0.2   # max confidence stamped on a surfaced ungrounded value
   band_relevance_floor: 0.0        # band page-anchor score strictly above this counts as "has evidence"
-  max_fields_per_call: 200         # fields per LLM call; the $ref schema is ~10x smaller, so the whole
-                                   #   escalate-everything set fits ONE call inline under the Windows limit
+  max_fields_per_call: 40          # legacy compatibility; oversized fallback uses model profiles
   prefer_ocr_text_over_image: true # scanned page that OCRs cleanly -> send OCR TEXT (fast) not the page
                                    #   image (slow vision + huge output). IMAGE_TABLE pages stay images.
   ocr_text_min_confidence: 0.85    # min OCR mean confidence to send text instead of the page image
   no_evidence_effort: low          # effort for the single sweep over bands with no page evidence
-  adaptive_batching: true          # merge bands that target the SAME pages into one call (a small
-                                   #   doc -> a few calls, not ~19 per-band calls); each call still
-                                   #   capped at max_fields_per_call. false = one call per band.
+  adaptive_batching: true          # legacy compatibility; normal path is whole-deal/per-document
   adaptive_max_pages_per_call: 8   # greedily combine page-sets until their union exceeds this
   exclude_dynamic_system_prompt_sections: true  # better prompt-cache reuse when the CLI supports it
+  planner:
+    max_fields_per_task: 40        # legacy compatibility; normal primary tasks request all fields
+    max_pages_per_task: 6          # legacy compatibility
+    max_images_per_task: 1         # legacy compatibility
+    max_prompt_chars_per_task: 28000
+    max_output_tokens_per_task: 2000
+    output_tokens_per_found_field: 45
+    output_tokens_base: 180
+    max_retries: 0                 # no routine retry ladder in the normal path
+    retry_backoff_seconds: 0.5
+    retry_jitter_seconds: 0.5
+    prompt_version: assist-sparse-v5-2026-06-24
+    sparse_schema_version: 5
+    rescue_enabled: false          # optional repair is controlled by candidate_arbitration.repair_policy
+    rescue_max_fields: 12
+    rescue_max_pages: 4
+    wave1_priority_max: 30
+    reason_priorities:             # lower number = earlier wave/higher value
+      required_empty: 5
+      below_confidence: 15
+      invalid: 18
+      conflicted: 20
+      qa_fail_rescue: 35
+      force_llm_assist: 45
+      finalization_rescue: 1
+    band_priorities:
+      FUND: 5
+      HEADLINE: 10
+      VALUATION: 10
+      METHODOLOGY: 15
+      "METHODOLOGY: MULTIPLE": 15
+      "METHODOLOGY: DCF": 20
+      INVESTMENT: 20
+      RETURNS: 20
+    field_priorities:
+      Fund Name: 1
+      Portfolio Company: 1
+      Valuation Date: 2
+      Reporting Period: 3
+      "Implied EV ($M)": 5
+      "Implied Equity Value 100% ($M)": 5
+      "Total Enterprise Value ($M)": 5
+      Primary Methodology: 10
+      Gross IRR %: 15
+      Net IRR %: 15
+      MOIC: 15
+      "Total Invested Capital ($M)": 20
+    field_keyword_priorities:
+      fund: 5
+      portfolio company: 5
+      company: 8
+      valuation: 8
+      enterprise value: 8
+      equity value: 8
+      methodology: 15
+      multiple: 15
+      dcf: 20
+      irr: 20
+      moic: 20
+      invested capital: 20
+    inferable_fields: []           # fields where explicit schema metadata allows inference
   confidence_scores:               # LLM self-reported confidence -> FieldHit.confidence
     high: 0.85
     medium: 0.60
@@ -435,14 +503,23 @@ llm:
   image_tokens_per_megapixel: 1500
   output_tokens_per_field: 80
   output_tokens_base: 300
-  auto:                            # AUTO-mode routing table (aliases resolve via models.yaml)
+  candidate_arbitration:
+    enabled: true
+    min_accept_confidence: 0.70
+    min_winner_margin: 0.15
+    agreement_bonus_per_extra_document: 0.05
+    max_agreement_bonus: 0.10
+    require_grounded_evidence: true
+    repair_policy: never           # never | core_only
+    max_repair_calls_per_deal: 1
+  auto:                            # AUTO model defaults (aliases resolve via models.yaml)
     classification_model: haiku    # cheap classification only
     classification_effort: low
     extraction_model: sonnet       # normal escalated-field extraction
     extraction_effort: medium
     ocr_hostile_model: opus        # memos whose payload contains SCANNED/IMAGE_TABLE pages
     ocr_hostile_effort: high
-    retry_model: opus              # second pass when fields still fail
+    retry_model: opus              # deprecated compatibility; normal path does not auto-retry
     retry_effort: high
     retry_effort_bump: xhigh       # retry effort when the same model tier repeats
     fable_effort: high             # final pass, only when allow_fable is true

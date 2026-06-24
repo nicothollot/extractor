@@ -7,6 +7,7 @@ config file's directory so the tool behaves the same from any CWD.
 from __future__ import annotations
 
 import re
+import warnings
 from pathlib import Path
 
 import yaml
@@ -42,6 +43,15 @@ class ClaudeCodeConfig(BaseModel):
     auto_update_on_start: bool = False
     default_timeout_seconds: int = 120
     allow_cli_usage: bool = True
+
+
+class CodexCliConfig(BaseModel):
+    command: str = "codex"
+    command_args: list[str] = []
+    default_timeout_seconds: int = 180
+    model: str | None = None
+    reasoning_effort: str = "high"
+    debug_capture_raw_response: bool = False
 
 
 class GuiConfig(BaseModel):
@@ -473,52 +483,154 @@ class LlmAutoRoutingConfig(BaseModel):
     fable_effort: str = "high"  # final pass, only when allow_fable is set
 
 
+class CandidateArbitrationConfig(BaseModel):
+    """Local candidate arbitration after primary LLM extraction.
+
+    Confidence is only a ranking signal after hard eligibility rules pass.
+    Keep these values transparent and few; period/source/type/evidence remain
+    gates, not hidden numeric weights.
+    """
+
+    enabled: bool = True
+    min_accept_confidence: float = 0.70
+    min_winner_margin: float = 0.15
+    agreement_bonus_per_extra_document: float = 0.05
+    max_agreement_bonus: float = 0.10
+    require_grounded_evidence: bool = True
+    repair_policy: str = "never"  # never | core_only
+    max_repair_calls_per_deal: int = 1
+
+    @field_validator("repair_policy")
+    @classmethod
+    def _valid_repair_policy(cls, v: str) -> str:
+        if v not in ("never", "core_only"):
+            raise ValueError("candidate_arbitration.repair_policy must be never|core_only")
+        return v
+
+
+class LlmPlannerConfig(BaseModel):
+    """Bounded local-LLM assistance planner.
+
+    The values here describe work-unit limits and field prioritization. They
+    are intentionally data, not executor conditionals, so a workbook/schema
+    change can rebalance Wave 1 without code edits.
+    """
+
+    max_fields_per_task: int = 40
+    max_pages_per_task: int = 6
+    max_images_per_task: int = 1
+    max_prompt_chars_per_task: int = 28_000
+    max_output_tokens_per_task: int = 2_000
+    output_tokens_per_found_field: int = 45
+    output_tokens_base: int = 180
+    max_retries: int = 0
+    retry_backoff_seconds: float = 0.5
+    retry_jitter_seconds: float = 0.5
+    prompt_version: str = "assist-sparse-v5-2026-06-24"
+    sparse_schema_version: int = 5
+    rescue_enabled: bool = False
+    rescue_max_fields: int = 12
+    rescue_max_pages: int = 4
+    wave1_priority_max: int = 30
+    reason_priorities: dict[str, int] = Field(
+        default_factory=lambda: {
+            "required_empty": 5,
+            "below_confidence": 15,
+            "invalid": 18,
+            "conflicted": 20,
+            "qa_fail_rescue": 35,
+            "force_llm_assist": 45,
+            "finalization_rescue": 1,
+        }
+    )
+    band_priorities: dict[str, int] = Field(
+        default_factory=lambda: {
+            "FUND": 5,
+            "HEADLINE": 10,
+            "VALUATION": 10,
+            "METHODOLOGY": 15,
+            "METHODOLOGY: MULTIPLE": 15,
+            "METHODOLOGY: DCF": 20,
+            "INVESTMENT": 20,
+            "RETURNS": 20,
+        }
+    )
+    field_priorities: dict[str, int] = Field(
+        default_factory=lambda: {
+            "Fund Name": 1,
+            "Portfolio Company": 1,
+            "Valuation Date": 2,
+            "Reporting Period": 3,
+            "Implied EV ($M)": 5,
+            "Implied Equity Value 100% ($M)": 5,
+            "Total Enterprise Value ($M)": 5,
+            "Primary Methodology": 10,
+            "Gross IRR %": 15,
+            "Net IRR %": 15,
+            "MOIC": 15,
+            "Total Invested Capital ($M)": 20,
+        }
+    )
+    field_keyword_priorities: dict[str, int] = Field(
+        default_factory=lambda: {
+            "fund": 5,
+            "portfolio company": 5,
+            "company": 8,
+            "valuation": 8,
+            "enterprise value": 8,
+            "equity value": 8,
+            "methodology": 15,
+            "multiple": 15,
+            "dcf": 20,
+            "irr": 20,
+            "moic": 20,
+            "invested capital": 20,
+        }
+    )
+    inferable_fields: list[str] = Field(default_factory=list)
+
+
 class LlmConfig(BaseModel):
-    """Phase-3 Claude Code CLI fallback. NEVER the Anthropic SDK / an API
-    key: extraction runs through hidden local `claude -p` sessions reusing
-    the operator's `claude auth login` credentials."""
+    """Phase-3 local CLI LLM fallback. NEVER a hosted API from Python."""
 
     enabled: bool = True  # master switch; --no-llm gives Phase-2 behavior
-    mode: str = "auto"  # auto (route by task) | manual (one forced model+effort)
+    provider: str = "claude"  # claude | codex
+    routing_mode: str = "auto"  # auto | per_deal | single_model
+    # Deprecated compatibility spelling. "manual" maps to routing_mode
+    # single_model at load time; "auto" continues to load as auto.
+    mode: str = "auto"
     manual_model: str = "sonnet"
     manual_effort: str = "low"
+    single_model_provider: str = "claude"
+    single_model_model: str = "sonnet"
+    single_model_effort: str = "medium"
     allow_fable: bool = False  # explicit opt-in for the most expensive tier
     budget_usd: float = 25.0  # hard per-run cap; beyond it memos are LLM_DEFERRED
-    workers: int = 2  # hidden Claude Code session queue concurrency (keep 1-2)
+    workers: int = 2  # hidden local provider session queue concurrency (keep 1-2)
     models_path: str = "./config/models.yaml"
     cache_enabled: bool = True  # response cache; --force-llm bypasses reads
-    timeout_seconds: int = 600  # per Claude Code extraction call
+    timeout_seconds: int = 180  # per bounded provider extraction task
     max_pages_per_memo: int = 20  # payload page cap (candidate pages + pages 1-3)
-    # ONE LLM CALL PER DEAL (default). Instead of escalating each document
-    # separately with band-batched, multi-call extraction, group a deal-period's
-    # documents together and make a SINGLE claude -p call over ALL of their pages
-    # for the whole field set (the $ref schema keeps ~200 fields under the
-    # Windows inline-schema limit). The deterministic engine still runs first
-    # (grounding, comps tables, derived fields); the LLM is the primary field
-    # extractor in one clear message. This is far faster than the per-band,
-    # per-tier fan-out and is what an analyst expects ("read the whole deal,
-    # give me the fields"). It implies comprehensive (force-assist) escalation
-    # and bypasses the deterministic result cache, exactly like --force-llm-assist.
-    # False = the legacy per-memo band-batched path (byte-for-byte unchanged).
-    one_call_per_deal: bool = True
+    # Group a deal-period's source documents into a combined LLM payload.
+    # This never broadens the field set and never bypasses deterministic cache;
+    # force_assist is the only option that makes the LLM primary.
+    combine_deal_documents: bool = False
+    # Deprecated legacy spelling. load_config maps it to combine_deal_documents
+    # when the new key is absent, then emits a warning.
+    one_call_per_deal: bool = False
     # Total page cap for a combined per-deal payload (across all the deal's
     # documents). Bounds the single call so a deal with many large documents
     # stays feasible; documents contribute their summary pages first.
     max_pages_per_deal: int = 40
     image_max_long_edge: int = 1080  # SCANNED/IMAGE_TABLE page render cap, PNG
     quote_match_threshold: int = 85  # fuzzy quote-grounding floor on OCR pages
-    # Band-batched extraction: instead of one giant call over every escalated
-    # field, make focused per-band calls ordered by deterministic page-anchor
-    # relevance, sending only that band's pages + a small schema. Sharper model
-    # focus, the most-relevant bands run first (so the budget is spent well),
-    # and bands the document shows no evidence for are batched into one cheap
-    # pass rather than expanded across every tier. False = legacy single call.
+    # Legacy band batching knobs are retained for old configs. The normal path
+    # now plans one deal pass or one document pass; these values are used only
+    # by compatibility helpers/tests and oversized fallback.
     band_batched: bool = True
-    # Small-doc collapse: when the LLM payload is at most this many pages, ignore
-    # band_batched and make ONE call over the whole document + all fields (far
-    # cheaper/faster for short client memos; the model also sees the full doc at
-    # once). Large memos still band-batch. 0 disables the collapse.
-    single_call_max_pages: int = 8
+    # Deprecated small-doc collapse. 0 keeps bounded planner behavior for every
+    # memo size.
+    single_call_max_pages: int = 0
     # When the model answers not_found for a field (it looked and the field is
     # absent from the supplied pages), treat that as RESOLVED: do not re-ask the
     # expensive AUTO retry tier for it, and do not raise a NOT_EXTRACTABLE flag
@@ -539,7 +651,7 @@ class LlmConfig(BaseModel):
     # inlining the field shape) a 200-field schema is ~12 KB inline, well under
     # the Windows ~32 KB command-line limit — so the whole escalate-everything
     # set fits in ONE call instead of many tiny ones.
-    max_fields_per_call: int = 200
+    max_fields_per_call: int = 40
     # SCANNED pages are normally sent as page IMAGES (read via the Read tool),
     # which is slow (vision reasoning + huge output) and re-done per call. When a
     # scanned page OCRs cleanly (mean confidence >= ocr_text_min_confidence), send
@@ -547,7 +659,7 @@ class LlmConfig(BaseModel):
     # the same text. IMAGE_TABLE pages always stay images (OCR mangles tables).
     prefer_ocr_text_over_image: bool = True
     ocr_text_min_confidence: float = 0.85
-    no_evidence_effort: str = "low"  # effort for the single no-evidence sweep call
+    no_evidence_effort: str = "low"  # legacy compatibility
     # Adaptive page-locality batching (efficiency). With band_batched on, bands
     # that target the SAME pages are MERGED into one call instead of one call
     # per band — so a small document (every band on pages 1-3) becomes a handful
@@ -562,12 +674,21 @@ class LlmConfig(BaseModel):
     confidence_scores: dict[str, float] = Field(
         default_factory=lambda: {"high": 0.85, "medium": 0.60, "low": 0.35}
     )
-    # ESTIMATED-token heuristics used when Claude Code reports no usage.
+    # ESTIMATED-token heuristics used when the provider reports no usage.
     chars_per_token: float = 4.0
     image_tokens_per_megapixel: int = 1500
     output_tokens_per_field: int = 80
     output_tokens_base: int = 300
     auto: LlmAutoRoutingConfig = Field(default_factory=LlmAutoRoutingConfig)
+    planner: LlmPlannerConfig = Field(default_factory=LlmPlannerConfig)
+    candidate_arbitration: CandidateArbitrationConfig = Field(default_factory=CandidateArbitrationConfig)
+
+    @field_validator("routing_mode")
+    @classmethod
+    def _valid_routing_mode(cls, v: str) -> str:
+        if v not in ("auto", "per_deal", "single_model"):
+            raise ValueError("llm.routing_mode must be auto|per_deal|single_model")
+        return v
 
 
 class ValidationConfig(BaseModel):
@@ -606,6 +727,7 @@ class Config(BaseModel):
     db_path: Path = Path("./output/pv_index.db")
     first_run: FirstRunConfig = Field(default_factory=FirstRunConfig)
     claude_code: ClaudeCodeConfig = Field(default_factory=ClaudeCodeConfig)
+    codex_cli: CodexCliConfig = Field(default_factory=CodexCliConfig)
     gui: GuiConfig = Field(default_factory=GuiConfig)
     indexer: IndexerConfig = Field(default_factory=IndexerConfig)
     clients: dict[str, ClientConfig] = Field(default_factory=lambda: {"default": ClientConfig()})
@@ -634,6 +756,31 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     cfg_path = Path(path).resolve()
     with open(cfg_path, "rb") as fh:  # noqa: io-guard-exempt (read-only)
         data = yaml.safe_load(fh) or {}
+    llm_data = data.get("llm")
+    if isinstance(llm_data, dict) and "one_call_per_deal" in llm_data:
+        warnings.warn(
+            "llm.one_call_per_deal is deprecated; use llm.combine_deal_documents. "
+            "It now only groups candidate documents and does not enable force LLM assist.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if "combine_deal_documents" not in llm_data:
+            llm_data["combine_deal_documents"] = bool(llm_data.get("one_call_per_deal"))
+    if isinstance(llm_data, dict):
+        legacy_mode = llm_data.get("mode")
+        if legacy_mode == "manual" and "routing_mode" not in llm_data:
+            warnings.warn(
+                "llm.mode: manual is deprecated; use llm.routing_mode: single_model. "
+                "The legacy model/effort values were mapped to the single-model plan.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            llm_data["routing_mode"] = "single_model"
+            llm_data.setdefault("single_model_provider", llm_data.get("provider", "claude"))
+            llm_data.setdefault("single_model_model", llm_data.get("manual_model", "sonnet"))
+            llm_data.setdefault("single_model_effort", llm_data.get("manual_effort", "medium"))
+        elif legacy_mode == "auto" and "routing_mode" not in llm_data:
+            llm_data["routing_mode"] = "auto"
     config = Config.model_validate(data)
     base = cfg_path.parent
     if not config.output_dir.is_absolute():

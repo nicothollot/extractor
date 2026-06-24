@@ -16,6 +16,7 @@ from pv_extractor.io_guard import open_read
 from pv_extractor.models import FieldHit, FlagSeverity, ReviewFlag
 
 _EQUATION_RE = re.compile(r"^\s*(.+?)\s*([+-])\s*(.+?)\s*=\s*(.+?)\s*$")
+_CODE_RE = re.compile(r"[^a-z0-9_]+")
 
 
 class RuleSet:
@@ -41,12 +42,16 @@ def _numeric(values: dict[str, object], header: str) -> float | None:
 
 
 def _make_flag(rule: dict, description: str) -> ReviewFlag:
+    name = str(rule.get("name") or rule.get("type") or "rule").strip().lower().replace("-", "_")
+    code = _CODE_RE.sub("_", name).strip("_") or "rule"
     return ReviewFlag(
         category="cross_field",
         description=f"{rule['name']}: {description}",
         severity=FlagSeverity(rule.get("severity", "warning")),
         reviewer_attention=bool(rule.get("reviewer_attention", False)),
         field=rule.get("field"),
+        origin="validation",
+        code=code,
     )
 
 

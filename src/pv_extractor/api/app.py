@@ -4,8 +4,8 @@ One process serves the JSON API under /api plus the built React frontend
 (static files with an SPA fallback). The app binds 127.0.0.1 only — that
 is enforced where uvicorn is launched (cli.gui) and by GuiConfig's
 loopback validator. No telemetry, no external calls of any kind from this
-layer; the only subprocesses are the official local Claude Code CLI
-commands triggered explicitly through /api/setup endpoints."""
+layer; subprocesses are local provider CLIs triggered explicitly by setup or
+LLM-assist endpoints."""
 
 from __future__ import annotations
 

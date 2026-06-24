@@ -1,8 +1,8 @@
-"""Claude Code response cache (rule 10).
+"""Local LLM response cache (rule 10).
 
-Key = sha256(static prompt + payload hash + escalated field set + model id +
+Key = sha256(static prompt + payload hash + escalated field set + provider/model +
 effort + LLM_VERSION). Re-running an unchanged memo never re-launches (or
-re-pays for) a Claude Code session unless --force-llm bypasses the read.
+re-pays for) a local provider session unless --force-llm bypasses the read.
 Lives in the same SQLite database as the file index and the Phase-2 result
 cache; workers open their own connections.
 """
@@ -45,6 +45,33 @@ def cache_key(
     digest.update(payload_hash.encode("utf-8"))
     digest.update("\x1f".join(sorted(field_headers)).encode("utf-8"))
     digest.update(f"{model_id}\x1f{effort}\x1f{LLM_VERSION}".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def task_cache_key(
+    *,
+    provider: str,
+    model_id: str,
+    effort: str,
+    schema_version: int,
+    prompt_version: str,
+    page_hashes: list[str],
+    field_keys: list[str],
+) -> str:
+    """Cache key for one bounded assistance task.
+
+    The key intentionally uses selected page/image hashes, not a whole-memo
+    payload hash, so a field asked over a different page subset cannot reuse a
+    stale answer and an unchanged sibling task still hits cache.
+    """
+    digest = hashlib.sha256()
+    digest.update(f"provider={provider}\x1fmodel={model_id}\x1feffort={effort}".encode("utf-8"))
+    digest.update(f"\x1fschema={schema_version}\x1fprompt={prompt_version}".encode("utf-8"))
+    digest.update("\x1fpages=".encode("utf-8"))
+    digest.update("\x1e".join(sorted(page_hashes)).encode("utf-8"))
+    digest.update("\x1ffields=".encode("utf-8"))
+    digest.update("\x1e".join(sorted(field_keys)).encode("utf-8"))
+    digest.update(f"\x1fversion={LLM_VERSION}".encode("utf-8"))
     return digest.hexdigest()
 
 

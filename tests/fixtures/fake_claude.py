@@ -12,8 +12,10 @@ from pathlib import Path
 from pv_extractor.llm.claude_code_client import LOGIN_REMEDIATION, ClaudeCodeResult
 from pv_extractor.models import LlmUsage
 
-# Field lines in the call prompt look like:  - "Gross IRR %" {json key: Gross_IRR} (...)
-_PROMPT_KEY_RE = re.compile(r'"(?P<header>[^"]+)"\s*\{json key:\s*(?P<key>[^}]+)\}')
+# Field lines in the call prompt look like:
+#   - "Gross IRR %" {field_id: Gross_IRR} (...)
+# Legacy fallback still uses {json key: ...}.
+_PROMPT_KEY_RE = re.compile(r'"(?P<header>[^"]+)"\s*\{(?:field_id|field_key|json key):\s*(?P<key>[^}]+)\}')
 
 
 def field_result(
@@ -52,6 +54,77 @@ def schema_response(
             for key in band_schema["properties"]
         }
     return out
+
+
+def sparse_v2_response(
+    schema: dict, values: dict[str, dict], key_to_header: dict[str, str] | None = None
+) -> dict:
+    key_to_header = key_to_header or {}
+    keys = list(schema["properties"]["not_found_field_keys"]["items"]["enum"])
+    results: list[dict] = []
+    not_found: list[str] = []
+    for key in keys:
+        header = key_to_header.get(key, key)
+        value = values.get(header)
+        if value is None or value.get("not_found"):
+            not_found.append(key)
+            continue
+        confidence = value.get("confidence", "high")
+        score = {"high": 0.85, "medium": 0.60, "low": 0.35}.get(str(confidence), confidence)
+        results.append(
+            {
+                "field_key": key,
+                "value": value.get("value"),
+                "unit": value.get("unit"),
+                "page": value.get("page") or 1,
+                "evidence_quote": value.get("verbatim_quote") or value.get("evidence_quote") or "",
+                "confidence": float(score) if isinstance(score, (int, float)) else 0.35,
+                "notes": "",
+            }
+        )
+    return {"schema_version": 2, "results": results, "not_found_field_keys": not_found, "warnings": []}
+
+
+def sparse_response(
+    schema: dict, values: dict[str, dict], key_to_header: dict[str, str] | None = None
+) -> dict:
+    """Fill sparse v5 responses by field id."""
+    key_to_header = key_to_header or {}
+    properties = schema.get("properties", {})
+    if "not_found_field_keys" in properties:
+        return sparse_v2_response(schema, values, key_to_header)
+    keys = list(properties["not_found"]["items"]["enum"])
+    results: list[dict] = []
+    not_found: list[str] = []
+    for key in keys:
+        header = key_to_header.get(key, key)
+        value = values.get(header)
+        if value is None or value.get("not_found"):
+            not_found.append(key)
+            continue
+        confidence = value.get("model_confidence", value.get("confidence", "high"))
+        score = {"high": 0.85, "medium": 0.60, "low": 0.35}.get(str(confidence), confidence)
+        results.append(
+            {
+                "field_id": key,
+                "value": value.get("value"),
+                "unit": value.get("unit"),
+                "document_id": value.get("document_id") or "D01",
+                "page": value.get("page") or 1,
+                "as_of_date": value.get("as_of_date"),
+                "quote": value.get("verbatim_quote") or value.get("evidence_quote") or value.get("quote") or "",
+                "evidence_kind": value.get("evidence_kind") or "explicit_label",
+                "model_confidence": float(score) if isinstance(score, (int, float)) else 0.35,
+            }
+        )
+    return {
+        "schema_version": 5,
+        "scope": {"type": "document", "id": "D01"},
+        "values": results,
+        "not_found": not_found,
+        "conflicts": [],
+        "warnings": [],
+    }
 
 
 def intent_response(
@@ -155,6 +228,11 @@ class FakeClaudeCodeClient:
             return ClaudeCodeResult(
                 job_id=job_id, ok=False, exit_code=3, duration_seconds=0.1, error="exit 3",
             )
+        if behavior == "timeout":
+            return ClaudeCodeResult(
+                job_id=job_id, ok=False, exit_code=None, duration_seconds=timeout or 180,
+                error=f"timed out after {timeout or 180}s",
+            )
         schema = json.loads(Path(schema_path).read_text(encoding="utf-8"))
         if self.mode == "intent":
             structured = intent_response(schema, **self.intent_anchors)
@@ -163,7 +241,10 @@ class FakeClaudeCodeClient:
                 m.group("key").strip(): m.group("header")
                 for m in _PROMPT_KEY_RE.finditer(prompt)
             }
-            structured = schema_response(schema, self.values, key_to_header)
+            if schema.get("properties", {}).get("schema_version"):
+                structured = sparse_response(schema, self.values, key_to_header)
+            else:
+                structured = schema_response(schema, self.values, key_to_header)
         return ClaudeCodeResult(
             job_id=job_id, ok=True, exit_code=0, duration_seconds=0.2,
             session_id=f"sess-fake-{len(self.calls):03d}",

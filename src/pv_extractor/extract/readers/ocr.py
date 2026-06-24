@@ -20,12 +20,13 @@ import statistics
 import os
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import fitz
 
 from pv_extractor.config import OcrConfig
+from pv_extractor.models import EvidenceWord
 from pv_extractor.io_guard import open_read
 from pv_extractor.logging_setup import log_event
 
@@ -56,6 +57,7 @@ class OcrPageResult:
     text: str
     mean_confidence: float  # 0-1 mean word/snippet confidence
     engine: str
+    words: list[EvidenceWord] = field(default_factory=list)
 
 
 class OcrReader:
@@ -152,8 +154,13 @@ class OcrReader:
                 if not 1 <= number <= doc.page_count:
                     continue
                 page = doc[number - 1]
-                png = page.get_pixmap(dpi=self.cfg.dpi).tobytes("png")
-                result = self._ocr_png(png, number)
+                pixmap = page.get_pixmap(dpi=self.cfg.dpi)
+                png = pixmap.tobytes("png")
+                result = self._ocr_png(
+                    png, number,
+                    pdf_width=float(page.rect.width), pdf_height=float(page.rect.height),
+                    image_width=float(pixmap.width), image_height=float(pixmap.height),
+                )
                 if result is not None:
                     out[number] = result
                     if ident is not None:
@@ -171,12 +178,38 @@ class OcrReader:
             doc.close()
         return out
 
-    def _ocr_png(self, png: bytes, page_number: int) -> OcrPageResult | None:
+    def _ocr_png(
+        self,
+        png: bytes,
+        page_number: int,
+        *,
+        pdf_width: float,
+        pdf_height: float,
+        image_width: float,
+        image_height: float,
+    ) -> OcrPageResult | None:
         if self.cfg.engine == "rapidocr":
-            return self._ocr_rapidocr(png, page_number)
-        return self._ocr_tesseract(png, page_number)
+            return self._ocr_rapidocr(
+                png, page_number,
+                pdf_width=pdf_width, pdf_height=pdf_height,
+                image_width=image_width, image_height=image_height,
+            )
+        return self._ocr_tesseract(
+            png, page_number,
+            pdf_width=pdf_width, pdf_height=pdf_height,
+            image_width=image_width, image_height=image_height,
+        )
 
-    def _ocr_rapidocr(self, png: bytes, page_number: int) -> OcrPageResult | None:
+    def _ocr_rapidocr(
+        self,
+        png: bytes,
+        page_number: int,
+        *,
+        pdf_width: float,
+        pdf_height: float,
+        image_width: float,
+        image_height: float,
+    ) -> OcrPageResult | None:
         engine = self._rapidocr()
         if engine is None:
             return None
@@ -190,9 +223,26 @@ class OcrReader:
         boxes = list(result.boxes) if result.boxes is not None else []
         text = deglue(_lines_from_boxes(txts, boxes))
         mean_conf = float(statistics.fmean(scores)) if scores else 0.0
-        return OcrPageResult(page_number=page_number, text=text, mean_confidence=mean_conf, engine="rapidocr")
+        words = _rapidocr_words(
+            txts, boxes, scores,
+            pdf_width=pdf_width, pdf_height=pdf_height,
+            image_width=image_width, image_height=image_height,
+        )
+        return OcrPageResult(
+            page_number=page_number, text=text, mean_confidence=mean_conf,
+            engine="rapidocr", words=words,
+        )
 
-    def _ocr_tesseract(self, png: bytes, page_number: int) -> OcrPageResult | None:
+    def _ocr_tesseract(
+        self,
+        png: bytes,
+        page_number: int,
+        *,
+        pdf_width: float,
+        pdf_height: float,
+        image_width: float,
+        image_height: float,
+    ) -> OcrPageResult | None:
         try:
             import io
 
@@ -211,6 +261,7 @@ class OcrReader:
             return None
         lines: dict[tuple[int, int, int], list[str]] = {}
         confs: list[float] = []
+        words: list[EvidenceWord] = []
         for word, conf, block, par, line in zip(
             data["text"], data["conf"], data["block_num"], data["par_num"], data["line_num"]
         ):
@@ -220,9 +271,83 @@ class OcrReader:
             conf_f = float(conf)
             if conf_f >= 0:
                 confs.append(conf_f / 100.0)
+        for idx, (word, conf, left, top, width, height) in enumerate(
+            zip(data["text"], data["conf"], data["left"], data["top"], data["width"], data["height"])
+        ):
+            if not str(word).strip():
+                continue
+            try:
+                conf_f = float(conf)
+            except (TypeError, ValueError):
+                conf_f = -1.0
+            bbox = _scale_pixel_bbox(
+                (float(left), float(top), float(left) + float(width), float(top) + float(height)),
+                pdf_width=pdf_width, pdf_height=pdf_height,
+                image_width=image_width, image_height=image_height,
+            )
+            words.append(
+                EvidenceWord(
+                    id=f"ocr{idx}",
+                    text=str(word),
+                    bbox=bbox,
+                    source="ocr",
+                    confidence=(conf_f / 100.0) if conf_f >= 0 else None,
+                )
+            )
         text = deglue("\n".join(" ".join(words) for _, words in sorted(lines.items())))
         mean_conf = float(statistics.fmean(confs)) if confs else 0.0
-        return OcrPageResult(page_number=page_number, text=text, mean_confidence=mean_conf, engine="tesseract")
+        return OcrPageResult(
+            page_number=page_number, text=text, mean_confidence=mean_conf,
+            engine="tesseract", words=words,
+        )
+
+
+def _scale_pixel_bbox(
+    bbox: tuple[float, float, float, float],
+    *,
+    pdf_width: float,
+    pdf_height: float,
+    image_width: float,
+    image_height: float,
+) -> tuple[float, float, float, float]:
+    sx = pdf_width / max(image_width, 1.0)
+    sy = pdf_height / max(image_height, 1.0)
+    return (bbox[0] * sx, bbox[1] * sy, bbox[2] * sx, bbox[3] * sy)
+
+
+def _rapidocr_words(
+    txts: list[str],
+    boxes: list,
+    scores: list[float],
+    *,
+    pdf_width: float,
+    pdf_height: float,
+    image_width: float,
+    image_height: float,
+) -> list[EvidenceWord]:
+    if not boxes or len(boxes) != len(txts):
+        return []
+    out: list[EvidenceWord] = []
+    for idx, (text, box) in enumerate(zip(txts, boxes)):
+        if not str(text).strip() or len(box) == 0:
+            continue
+        xs = [float(pt[0]) for pt in box]
+        ys = [float(pt[1]) for pt in box]
+        bbox = _scale_pixel_bbox(
+            (min(xs), min(ys), max(xs), max(ys)),
+            pdf_width=pdf_width, pdf_height=pdf_height,
+            image_width=image_width, image_height=image_height,
+        )
+        out.append(
+            EvidenceWord(
+                id=f"ocr{idx}",
+                text=str(text),
+                bbox=bbox,
+                source="ocr",
+                confidence=float(scores[idx]) if idx < len(scores) else None,
+            )
+        )
+    return out
 
 
 # OCR engines glue words together on tight scans ('FundManager:$99.0M').

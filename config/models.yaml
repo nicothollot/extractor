@@ -1,17 +1,20 @@
-# Claude Code model menu — the single source of truth for which models the
-# Phase-3 LLM fallback may launch through local `claude` CLI sessions, and the
-# editable price-per-1M-token assumptions the cost ledger uses.
+# Local LLM provider model menu — the single source of truth for which models
+# the Phase-3 assist may launch through a local provider CLI, and the editable
+# price-per-1M-token assumptions the cost ledger uses when a matching pricing
+# table exists.
 #
 # These prices are ESTIMATES / config defaults, not sacred constants. Review
 # them against https://claude.com/pricing and update `last_reviewed` when you
-# do. When Claude Code reports actual token usage the ledger uses it; when it
-# does not, costs are computed from these numbers and labeled ESTIMATED.
+# do. When the provider reports actual token usage the ledger uses it. When
+# it does not, costs are computed from these numbers and labeled ESTIMATED.
+# Providers/models without a matching price table show cost as unavailable.
 #
 # Fields per entry:
+#   provider                 claude | codex (default: claude for old files)
 #   alias                    short name used in config/CLI (--llm-model sonnet)
-#   id                       full model id passed to `claude --model` when pinned
-#   latest_alias             true => pass the ALIAS to Claude Code so it floats
-#                            to the newest model of that tier as the CLI updates
+#   id                       full model id passed to the provider CLI when pinned
+#   latest_alias             true => pass the ALIAS so it floats to the newest
+#                            model of that tier as the provider CLI updates
 #   pinned                   true => always pass the full id (never float)
 #   requires_explicit_enable true => the AUTO router never selects this model
 #                            unless the user opted in (llm.allow_fable / CLI);
@@ -19,11 +22,14 @@
 #   default_effort           effort used when nothing else specifies one
 #   pricing_per_mtok         USD per 1M tokens (input / output / cache hit /
 #                            5-minute cache write / 1-hour cache write)
+#   extraction_profile       editable operational thresholds for choosing
+#                            whole-deal vs per-document extraction
 
 last_reviewed: "2026-06-11"
 
 models:
   - alias: fable
+    provider: claude
     id: claude-fable-5
     display_name: Claude Fable 5
     context_window: 1000000
@@ -31,6 +37,14 @@ models:
     latest_alias: true
     pinned: false
     requires_explicit_enable: true   # highest-cost tier: explicit user opt-in only
+    extraction_profile:
+      default_shape: adaptive
+      deal_pass_max_input_tokens: 500000
+      deal_pass_max_documents: 8
+      deal_pass_max_image_pages: 120
+      deal_pass_max_fields: 300
+      oversized_target_fields: 100
+      max_parallel_document_calls: 3
     pricing_per_mtok:
       input: 10.00
       output: 50.00
@@ -39,6 +53,7 @@ models:
       cache_write_1h: 20.00
 
   - alias: opus
+    provider: claude
     id: claude-opus-4-8
     display_name: Claude Opus 4.8
     context_window: 1000000
@@ -46,6 +61,14 @@ models:
     latest_alias: true
     pinned: false
     requires_explicit_enable: false
+    extraction_profile:
+      default_shape: adaptive
+      deal_pass_max_input_tokens: 300000
+      deal_pass_max_documents: 6
+      deal_pass_max_image_pages: 80
+      deal_pass_max_fields: 250
+      oversized_target_fields: 100
+      max_parallel_document_calls: 3
     pricing_per_mtok:
       input: 5.00
       output: 25.00
@@ -54,6 +77,7 @@ models:
       cache_write_1h: 10.00
 
   - alias: sonnet
+    provider: claude
     id: claude-sonnet-4-6
     display_name: Claude Sonnet 4.6
     context_window: 1000000
@@ -61,6 +85,14 @@ models:
     latest_alias: true
     pinned: false
     requires_explicit_enable: false
+    extraction_profile:
+      default_shape: adaptive
+      deal_pass_max_input_tokens: 100000
+      deal_pass_max_documents: 2
+      deal_pass_max_image_pages: 15
+      deal_pass_max_fields: 220
+      oversized_target_fields: 100
+      max_parallel_document_calls: 3
     pricing_per_mtok:
       input: 3.00
       output: 15.00
@@ -69,6 +101,7 @@ models:
       cache_write_1h: 6.00
 
   - alias: haiku
+    provider: claude
     id: claude-haiku-4-5
     display_name: Claude Haiku 4.5
     context_window: 200000
@@ -76,9 +109,35 @@ models:
     latest_alias: true
     pinned: false
     requires_explicit_enable: false
+    extraction_profile:
+      default_shape: document
+      deal_pass_max_input_tokens: 50000
+      deal_pass_max_documents: 1
+      deal_pass_max_image_pages: 5
+      deal_pass_max_fields: 180
+      oversized_target_fields: 90
+      max_parallel_document_calls: 2
     pricing_per_mtok:
       input: 1.00
       output: 5.00
       cache_hit: 0.10
       cache_write_5m: 1.25
       cache_write_1h: 2.00
+
+  - alias: provider-default
+    provider: codex
+    id: ""
+    display_name: Codex CLI default
+    context_window: 0
+    default_effort: high
+    latest_alias: false
+    pinned: false
+    requires_explicit_enable: false
+    extraction_profile:
+      default_shape: document
+      deal_pass_max_input_tokens: 80000
+      deal_pass_max_documents: 2
+      deal_pass_max_image_pages: 0
+      deal_pass_max_fields: 180
+      oversized_target_fields: 90
+      max_parallel_document_calls: 2

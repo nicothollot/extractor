@@ -169,6 +169,8 @@ def apply_derived(
                         severity=FlagSeverity.warning,
                         reviewer_attention=True,
                         field=spec.header,
+                        origin="validation",
+                        code="computed_crosscheck",
                     )
                 )
             conflicts = [

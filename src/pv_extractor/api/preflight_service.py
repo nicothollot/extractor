@@ -20,7 +20,7 @@ from pv_extractor.api.jobs import JobManager
 from pv_extractor.config import Config
 from pv_extractor.io_guard import open_read
 from pv_extractor.llm.costs import estimate_usage
-from pv_extractor.llm.model_registry import ModelRegistry
+from pv_extractor.llm.model_registry import ExtractionPlanMetrics, ModelRegistry
 
 # Pre-run heuristics: payload text volume per page and how many fields a
 # typical memo escalates. Both only exist before extraction has run; the
@@ -41,6 +41,19 @@ class MemoEstimate(BaseModel):
     first_tier: str = ""
     first_tier_usd: float = 0.0
     ladder_usd: float = 0.0  # worst case: every tier in the ladder runs
+    documents: int = 1
+    pages: int = 0
+    image_pages: int = 0
+    fields: int = 0
+    estimated_input_tokens: int = 0
+    provider: str = ""
+    model: str = ""
+    effort: str = ""
+    execution_shape: str = ""
+    expected_primary_calls: int = 0
+    repair_policy: str = "never"
+    max_repair_calls: int = 0
+    reason: str = ""
 
 
 class PreflightEstimate(BaseModel):
@@ -100,6 +113,8 @@ def estimate_from_dry_run(
     manual_effort: str | None = None,
     budget_usd: float | None = None,
     force_assist: bool = False,
+    routing_mode: str | None = None,
+    repair_policy: str | None = None,
 ) -> PreflightEstimate:
     """Estimate from the dry-run job's verify events (which carry the
     winner file paths). force_assist reflects the LLM-as-primary-extractor mode:
@@ -112,13 +127,10 @@ def estimate_from_dry_run(
     )
 
     registry = ModelRegistry.load(config.llm.models_path)
-    resolved_mode = mode or ("manual" if manual_model else config.llm.mode)
-    tiers = registry.extraction_tiers(
-        mode=resolved_mode, auto=config.llm.auto,
-        manual_model=manual_model or config.llm.manual_model,
-        manual_effort=manual_effort or config.llm.manual_effort,
-        ocr_hostile=False, allow_fable=config.llm.allow_fable,
-    )
+    resolved_mode = routing_mode or mode or ("single_model" if manual_model else config.llm.routing_mode)
+    if resolved_mode == "manual":
+        resolved_mode = "single_model"
+    provider = config.llm.provider
 
     estimate = PreflightEstimate(
         mode=resolved_mode,
@@ -128,8 +140,9 @@ def estimate_from_dry_run(
             "assumed_escalated_fields": assumed_fields,
             "force_llm_assist": force_assist,
             "max_pages_per_memo": config.llm.max_pages_per_memo,
-            "tier_ladder": [f"{t.entry.alias}/{t.effort}" for t in tiers],
+            "provider": provider,
             "pricing_source": str(config.llm.models_path),
+            "repair_policy": repair_policy or config.llm.candidate_arbitration.repair_policy,
         },
     )
 
@@ -155,14 +168,44 @@ def estimate_from_dry_run(
             field_count=assumed_fields,
             cfg=config.llm,
         )
-        per_tier = [registry.cost_usd(usage, tier.entry) for tier in tiers]
+        metrics = ExtractionPlanMetrics(
+            estimated_input_tokens=usage.input_tokens,
+            documents=1,
+            image_pages=0,
+            fields=assumed_fields,
+        )
+        plan = registry.resolve_extraction_plan(
+            routing_mode=resolved_mode,
+            metrics=metrics,
+            auto=config.llm.auto,
+            provider=provider,
+            manual_model=manual_model or config.llm.single_model_model,
+            manual_effort=manual_effort or config.llm.single_model_effort,
+            provider_default_model=config.codex_cli.model,
+            provider_default_effort=config.codex_cli.reasoning_effort,
+            repair_policy=repair_policy or config.llm.candidate_arbitration.repair_policy,
+            max_repair_calls_per_deal=config.llm.candidate_arbitration.max_repair_calls_per_deal,
+            allow_fable=config.llm.allow_fable,
+        )
+        cost = registry.cost_usd(usage, plan.selection.entry) or 0.0
         memo = MemoEstimate(
             client=key[0], deal=key[1],
             file_name=event.payload.get("file_name"),
             page_count=page_count, payload_pages=payload_pages,
-            first_tier=f"{tiers[0].entry.alias}/{tiers[0].effort}",
-            first_tier_usd=round(per_tier[0], 4),
-            ladder_usd=round(sum(per_tier), 4),
+            first_tier=f"{plan.model}/{plan.effort}",
+            first_tier_usd=round(cost, 4),
+            ladder_usd=round(cost, 4),
+            pages=page_count or payload_pages,
+            fields=assumed_fields,
+            estimated_input_tokens=usage.input_tokens,
+            provider=plan.provider,
+            model=plan.model,
+            effort=plan.effort,
+            execution_shape=plan.execution_shape,
+            expected_primary_calls=plan.expected_primary_calls,
+            repair_policy=plan.repair_policy,
+            max_repair_calls=plan.max_repair_calls,
+            reason=plan.reason,
         )
         estimate.memos.append(memo)
 

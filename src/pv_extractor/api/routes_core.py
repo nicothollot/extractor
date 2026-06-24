@@ -45,6 +45,7 @@ _EDITABLE_PREFIXES = (
     "output_dir",
     "db_path",
     "claude_code.",
+    "codex_cli.",
     "first_run.",
     "gui.",
     "llm.",
@@ -104,7 +105,8 @@ def health(request: Request) -> dict:
         "ok": True,
         "version": version,
         "active_job": active.model_dump() if active else None,
-        "auto_update_on_start": config.claude_code.auto_update_on_start,
+        "llm_provider": config.llm.provider,
+        "auto_update_on_start": config.llm.provider == "claude" and config.claude_code.auto_update_on_start,
     }
 
 
@@ -1094,20 +1096,41 @@ def templates(request: Request) -> dict:
 
 @router.get("/models")
 def models(request: Request) -> dict:
-    from pv_extractor.llm.model_registry import ModelRegistry
+    from pv_extractor.llm.model_registry import ModelEntry, ModelRegistry
 
     config = _config(request)
     try:
         registry = ModelRegistry.load(config.llm.models_path)
     except (OSError, ValueError) as exc:
         raise HTTPException(500, detail=f"models.yaml unusable: {exc}") from exc
+    provider = config.llm.provider
+    provider_models = registry.entries_for_provider(provider)
+    if provider != "claude" and not provider_models:
+        provider_models = [
+            ModelEntry(
+                provider=provider,
+                alias="provider-default",
+                id="",
+                display_name=f"{provider} CLI default",
+                context_window=0,
+                default_effort=config.codex_cli.reasoning_effort,
+                pricing_per_mtok=None,
+            )
+        ]
     return {
         "last_reviewed": registry.menu.last_reviewed,
         "models_path": str(config.llm.models_path),
-        "models": [e.model_dump() for e in registry.entries],
+        "provider": provider,
+        "models": [e.model_dump() for e in provider_models],
+        "all_models": [e.model_dump() for e in registry.entries],
         "llm": {
             "enabled": config.llm.enabled,
+            "provider": provider,
+            "routing_mode": config.llm.routing_mode,
             "mode": config.llm.mode,
+            "single_model_provider": config.llm.single_model_provider,
+            "single_model_model": config.llm.single_model_model,
+            "single_model_effort": config.llm.single_model_effort,
             "manual_model": config.llm.manual_model,
             "manual_effort": config.llm.manual_effort,
             "allow_fable": config.llm.allow_fable,
@@ -1144,6 +1167,7 @@ def get_config(request: Request) -> dict:
         "output_dir": str(config.output_dir),
         "db_path": str(config.db_path),
         "claude_code": config.claude_code.model_dump(),
+        "codex_cli": config.codex_cli.model_dump(),
         "first_run": config.first_run.model_dump(),
         "gui": config.gui.model_dump(),
         "llm": config.llm.model_dump(exclude={"confidence_scores"}),

@@ -129,16 +129,16 @@ def run_cmd(
     ] = None,
     dry_run: Annotated[bool, typer.Option("--dry-run", help="Locate+verify only; print coverage")] = False,
     force: Annotated[bool, typer.Option("--force", help="Bypass the extraction result cache")] = False,
-    no_llm: Annotated[bool, typer.Option("--no-llm", help="Disable the Claude Code fallback (pure Phase-2 run)")] = False,
+    no_llm: Annotated[bool, typer.Option("--no-llm", help="Disable the local LLM assist pass (pure deterministic run)")] = False,
     llm_budget: Annotated[Optional[float], typer.Option("--llm-budget", help="Hard per-run LLM budget cap in USD (default: config llm.budget_usd)")] = None,
-    llm_mode: Annotated[Optional[str], typer.Option("--llm-mode", help="auto | manual (default: config llm.mode)")] = None,
-    llm_model: Annotated[Optional[str], typer.Option("--llm-model", help="Model alias/id from config/models.yaml; implies --llm-mode manual")] = None,
+    llm_mode: Annotated[Optional[str], typer.Option("--llm-mode", help="auto | per_deal | single_model (legacy manual accepted)")] = None,
+    llm_model: Annotated[Optional[str], typer.Option("--llm-model", help="Model alias/id from config/models.yaml; implies --llm-mode single_model")] = None,
     llm_effort: Annotated[Optional[str], typer.Option("--llm-effort", help="low | medium | high | xhigh | max")] = None,
-    force_llm: Annotated[bool, typer.Option("--force-llm", help="Bypass the Claude Code response cache")] = False,
+    force_llm: Annotated[bool, typer.Option("--force-llm", help="Bypass the local LLM response cache")] = False,
     force_llm_assist: Annotated[bool, typer.Option("--force-llm-assist", help="Use the LLM as the primary extractor: escalate every empty extractable field (bypasses the deterministic result cache)")] = False,
     config_path: ConfigOpt = Path("config.yaml"),
 ) -> None:
-    """Full pipeline: locate -> verify -> extract -> validate -> [Claude Code fallback] -> write."""
+    """Full pipeline: locate -> verify -> extract -> validate -> [local LLM assist] -> write."""
     from pv_extractor.llm.escalate import resolve_settings
     from pv_extractor.run import run as run_pipeline
     from pv_extractor.write import HeaderDriftError
@@ -191,7 +191,7 @@ def run_cmd(
         else:
             label = "actual+estimated" if llm.any_actual_costs else "ESTIMATED"
             console.print(
-                f"Claude Code fallback: {llm.memos_escalated} memo(s), {llm.attempts} call(s) "
+                f"LLM assist ({config.llm.provider}): {llm.memos_escalated} memo(s), {llm.attempts} call(s) "
                 f"({llm.cache_hits} cached), {llm.memos_deferred} deferred, "
                 f"[bold]${llm.total_cost_usd:.4f}[/bold] ({label})"
             )
@@ -296,7 +296,7 @@ def scan(
 def deals(
     client: Annotated[Optional[str], typer.Option(help="Client folder name (as indexed); omit to refresh/summarize ALL indexed clients")] = None,
     refresh: Annotated[bool, typer.Option("--refresh", help="Re-run discovery before printing (no rescan needed — works on the existing index)")] = False,
-    llm: Annotated[bool, typer.Option("--llm", help="Include the Claude Code assist pass (local CLI, no API key)")] = False,
+    llm: Annotated[bool, typer.Option("--llm", help="Include the local LLM assist pass (local CLI, no API key)")] = False,
     llm_model: Annotated[Optional[str], typer.Option(help="Model alias/id for --llm (default: deal_discovery.llm.model)")] = None,
     llm_effort: Annotated[Optional[str], typer.Option(help="Effort for --llm (default: deal_discovery.llm.effort)")] = None,
     show_learned: Annotated[bool, typer.Option("--show-learned", help="Print this client's learned layout priors + recorded corrections, then exit")] = False,
@@ -444,7 +444,7 @@ def init_db_cmd(config_path: ConfigOpt = Path("config.yaml")) -> None:
 
 @app.command("self-check")
 def self_check_cmd(config_path: ConfigOpt = Path("config.yaml")) -> None:
-    """Run read-only startup checks (Claude Code CLI availability/auth); never sends data."""
+    """Run read-only startup checks (provider CLI availability/auth); never sends data."""
     from pv_extractor.system.claude_code import run_startup_checks
 
     config = _setup(config_path)
@@ -461,17 +461,19 @@ def self_check_cmd(config_path: ConfigOpt = Path("config.yaml")) -> None:
 
 @app.command()
 def models(config_path: ConfigOpt = Path("config.yaml")) -> None:
-    """Show the Claude Code model menu and the editable pricing assumptions."""
+    """Show the active LLM provider model menu and pricing assumptions."""
     from pv_extractor.llm.model_registry import ModelRegistry
 
     config = _setup(config_path)
     registry = ModelRegistry.load(config.llm.models_path)
 
-    table = Table(title=f"Claude Code model menu — prices are editable estimates, USD per 1M tokens")
-    for col in ("alias", "model id", "display name", "context", "effort", "in", "out",
+    provider = config.llm.provider
+    entries = registry.entries_for_provider(provider)
+    table = Table(title=f"{provider} model menu — prices are editable estimates when available")
+    for col in ("provider", "alias", "model id", "display name", "context", "effort", "in", "out",
                 "cache hit", "5m write", "1h write", "notes"):
         table.add_column(col)
-    for entry in registry.entries:
+    for entry in entries:
         p = entry.pricing_per_mtok
         notes = []
         if entry.latest_alias:
@@ -481,16 +483,21 @@ def models(config_path: ConfigOpt = Path("config.yaml")) -> None:
         if entry.requires_explicit_enable:
             notes.append("[red]explicit enable only[/red]")
         table.add_row(
-            entry.alias, entry.id, entry.display_name, f"{entry.context_window:,}",
-            entry.default_effort, f"${p.input:.2f}", f"${p.output:.2f}",
-            f"${p.cache_hit:.2f}", f"${p.cache_write_5m:.2f}", f"${p.cache_write_1h:.2f}",
+            entry.provider, entry.alias, entry.id, entry.display_name, f"{entry.context_window:,}",
+            entry.default_effort,
+            f"${p.input:.2f}" if p else "unavailable",
+            f"${p.output:.2f}" if p else "unavailable",
+            f"${p.cache_hit:.2f}" if p else "unavailable",
+            f"${p.cache_write_5m:.2f}" if p else "unavailable",
+            f"${p.cache_write_1h:.2f}" if p else "unavailable",
             ", ".join(notes),
         )
     console.print(table)
     console.print(f"last reviewed: [bold]{registry.menu.last_reviewed or 'never'}[/bold]")
     console.print(f"edit prices: {config.llm.models_path}")
     console.print(
-        f"mode={config.llm.mode}  manual={config.llm.manual_model}/{config.llm.manual_effort}  "
+        f"routing_mode={config.llm.routing_mode}  single_model="
+        f"{config.llm.single_model_provider}/{config.llm.single_model_model}/{config.llm.single_model_effort}  "
         f"budget=${config.llm.budget_usd:.2f}/run  allow_fable={config.llm.allow_fable}"
     )
 
@@ -500,7 +507,7 @@ def costs(
     run: Annotated[str, typer.Option("--run", help="Run id, e.g. RUN_20260611_120000")],
     config_path: ConfigOpt = Path("config.yaml"),
 ) -> None:
-    """Show the Claude Code cost ledger for one run (actual vs ESTIMATED)."""
+    """Show the local LLM cost ledger for one run."""
     from pv_extractor.llm.costs import LEDGER_FILENAME, read_ledger, summarize_ledger
 
     config = _setup(config_path)
@@ -510,20 +517,21 @@ def costs(
         raise typer.Exit(code=1)
     entries = read_ledger(ledger_path)
 
-    table = Table(title=f"Claude Code cost ledger — {run}")
+    table = Table(title=f"LLM cost ledger — {run}")
     for col in ("memo", "tier", "model", "effort", "cached", "in tok", "out tok",
                 "cost USD", "source", "session", "error"):
         table.add_column(col)
     for entry in entries:
         usage = entry.get("usage") or {}
         source = entry.get("cost_source", "estimated")
-        source_label = source.upper() if source == "estimated" else source
+        source_label = source.upper() if source in {"estimated", "unavailable"} else source
+        cost_text = "unavailable" if source == "unavailable" else f"{entry.get('cost_usd', 0.0):.4f}"
         table.add_row(
             entry.get("memo_id", ""), str(entry.get("tier", "")),
             entry.get("model_alias", ""), entry.get("effort", ""),
             "yes" if entry.get("from_cache") else "",
             f"{usage.get('input_tokens', 0):,}", f"{usage.get('output_tokens', 0):,}",
-            f"{entry.get('cost_usd', 0.0):.4f}", source_label,
+            cost_text, source_label,
             entry.get("session_id") or "", entry.get("error") or "",
         )
     console.print(table)
@@ -534,13 +542,14 @@ def costs(
     )
     console.print(
         f"total: [bold]${summary['total_usd']:.4f}[/bold] "
-        f"(actual ${summary['actual_usd']:.4f} + ESTIMATED ${summary['estimated_usd']:.4f})"
+        f"(actual ${summary['actual_usd']:.4f} + ESTIMATED ${summary['estimated_usd']:.4f}; "
+        f"unavailable attempts {summary.get('unavailable_attempts', 0)})"
     )
 
 
 @app.command()
 def doctor(config_path: ConfigOpt = Path("config.yaml")) -> None:
-    """Diagnose the Phase-3/4 setup: claude CLI, auth, print-mode flags, model menu,
+    """Diagnose the Phase-3/4 setup: provider CLI, auth, structured-output flags, model menu,
     schema artifacts, cost accounting (shared with the GUI Settings screen)."""
     from pv_extractor.system.doctor import collect_doctor_checks
 

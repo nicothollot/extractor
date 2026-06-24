@@ -11,7 +11,7 @@ from __future__ import annotations
 import enum
 from datetime import date, datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class DocType(str, enum.Enum):
@@ -336,6 +336,66 @@ class DocFlag(str, enum.Enum):
     OCR_UNAVAILABLE = "OCR_UNAVAILABLE"  # scanned pages present but no OCR engine
 
 
+class EvidenceMatchMethod(str, enum.Enum):
+    """How a field's evidence quote was tied to page geometry."""
+
+    native_text = "native_text"
+    table_cell = "table_cell"
+    ocr_word_alignment = "ocr_word_alignment"
+    manual_box = "manual_box"
+    page_only = "page_only"
+
+
+class EvidenceWord(BaseModel):
+    """One source token/word with geometry in PDF page coordinates.
+
+    `bbox` is always `(x0, y0, x1, y1)` in PDF points in the same PyMuPDF
+    page coordinate space used for rendering overlays: top-left origin,
+    `page.rect` units, after PyMuPDF crop/rotation normalization.
+    """
+
+    id: str
+    text: str
+    bbox: tuple[float, float, float, float]
+    source: str = "native_text"  # native_text | ocr
+    confidence: float | None = None
+
+
+class EvidenceRef(BaseModel):
+    """First-class field evidence reference.
+
+    The coordinate system is intentionally singular: any non-null `bbox` is
+    `(x0, y0, x1, y1)` in PDF points in PyMuPDF's page coordinate space
+    (top-left origin, `page.rect` units). The API/UI convert from this single
+    system to pixels when drawing overlays.
+    """
+
+    source_id: str | None = None
+    source_file: str | None = None
+    display_page: int | None = None  # 1-based page shown to reviewers
+    pdf_page_index: int | None = None  # 0-based page index for PDF libraries
+    quote: str = ""
+    raw_text: str = ""
+    bbox: tuple[float, float, float, float] | None = None
+    bbox_coordinate_system: str = "pdf_points_topleft_page_rect"
+    match_method: EvidenceMatchMethod = EvidenceMatchMethod.page_only
+    match_score: float | None = None
+    word_ids: list[str] = Field(default_factory=list)
+    span_ids: list[str] = Field(default_factory=list)
+    provenance: str = ""
+    provider: str | None = None
+    extraction_method: str | None = None
+    no_geometry_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _derive_page_pair(self) -> "EvidenceRef":
+        if self.display_page is None and self.pdf_page_index is not None:
+            self.display_page = self.pdf_page_index + 1
+        if self.pdf_page_index is None and self.display_page is not None and self.display_page > 0:
+            self.pdf_page_index = self.display_page - 1
+        return self
+
+
 class TableData(BaseModel):
     """One extracted table as a row-major cell grid (None = empty cell)."""
 
@@ -358,6 +418,7 @@ class PageContent(BaseModel):
     page_class: PageClass = PageClass.TEXT
     ocr_engine: str | None = None  # set when text came from OCR
     ocr_mean_confidence: float | None = None  # mean word confidence 0-1
+    words: list[EvidenceWord] = Field(default_factory=list)
     unit_label: str = "page"  # page | slide | sheet | section
     unit_name: str | None = None  # e.g. worksheet name
 
@@ -388,6 +449,7 @@ class ConflictingCandidate(BaseModel):
     page: int | None = None
     confidence: float = 0.0
     evidence: str = ""
+    evidence_ref: EvidenceRef | None = None
 
 
 class FieldHit(BaseModel):
@@ -402,7 +464,7 @@ class FieldHit(BaseModel):
     unit: str | None = None
     page: int | None = None
     bbox: tuple[float, float, float, float] | None = None
-    method: str = "deterministic"  # deterministic | computed | metadata | claude-code:<model>:<effort>
+    method: str = "deterministic"  # deterministic | computed | metadata | llm:<provider>:<model>:<effort>
     confidence: float = 0.0  # 0-1, multiplicative components
     evidence: str = ""  # verbatim snippet <= ~200 chars
     confidence_components: dict[str, float] = Field(default_factory=dict)
@@ -411,6 +473,48 @@ class FieldHit(BaseModel):
     # merge), the merged row records WHICH document each cell's value came from
     # (the highest-confidence one). None on single-document rows.
     source_file: str | None = None
+    evidence_ref: EvidenceRef | None = None
+
+    @model_validator(mode="after")
+    def _sync_legacy_evidence_fields(self) -> "FieldHit":
+        """Bridge the migration from page/raw/bbox to EvidenceRef.
+
+        Old audit JSON only has `page`, `evidence`, and maybe `bbox`. New code
+        should consume `evidence_ref`, but the legacy fields stay populated so
+        existing APIs/tests continue to work during the migration.
+        """
+        if self.evidence_ref is not None:
+            if self.page is None:
+                self.page = self.evidence_ref.display_page
+            if self.bbox is None and self.evidence_ref.bbox is not None:
+                self.bbox = self.evidence_ref.bbox
+            if not self.evidence and self.evidence_ref.quote:
+                self.evidence = self.evidence_ref.quote
+            return self
+
+        if self.page is None and not self.evidence and self.bbox is None:
+            return self
+        match_method = EvidenceMatchMethod.page_only
+        no_geometry_reason = None
+        if self.method == "manual" and self.bbox is not None:
+            match_method = EvidenceMatchMethod.manual_box
+        elif self.bbox is not None:
+            match_method = EvidenceMatchMethod.table_cell
+        else:
+            no_geometry_reason = "legacy hit has page/quote but no resolved bbox"
+        self.evidence_ref = EvidenceRef(
+            source_file=self.source_file,
+            display_page=self.page,
+            quote=self.evidence,
+            raw_text=self.raw_text,
+            bbox=self.bbox,
+            match_method=match_method,
+            match_score=self.confidence,
+            provenance="legacy_fieldhit",
+            extraction_method=self.method,
+            no_geometry_reason=no_geometry_reason,
+        )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +543,27 @@ class ReviewFlag(BaseModel):
     severity: FlagSeverity = FlagSeverity.warning
     reviewer_attention: bool = False
     field: str | None = None  # related schema header, when field-specific
+    # Backward-compatible provenance for generated cleanup/dedupe. Older audit
+    # JSON without these fields infers origin from category at load time.
+    origin: str | None = None  # reader | extraction | validation | qa | llm | run | review
+    code: str | None = None  # stable machine-readable rule/finding code
+
+    @model_validator(mode="after")
+    def _default_origin(self) -> "ReviewFlag":
+        if self.origin is None:
+            if self.category == "llm":
+                self.origin = "llm"
+            elif self.category in {"range", "cross_field", "qoq_threshold", "computed_crosscheck"}:
+                self.origin = "validation"
+            elif self.category == "qa":
+                self.origin = "qa"
+            elif self.category in {"run", "locator", "verify"}:
+                self.origin = "run"
+            elif self.category in {"reader"}:
+                self.origin = "reader"
+            else:
+                self.origin = "extraction"
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +583,7 @@ class EscalationField(BaseModel):
 
 
 class LlmUsage(BaseModel):
-    """Token usage for one Claude Code call — actual when the CLI reported
+    """Token usage for one local LLM call — actual when the CLI reported
     it, otherwise estimated from the prompt/payload and labeled as such."""
 
     input_tokens: int = 0
@@ -468,35 +593,81 @@ class LlmUsage(BaseModel):
     source: str = "estimated"  # actual | estimated
 
 
+class AssistanceTaskRecord(BaseModel):
+    """One bounded provider-neutral LLM assistance task.
+
+    Serialized into the audit/diagnostics stream; it carries identifiers,
+    field/page counts and hashes only, never memo text.
+    """
+
+    task_id: str
+    memo_id: str
+    row_memo_ids: list[str] = Field(default_factory=list)
+    deal_id: str = ""
+    document_ids: list[str] = Field(default_factory=list)
+    requested_field_keys: list[str] = Field(default_factory=list)
+    requested_fields: list[str] = Field(default_factory=list)
+    field_priorities: dict[str, int] = Field(default_factory=dict)
+    selected_pages: list[int] = Field(default_factory=list)
+    selected_page_hashes: list[str] = Field(default_factory=list)
+    text_block_count: int = 0
+    image_count: int = 0
+    estimated_prompt_chars: int = 0
+    estimated_prompt_tokens: int = 0
+    estimated_output_tokens: int = 0
+    worst_case_output_chars: int = 0
+    reason: str = ""
+    wave: int = 1
+    provider: str = ""
+    model_alias: str = ""
+    model_id: str = ""
+    effort: str = ""
+
+
 class LlmAttempt(BaseModel):
-    """One Claude Code CLI call for one memo at one router tier. Serialized
+    """One local LLM CLI call for one memo at one router tier. Serialized
     into the audit record and the per-run cost ledger; never contains memo
     text, client names, or page payload."""
 
     job_id: str  # pv-<run_id>-<memo_id>-t<tier>
+    task_id: str | None = None
+    wave: int | None = None
+    provider: str = "claude"
     tier: int
     model_alias: str
     model_id: str
     effort: str
-    session_id: str | None = None  # Claude Code session id when reported
+    session_id: str | None = None  # provider session/thread id when reported
     from_cache: bool = False  # served from the LLM response cache (rule 10)
     exit_code: int | None = None
     duration_seconds: float = 0.0
     usage: LlmUsage = Field(default_factory=LlmUsage)
     cost_usd: float = 0.0
-    cost_source: str = "estimated"  # actual | estimated
+    cost_source: str = "estimated"  # actual | estimated | cache | unavailable
+    schema_version: int = 1
+    prompt_version: str = ""
+    selected_pages: list[int] = Field(default_factory=list)
+    selected_page_count: int = 0
+    selected_image_count: int = 0
+    estimated_prompt_chars: int = 0
+    estimated_prompt_tokens: int = 0
+    estimated_output_tokens: int = 0
+    queue_wait_seconds: float = 0.0
+    retry_status: str = "none"  # none | retryable | retried | non_retryable
     fields_requested: int = 0
     fields_returned: int = 0
     fields_merged: int = 0
     fields_rejected: int = 0
     fields_not_found: int = 0
+    fields_grounded: int = 0
+    fields_ungrounded: int = 0
     error: str | None = None
 
 
 class EscalationPlan(BaseModel):
-    """Per-memo seam for the Phase-3 Claude Code CLI fallback. Phase 2
+    """Per-memo seam for the Phase-3 local CLI LLM assist. Phase 2
     serializes the field list into the audit record; Phase 3 executes it
-    through hidden local Claude Code sessions and records every attempt,
+    through hidden local provider sessions and records every attempt,
     merge and rejection here (the audit trail for rule 'nothing silent')."""
 
     memo_id: str
@@ -506,10 +677,12 @@ class EscalationPlan(BaseModel):
     # llm_fallback_disabled | not_needed | llm_completed | llm_partial |
     # llm_failed | llm_deferred_budget
     status: str = "llm_fallback_disabled"
+    tasks: list[AssistanceTaskRecord] = Field(default_factory=list)
     attempts: list[LlmAttempt] = Field(default_factory=list)
     merged_fields: list[str] = Field(default_factory=list)
     not_extractable: list[str] = Field(default_factory=list)
     merge_log: list[str] = Field(default_factory=list)  # one line per merge/overwrite/rejection
+    diagnostics: dict[str, object] = Field(default_factory=dict)
 
 
 class AssetExtraction(BaseModel):

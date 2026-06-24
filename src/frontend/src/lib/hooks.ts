@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { get, JobEvent, JobInfo } from "./api";
+import { initialJobPollingSnapshot, JobPollingMachine, JobPollingSnapshot } from "./jobPolling";
 
 export interface Loadable<T> {
   data: T | null;
@@ -96,26 +97,30 @@ export function useJobEvents(jobId: string | null) {
   return { events, job };
 }
 
-/** Poll a job until it leaves the active states. */
-export function useJobPolling(jobId: string | null, intervalMs = 1200) {
-  const [job, setJob] = useState<JobInfo | null>(null);
+/** Poll a job until it leaves the active states, retrying transient request failures. */
+export function useJobPolling(jobId: string | null, intervalMs = 1200): JobPollingSnapshot & { refresh: () => void } {
+  const [snapshot, setSnapshot] = useState<JobPollingSnapshot>(() => initialJobPollingSnapshot(jobId));
+  const machineRef = useRef<JobPollingMachine | null>(null);
+
   useEffect(() => {
-    if (!jobId) return;
-    let alive = true;
-    const poll = async () => {
-      const j = await get<JobInfo>(`/api/jobs/${jobId}`).catch(() => null);
-      if (!alive) return;
-      if (j) setJob(j);
-      if (j && ["queued", "running", "cancelling"].includes(j.status)) {
-        window.setTimeout(poll, intervalMs);
-      }
-    };
-    poll();
+    const machine = new JobPollingMachine(
+      (id, signal) => get<JobInfo>(`/api/jobs/${id}`, { signal }),
+      setSnapshot,
+      { intervalMs },
+    );
+    machineRef.current = machine;
+    machine.setJobId(jobId);
     return () => {
-      alive = false;
+      machine.stop();
+      if (machineRef.current === machine) machineRef.current = null;
     };
   }, [jobId, intervalMs]);
-  return job;
+
+  const refresh = useCallback(() => {
+    machineRef.current?.refresh();
+  }, []);
+
+  return { ...snapshot, refresh };
 }
 
 export const fmtUsd = (v: number | null | undefined, digits = 2) =>

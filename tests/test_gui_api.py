@@ -449,7 +449,9 @@ def test_concurrent_pipeline_jobs_refused(client) -> None:
     try:
         assert second.status_code in (200, 409)
         if second.status_code == 409:
-            assert "already active" in second.json()["detail"]
+            detail = second.json()["detail"]
+            assert detail["code"] == "active_pipeline_job"
+            assert detail["active_job"]["id"] == first.json()["job"]["id"]
     finally:
         _wait_job(client, first.json()["job"]["id"])
         if second.status_code == 200:
@@ -480,8 +482,8 @@ def test_review_queue_actions_and_evidence(client, completed_run, gui_env) -> No
     assert image.headers["content-type"] == "image/png"
     assert image.content[:8] == b"\x89PNG\r\n\x1a\n"
 
-    # accept a flag -> workbook Resolved=Y + audit review_actions entry
-    flag_item = next(i for i in items if i["kind"] == "flag" and not i["resolved"])
+    # accept a pending item -> audit review_actions entry + queue resolution
+    flag_item = next(i for i in items if not i["resolved"])
     r = client.post(
         f"/api/runs/{run_id}/review/{flag_item['id']}/action",
         json={"action": "accept", "note": "verified against page"},
@@ -627,9 +629,12 @@ def test_run_timing_page_words_and_add_value(client, gui_env) -> None:
     assert detail["started_at"] and detail["finished_at"]
     assert detail["duration_minutes"] is not None
 
-    items = client.get(f"/api/runs/{run_id}/review").json()["items"]
+    queue = client.get(f"/api/runs/{run_id}/review").json()
+    items = queue["items"]
     assert items
     assert all("qa_fail_reasons" in i for i in items)
+    assert all(i["qa_fail_reasons"] == [] for i in items)
+    assert "memo_issues" in queue
 
     # page-words endpoint for a PDF page (text pages carry selectable words)
     with_page = next(i for i in items if i["has_page_image"])
@@ -676,6 +681,8 @@ def test_run_timing_page_words_and_add_value(client, gui_env) -> None:
     ]
     assert manual and manual[0]["value"] == "manual-added"
     assert manual[0]["bbox"] == [10.0, 10.0, 120.0, 28.0]
+    assert manual[0]["evidence_ref"]["match_method"] == "manual_box"
+    assert manual[0]["evidence_ref"]["bbox"] == [10.0, 10.0, 120.0, 28.0]
 
 
 # ---------------------------------------------------------------------------
@@ -1402,9 +1409,10 @@ def test_multi_search_run_conflicts_with_active_pipeline(client) -> None:
     try:
         assert second.status_code in (200, 409)
         if second.status_code == 409:
-            assert "already active" in second.json()["detail"]
+            detail = second.json()["detail"]
+            assert detail["code"] == "active_pipeline_job"
+            assert detail["active_job"]["id"] == first.json()["job"]["id"]
     finally:
         _wait_job(client, first.json()["job"]["id"])
         if second.status_code == 200:
             _wait_job(client, second.json()["job"]["id"])
-

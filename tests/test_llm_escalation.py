@@ -254,7 +254,7 @@ def test_fill_empty_field_and_never_overwrite_confident_value(tmp_path):
 
     fund = next(h for h in memo.assets[0].hits if h.field == "Fund Name")
     assert fund.value == "Test Fund I"
-    assert fund.method == "claude-code:sonnet:medium"  # text memo -> AUTO tier 0
+    assert fund.method == "llm:claude:sonnet:medium"  # text memo -> AUTO tier 0
     assert fund.evidence == "Fund Name: Test Fund I" and fund.page == 1
     assert fund.confidence == pytest.approx(0.85)
 
@@ -266,14 +266,8 @@ def test_fill_empty_field_and_never_overwrite_confident_value(tmp_path):
     assert any("rejected:protected" in line for line in plan.merge_log)
     assert plan.status == "llm_partial"
     assert any(d.startswith("LLM_UNCONFIRMED: Gross IRR") for d in flags_of(memo))
-    # Adaptive batching merges FUND ("Fund Name") and RETURNS ("Gross IRR %",
-    # both on page 1) into one call; Fund Name fills on the sonnet tier, while the
-    # protected Gross IRR stays unresolved and forces the opus retry of the merged
-    # group. Invariant: tier 0 is sonnet/medium and an opus/high retry happened.
     tiers = [(a.model_alias, a.effort) for a in plan.attempts]
-    assert tiers[0] == ("sonnet", "medium")
-    assert ("opus", "high") in tiers  # protected below-confidence field forced a retry
-    assert all(a.model_alias in ("sonnet", "opus") for a in plan.attempts)
+    assert tiers == [("sonnet", "medium")]
     assert summary.attempts == len(plan.attempts) and summary.total_cost_usd > 0
     ledger = read_ledger(Path(config.output_dir) / "RUN_TEST" / "llm" / LEDGER_FILENAME)
     assert len(ledger) == len(plan.attempts) and all(e["cost_source"] == "estimated" for e in ledger)
@@ -292,7 +286,7 @@ def test_overwrite_below_threshold_keeps_old_value_as_conflict(tmp_path):
     run_escalation(config, [memo], fake)
 
     irr = next(h for h in memo.assets[0].hits if h.field == "Gross IRR %")
-    assert irr.value == 12.5 and irr.method == "claude-code:sonnet:medium"
+    assert irr.value == 12.5 and irr.method == "llm:claude:sonnet:medium"
     assert irr.conflicts and irr.conflicts[-1].value == 11.0  # audit keeps the loser
     plan = memo.escalation
     assert plan.status == "llm_completed"
@@ -300,11 +294,9 @@ def test_overwrite_below_threshold_keeps_old_value_as_conflict(tmp_path):
     assert len(plan.attempts) == 1  # resolved at tier 0, no retry
 
 
-def test_ungrounded_value_is_surfaced_for_review_by_default(tmp_path):
-    """Default (surface_ungrounded_values=True): a value whose quote can't be
-    matched on the page (common on scanned/OCR pages) is SHOWN as a
-    low-confidence, UNGROUNDED-flagged hit for the analyst to review — not
-    silently discarded."""
+def test_ungrounded_value_is_ineligible_by_default(tmp_path):
+    """Default arbitration requires grounded evidence: an ungrounded value is
+    retained as an unresolved review item rather than filling the field."""
     config = make_config(tmp_path)
     memo = make_memo(tmp_path, hits=[], plan_fields=[escalation_field("Fund Name", "required_empty")])
     fake = FakeClaudeCodeClient(
@@ -312,12 +304,8 @@ def test_ungrounded_value_is_surfaced_for_review_by_default(tmp_path):
     )
     run_escalation(config, [memo], fake)
 
-    hit = next((h for h in memo.assets[0].hits if h.field == "Fund Name"), None)
-    assert hit is not None and hit.value == "Fake Fund"          # value SHOWN, not discarded
-    assert hit.confidence <= config.llm.ungrounded_confidence_cap  # but clearly low-confidence
-    assert any(d.startswith("UNGROUNDED_LLM_VALUE: Fund Name") for d in flags_of(memo))
-    # surfaced => resolved, so no NOT_EXTRACTABLE "all passes failed" flag
-    assert not any(d.startswith("NOT_EXTRACTABLE") for d in flags_of(memo))
+    assert next((h for h in memo.assets[0].hits if h.field == "Fund Name"), None) is None
+    assert any(d.startswith("LLM_UNRESOLVED: Fund Name") for d in flags_of(memo))
 
 
 def test_ungrounded_value_discarded_when_surfacing_disabled(tmp_path):
@@ -357,7 +345,7 @@ def test_wholesale_call_failure_emits_one_clear_error_not_per_field_noise(tmp_pa
     assert memo.escalation.status == "llm_failed"
 
 
-def test_malformed_json_falls_through_to_retry_tier(tmp_path):
+def test_malformed_json_does_not_trigger_routine_retry(tmp_path):
     config = make_config(tmp_path)
     memo = make_memo(tmp_path, hits=[], plan_fields=[escalation_field("Fund Name", "required_empty")])
     fake = FakeClaudeCodeClient(
@@ -368,10 +356,9 @@ def test_malformed_json_falls_through_to_retry_tier(tmp_path):
 
     plan = memo.escalation
     assert plan.attempts[0].error and "non-JSON" in plan.attempts[0].error
-    assert plan.attempts[1].fields_merged == 1
-    fund = next(h for h in memo.assets[0].hits if h.field == "Fund Name")
-    assert fund.method == "claude-code:opus:high"  # merged by the retry tier
-    assert plan.status == "llm_completed"
+    assert len(plan.attempts) == 1
+    assert next((h for h in memo.assets[0].hits if h.field == "Fund Name"), None) is None
+    assert plan.status == "llm_failed"
 
 
 def test_not_found_is_resolved_no_retry_no_flag(tmp_path):
@@ -404,9 +391,9 @@ def test_not_found_is_resolved_no_retry_no_flag(tmp_path):
     assert irr.value == 11.0  # untouched
 
 
-def test_retry_not_found_true_restores_retry_and_flags(tmp_path):
-    """Opt-in (retry_not_found=True): not_found fields escalate to the stronger
-    tier and, still unresolved, surface the leftover flags (old behavior)."""
+def test_retry_not_found_true_no_longer_creates_model_ladder(tmp_path):
+    """Legacy retry_not_found no longer creates a stronger model ladder; repair
+    is controlled by candidate_arbitration.repair_policy."""
     config = make_config(tmp_path)
     config.llm.retry_not_found = True
     memo = make_memo(
@@ -422,8 +409,8 @@ def test_retry_not_found_true_restores_retry_and_flags(tmp_path):
 
     plan = memo.escalation
     assert plan.merged_fields == []
-    assert any(c["model"] == "opus" for c in fake.calls)  # retry tier ran
-    assert sum(a.fields_not_found for a in plan.attempts) == 4  # 2 fields x 2 tiers
+    assert all(c["model"] != "opus" for c in fake.calls)
+    assert sum(a.fields_not_found for a in plan.attempts) == 2
     assert plan.not_extractable == ["Fund Name"]
     assert any(d.startswith("NOT_EXTRACTABLE: Fund Name") for d in flags_of(memo))
     assert any(d.startswith("LLM_UNCONFIRMED: Gross IRR") for d in flags_of(memo))
@@ -515,7 +502,7 @@ def test_resolve_settings_cli_semantics(default_config):
     assert s.enabled and s.mode == "auto" and s.budget_usd == 25.0
     assert resolve_settings(default_config, no_llm=True).enabled is False
     s = resolve_settings(default_config, model="haiku", effort="low")
-    assert s.mode == "manual" and s.manual_model == "haiku"  # --llm-model implies manual
+    assert s.mode == "single_model" and s.manual_model == "haiku"
     assert resolve_settings(default_config, budget=5.0).budget_usd == 5.0
 
 
@@ -554,21 +541,22 @@ def test_full_pipeline_scanned_memo_escalates_merges_and_ledgers(phase2_env):
     escalated = {f.field for f in plan.fields}
     assert {"Gross IRR %", "MOIC"} <= escalated  # OCR-page hits sit below threshold
 
-    # the scanned memo is OCR-hostile: AUTO routes straight to opus/high
-    assert fake.calls and fake.calls[0]["model"] == "opus" and fake.calls[0]["effort"] == "high"
+    # A one-document deal is one primary request; AUTO stays on the configured
+    # normal extraction model unless profile metrics justify Opus.
+    assert fake.calls and fake.calls[0]["model"] == "sonnet" and fake.calls[0]["effort"] == "medium"
 
     # merged row: the grounded LLM value replaced the low-confidence OCR hit
     irr = next(h for h in memo.assets[0].hits if h.field == "Gross IRR %")
     assert irr.value == 12.5
-    assert irr.method == "claude-code:opus:high"
+    assert irr.method == "llm:claude:sonnet:medium"
     assert irr.evidence == "Gross IRR: 12.5%"
     assert "Gross IRR %" in plan.merged_fields
 
-    # fabricated quote: value discarded, UNGROUNDED flag raised
+    # fabricated quote: value discarded, unresolved review item raised
     moic = next(h for h in memo.assets[0].hits if h.field == "MOIC")
-    assert moic.method != "claude-code:opus:high" or moic.value != 9.9
+    assert moic.method != "llm:claude:opus:high" or moic.value != 9.9
     assert any(
-        f.description.startswith("UNGROUNDED_LLM_VALUE: MOIC") and f.reviewer_attention
+        f.description.startswith("LLM_UNRESOLVED: MOIC") and f.reviewer_attention
         for f in memo.assets[0].flags
     )
 
@@ -600,7 +588,7 @@ def test_full_pipeline_scanned_memo_escalates_merges_and_ledgers(phase2_env):
     run_log = workbook["Run Log"]
     sessions_col = RUN_LOG_COLUMNS.index("Batch Sessions") + 1
     sessions_cell = run_log.cell(row=run_log.max_row, column=sessions_col).value
-    assert sessions_cell and f"pv-{report.run_id}-{memo.memo_id}-g0t0" in sessions_cell
+    assert sessions_cell and f"pv-{report.run_id}-{memo.memo_id}-w" in sessions_cell
     workbook.close()
 
 
@@ -615,7 +603,7 @@ def test_full_pipeline_no_llm_settings_is_pure_phase2(phase2_env):
     assert report.llm is None
     assert memo.escalation.attempts == []
     assert memo.escalation.status == "llm_fallback_disabled"
-    assert not any(h.method.startswith("claude-code:") for h in memo.assets[0].hits)
+    assert not any(h.method.startswith("llm:") for h in memo.assets[0].hits)
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +669,7 @@ def test_one_call_per_deal_extracts_all_documents_in_one_call(tmp_path):
     primary.escalation = EscalationPlan(
         memo_id="MEMO_A", confidence_threshold=0.75,
         fields=[escalation_field("Gross IRR %", "force_llm_assist"),
-                escalation_field("MOIC", "force_llm_assist")],
+                escalation_field("MOIC", "force_llm_assist", pages=[2])],
     )
     support = MemoResult(
         memo_id="MEMO_B", run_id="RUN_TEST", client="C", deal="D",
@@ -710,7 +698,7 @@ def test_one_call_per_deal_extracts_all_documents_in_one_call(tmp_path):
     # values from BOTH documents landed on the primary row, grounded.
     hits = {h.field: h for h in primary.assets[0].hits}
     assert hits["Gross IRR %"].value == 12.5
-    assert hits["Gross IRR %"].method.startswith("claude-code:")
+    assert hits["Gross IRR %"].method.startswith("llm:claude:")
     assert hits["MOIC"].value == 1.4 and hits["MOIC"].page == 2
 
 

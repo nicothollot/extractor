@@ -67,6 +67,8 @@ def qoq_checks(
                         severity=FlagSeverity.warning,
                         reviewer_attention=True,
                         field=header,
+                        origin="validation",
+                        code="wacc_gt_50bps_qoq",
                     )
                 )
         threshold_values.setdefault("WACC >50bps QoQ", False)
@@ -87,6 +89,8 @@ def qoq_checks(
                         severity=FlagSeverity.warning,
                         reviewer_attention=True,
                         field=_MULT_HEADER,
+                        origin="validation",
+                        code="multiple_gt_0_5x_qoq",
                     )
                 )
 
@@ -106,6 +110,8 @@ def qoq_checks(
                         severity=FlagSeverity.warning,
                         reviewer_attention=True,
                         field=_NAV_HEADER,
+                        origin="validation",
+                        code="nav_gt_5pct_qoq",
                     )
                 )
 

@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -34,8 +35,11 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from pv_extractor.config import Config
+from pv_extractor.io_guard import guarded_open_write
 from pv_extractor.logging_setup import log_event
 from pv_extractor.models import LlmUsage
+from pv_extractor.llm.provider import LlmCliResult, LlmProviderCapabilities
+from pv_extractor.llm.response_validation import StructuredResponseError, validate_structured_response
 
 logger = logging.getLogger(__name__)
 
@@ -48,20 +52,10 @@ LOGIN_REMEDIATION = (
 _STDERR_DEBUG_CHARS = 400
 
 
-class ClaudeCodeResult(BaseModel):
+class ClaudeCodeResult(LlmCliResult):
     """Outcome of one non-interactive extraction call."""
 
-    job_id: str
-    ok: bool
-    exit_code: int | None = None
-    duration_seconds: float = 0.0
-    session_id: str | None = None
-    structured: dict | None = None  # schema-conforming JSON document
-    usage: LlmUsage | None = None  # actual usage when the CLI reported it
-    total_cost_usd: float | None = None  # actual cost when the CLI reported it
-    error: str | None = None
-    stdout_sha256: str = ""  # audit pointer without retaining content
-    argv: list[str] = Field(default_factory=list)  # flags only; prompt goes via stdin
+    provider: str = "claude"
 
 
 def _sanitized_env() -> dict[str, str]:
@@ -289,12 +283,15 @@ def _error_from_stdout(stdout: str) -> str:
 class ClaudeCodeClient:
     """Launches hidden, non-interactive Claude Code extraction calls."""
 
+    provider_name = "claude"
+
     def __init__(self, config: Config) -> None:
         self._command = config.claude_code.command
         self._command_args = list(config.claude_code.command_args)
         self._check_timeout = config.claude_code.default_timeout_seconds
         self._call_timeout = config.llm.timeout_seconds
         self._exclude_dynamic = config.llm.exclude_dynamic_system_prompt_sections
+        self._pv_root = config.pv_root
         self._help_text: str | None = None
 
     # ------------------------------------------------------------------
@@ -303,6 +300,20 @@ class ClaudeCodeClient:
 
     def binary_path(self) -> str | None:
         return shutil.which(self._command)
+
+    def check_available(self) -> tuple[bool, str]:
+        if self.binary_path() is None:
+            return False, f"claude CLI ({self._command!r}) not found on PATH"
+        return self.auth_status()
+
+    def capabilities(self) -> LlmProviderCapabilities:
+        return LlmProviderCapabilities(
+            structured_output=self.supports("--json-schema"),
+            image_input=True,
+            output_schema_file=False,
+            output_last_message_file=False,
+            json_telemetry=False,
+        )
 
     def _probe(self, argv_tail: list[str], timeout: int | None = None) -> tuple[int | None, str]:
         argv = [self._command, *self._command_args, *argv_tail]
@@ -369,10 +380,18 @@ class ClaudeCodeClient:
         # so no shell quoting/escaping is involved.
         try:
             schema_arg = schema_path.read_text(encoding="utf-8")
+            schema_doc = json.loads(schema_arg)
         except OSError as exc:
             result = ClaudeCodeResult(
                 job_id=job_id, ok=False,
                 error=f"could not read schema {schema_path}: {exc}",
+            )
+            self._log(result, model, effort)
+            return result
+        except json.JSONDecodeError as exc:
+            result = ClaudeCodeResult(
+                job_id=job_id, ok=False,
+                error=f"could not parse schema {schema_path}: {exc}",
             )
             self._log(result, model, effort)
             return result
@@ -401,19 +420,46 @@ class ClaudeCodeClient:
             # characters like ◼ (U+25FC) and raises UnicodeEncodeError before
             # the call even runs. Force UTF-8 on both directions (errors=replace
             # only guards stdout decode; UTF-8 encodes any prompt losslessly).
-            proc = subprocess.run(
-                exec_argv, input=prompt, capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
-                timeout=timeout or self._call_timeout, cwd=str(cwd), env=_sanitized_env(),
-            )
-        except subprocess.TimeoutExpired:
-            duration = round(time.perf_counter() - started, 2)
-            result = ClaudeCodeResult(
-                job_id=job_id, ok=False, duration_seconds=duration,
-                error=f"timed out after {timeout or self._call_timeout}s", argv=argv,
-            )
-            self._log(result, model, effort)
-            return result
+            popen_kwargs: dict = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "cwd": str(cwd),
+                "env": _sanitized_env(),
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["start_new_session"] = True
+            proc = subprocess.Popen(exec_argv, **popen_kwargs)
+            try:
+                stdout, stderr = proc.communicate(prompt, timeout=timeout or self._call_timeout)
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        capture_output=True,
+                        text=True,
+                    )
+                else:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    if os.name == "nt":
+                        proc.kill()
+                    else:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                duration = round(time.perf_counter() - started, 2)
+                result = ClaudeCodeResult(
+                    job_id=job_id, ok=False, duration_seconds=duration,
+                    error=f"timed out after {timeout or self._call_timeout}s", argv=argv,
+                )
+                self._log(result, model, effort)
+                return result
         except OSError as exc:
             result = ClaudeCodeResult(
                 job_id=job_id, ok=False, error=f"failed to launch: {exc}", argv=argv,
@@ -422,7 +468,8 @@ class ClaudeCodeClient:
             return result
 
         duration = round(time.perf_counter() - started, 2)
-        stdout = proc.stdout or ""
+        stdout = stdout or ""
+        stderr = stderr or ""
         result = ClaudeCodeResult(
             job_id=job_id, ok=False, exit_code=proc.returncode, duration_seconds=duration,
             stdout_sha256=hashlib.sha256(stdout.encode("utf-8")).hexdigest(), argv=argv,
@@ -435,8 +482,8 @@ class ClaudeCodeClient:
             # both. stderr/the envelope error is the CLI's own diagnostic, not
             # memo content (the memo travels via stdin and only appears in the
             # structured stdout payload). Truncated to keep the audit compact.
-            stderr = re.sub(r"\s+", " ", (proc.stderr or "")).strip()
-            detail = stderr or _error_from_stdout(stdout)
+            stderr_detail = re.sub(r"\s+", " ", stderr).strip()
+            detail = stderr_detail or _error_from_stdout(stdout)
             result.error = f"exit {proc.returncode}" + (f": {detail[:_STDERR_DEBUG_CHARS]}" if detail else "")
             self._log(result, model, effort)
             return result
@@ -463,10 +510,42 @@ class ClaudeCodeClient:
             result.error = "no schema-conforming JSON document in output"
             self._log(result, model, effort)
             return result
+        try:
+            validate_structured_response(schema_doc, structured)
+        except StructuredResponseError as exc:
+            result.error = f"structured output failed schema validation: {exc}"
+            self._log(result, model, effort)
+            return result
         result.structured = structured
         result.ok = True
         self._log(result, model, effort)
         return result
+
+    def extract_structured(
+        self,
+        *,
+        job_id: str,
+        prompt: str,
+        schema: dict,
+        images: list[Path] | None,
+        timeout: int | None,
+        model: str | None,
+        effort: str | None,
+        cwd: Path,
+    ) -> ClaudeCodeResult:
+        schema_path = cwd / f"{job_id}_schema.json"
+        with guarded_open_write(schema_path, self._pv_root) as fh:
+            fh.write(json.dumps(schema, ensure_ascii=False))
+        return self.extract_json(
+            job_id=job_id,
+            prompt=prompt,
+            schema_path=schema_path,
+            model=model or "",
+            effort=effort or "",
+            cwd=cwd,
+            allow_read_tool=True,
+            timeout=timeout,
+        )
 
     def _log(self, result: ClaudeCodeResult, model: str, effort: str) -> None:
         """INFO-safe logging: identifiers and counters only (redaction rule)."""

@@ -1,11 +1,10 @@
-"""Phase 3: Claude Code CLI fallback for escalated fields.
+"""Phase 3: local CLI LLM assist for escalated fields.
 
 The deterministic engine (Phase 2) stays primary. This package executes each
-memo's EscalationPlan as a surgical second pass through hidden, non-
-interactive local Claude Code sessions (`claude -p --output-format json
---json-schema ...`). There is NO Anthropic SDK, NO `anthropic` import and NO
-ANTHROPIC_API_KEY anywhere — authentication is the operator's one-time
-`claude auth login`, reused by every subprocess.
+memo's EscalationPlan as a surgical second pass through hidden, non-interactive
+local provider CLI sessions. There is NO hosted LLM API call from Python;
+authentication is the operator's one-time local CLI login, reused by every
+subprocess.
 
 LLM_VERSION participates in the response cache key — bump it on any change
 that can alter prompts, payload assembly, parsing or merge behavior.
@@ -28,9 +27,13 @@ that can alter prompts, payload assembly, parsing or merge behavior.
 # 3.9.0: response schema uses $defs/$ref (~10x smaller) so ~200 fields fit ONE
 # call (max_fields_per_call 50->200); cleanly-OCR'd SCANNED pages sent as TEXT
 # instead of slow page images (prefer_ocr_text_over_image).
-# 4.0.0: ONE CALL PER DEAL (llm.one_call_per_deal, default true) — a deal-period's
-# documents are combined into ONE payload (global page index, per-document
-# labels) and extracted in a SINGLE call over the whole field set, instead of
-# per-memo band-batched multi-call fan-out. Changes payload composition, prompt
-# page labels, and grouping → invalidates the response cache.
-LLM_VERSION = "4.0.0"
+# 4.1.0: provider-neutral structured-extraction seam; cache key includes provider
+# identity; llm.one_call_per_deal is deprecated in favor of
+# llm.combine_deal_documents and no longer implies force-assist/cache bypass.
+# 4.2.0: bounded adaptive AssistanceTask planner, sparse schema-v2 output,
+# selected-page cache keys, structured grounding, scoped retries/timeouts and
+# finalization rescue wave.
+# 5.0.0: sparse schema-v5 candidates with numeric model_confidence, one primary
+# deal/document pass, model extraction profiles, and local confidence
+# arbitration with repair disabled by default.
+LLM_VERSION = "5.0.0"

@@ -47,20 +47,21 @@ def _cost_accounting_check(config: Config) -> DoctorCheck:
 
 
 def collect_doctor_checks(config: Config) -> list[DoctorCheck]:
-    """Claude Code CLI / auth / print-mode flags / model menu / schema
-    artifacts / cost accounting — the Phase-3+4 health snapshot."""
+    """Active LLM provider CLI / model menu / schema artifacts / cost
+    accounting — the Phase-3+4 health snapshot."""
+    from pv_extractor.llm.codex_cli_client import CodexCliClient
     from pv_extractor.llm.claude_code_client import ClaudeCodeClient
     from pv_extractor.llm.model_registry import ModelRegistry
     from pv_extractor.system.claude_code import run_startup_checks
 
     checks: list[DoctorCheck] = []
+    provider = config.llm.provider
 
-    snapshot = run_startup_checks(config)
-    for res in snapshot.results:
-        checks.append(DoctorCheck(check=f"claude {res.check}", ok=res.ok, detail=res.detail))
-
-    client = ClaudeCodeClient(config)
-    if client.binary_path() is not None:
+    if provider == "claude":
+        snapshot = run_startup_checks(config)
+        for res in snapshot.results:
+            checks.append(DoctorCheck(check=f"claude {res.check}", ok=res.ok, detail=res.detail))
+        client = ClaudeCodeClient(config)
         for flag in ("--json-schema", "--output-format", "--effort",
                      "--exclude-dynamic-system-prompt-sections"):
             supported = client.supports(flag)
@@ -70,6 +71,30 @@ def collect_doctor_checks(config: Config) -> list[DoctorCheck]:
                     detail="yes" if supported else "not advertised by --help (call proceeds without it)",
                 )
             )
+    elif provider == "codex":
+        client = CodexCliClient(config)
+        ok, detail = client.check_available()
+        checks.append(DoctorCheck(check="codex CLI", ok=ok, detail=detail))
+        caps = client.capabilities()
+        checks.append(
+            DoctorCheck(
+                check="codex structured output",
+                ok=caps.output_schema_file and caps.output_last_message_file,
+                detail=(
+                    "supports --output-schema and --output-last-message"
+                    if caps.output_schema_file and caps.output_last_message_file
+                    else "codex exec --help does not advertise the required structured-output file flags"
+                ),
+            )
+        )
+        checks.append(
+            DoctorCheck(
+                check="codex JSON telemetry", ok=True,
+                detail="supported" if caps.json_telemetry else "not advertised; token usage may be unavailable",
+            )
+        )
+    else:
+        checks.append(DoctorCheck(check="llm provider", ok=False, detail=f"unknown provider {provider!r}"))
 
     try:
         registry = ModelRegistry.load(config.llm.models_path)
@@ -79,9 +104,12 @@ def collect_doctor_checks(config: Config) -> list[DoctorCheck]:
                 detail=f"{len(registry.entries)} models, last reviewed {registry.menu.last_reviewed or 'never'}",
             )
         )
-        for name in (config.llm.auto.extraction_model, config.llm.auto.retry_model,
-                     config.llm.manual_model):
-            registry.resolve(name)
+        if provider == "claude":
+            for name in (config.llm.auto.extraction_model, config.llm.auto.retry_model,
+                         config.llm.manual_model):
+                registry.resolve(name, provider=provider)
+        elif config.codex_cli.model:
+            registry.resolve(config.codex_cli.model, provider=provider)
         checks.append(
             DoctorCheck(check="routing models resolvable", ok=True,
                         detail="auto/manual routing aliases all in the menu")
@@ -96,7 +124,10 @@ def collect_doctor_checks(config: Config) -> list[DoctorCheck]:
     checks.append(
         DoctorCheck(
             check="llm enabled", ok=config.llm.enabled,
-            detail=f"mode={config.llm.mode} budget=${config.llm.budget_usd:.2f} workers={config.llm.workers}",
+            detail=(
+                f"provider={config.llm.provider} mode={config.llm.mode} "
+                f"budget=${config.llm.budget_usd:.2f} workers={config.llm.workers}"
+            ),
         )
     )
     checks.append(_cost_accounting_check(config))

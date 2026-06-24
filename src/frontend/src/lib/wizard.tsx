@@ -44,7 +44,7 @@ export interface WizardState {
   dryRunOnly: boolean;
   // ai / model
   llmEnabled: boolean;
-  mode: "auto" | "manual";
+  mode: "auto" | "per_deal" | "single_model";
   manualModel: string;
   manualEffort: string;
   budget: string;
@@ -89,7 +89,7 @@ export const initialWizardState: WizardState = {
   llmEnabled: true,
   mode: "auto",
   manualModel: "sonnet",
-  manualEffort: "low",
+  manualEffort: "medium",
   budget: "",
   forceLlmAssist: false,
   aiInitialized: false,

@@ -26,6 +26,7 @@ from pathlib import Path
 
 import fitz  # pymupdf
 
+from pv_extractor.evidence import pymupdf_words_to_evidence_words
 from pv_extractor.logging_setup import log_event
 from pv_extractor.models import (
     DocFlag,
@@ -103,6 +104,7 @@ class PdfReader(DocumentReader):
         else:
             page_class = PageClass.TEXT
 
+        words = pymupdf_words_to_evidence_words(page.get_text("words"))
         return PageContent(
             page_number=page.number + 1,
             text=text,
@@ -111,6 +113,7 @@ class PdfReader(DocumentReader):
             has_text_layer=has_text_layer,
             rotation=page.rotation,
             page_class=page_class,
+            words=words,
         )
 
     # ------------------------------------------------------------------
