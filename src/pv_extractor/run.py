@@ -743,6 +743,9 @@ def run(
         if llm_settings is not None and llm_settings.enabled and not control.cancelled:
             all_groups = _build_deal_groups(assembled)
             deal_groups, document_memos, routing_diag = _route_llm_groups(all_groups, config, llm_settings)
+            def _llm_event_sink(event: str, payload: dict[str, object]) -> None:
+                control.emit(event, **payload)
+
             control.emit(
                 "llm_phase",
                 status="started",
@@ -754,12 +757,14 @@ def run(
                 deal_summary = process_deals(
                     deal_groups, config, llm_settings, schema_fields,
                     run_id=run_id, run_dir=run_dir, client=llm_client,
+                    event_sink=_llm_event_sink,
                 )
                 report.llm = _merge_llm_summaries(report.llm, deal_summary)
             if document_memos:
                 doc_summary = process_memos(
                     document_memos, config, llm_settings, schema_fields,
                     run_id=run_id, run_dir=run_dir, client=llm_client,
+                    event_sink=_llm_event_sink,
                 )
                 report.llm = _merge_llm_summaries(report.llm, doc_summary)
             control.emit(
@@ -789,9 +794,13 @@ def run(
             rescue_memos = _prepare_rescue_wave(assembled, config, schema_by_header, derived_headers)
             if rescue_memos:
                 control.emit("llm_phase", status="rescue_started", memos=len(rescue_memos))
+                def _llm_event_sink(event: str, payload: dict[str, object]) -> None:
+                    control.emit(event, **payload)
+
                 rescue_summary = process_memos(
                     rescue_memos, config, llm_settings, schema_fields,
                     run_id=run_id, run_dir=run_dir, client=llm_client,
+                    event_sink=_llm_event_sink,
                 )
                 report.llm = _merge_llm_summaries(report.llm, rescue_summary)
                 final_started = time.perf_counter()

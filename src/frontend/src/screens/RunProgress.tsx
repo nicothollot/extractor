@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { CostMeter } from "../components/charts";
+import { LlmActivityView } from "../components/LlmActivityView";
 import { LogTail } from "../components/LogTail";
 import { ProgressLanes, buildLanes } from "../components/ProgressLanes";
 import { Button, Card, CardHeader, Panel, StatusChip } from "../components/ui";
@@ -266,6 +267,8 @@ export default function RunProgress() {
           </div>
         </Card>
       </div>
+
+      <LlmActivityView events={events} />
 
       <Card>
         <CardHeader title="Log tail" sub="structured pipeline records (identifiers only, never memo content)" />

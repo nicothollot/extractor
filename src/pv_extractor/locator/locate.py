@@ -33,6 +33,8 @@ from pv_extractor.normalize import normalize_text, split_path_segments, strip_ex
 
 logger = logging.getLogger(__name__)
 
+_PERIOD_EVIDENCE_METHODS = ("folder", "folder_same_period", "filename", "mtime")
+
 
 def _fts_phrases(names: list[str]) -> list[str]:
     """Double-quoted FTS5 phrases: normalize_text strips quotes and every
@@ -85,7 +87,7 @@ def _is_eligible(head: CandidateFile, cfg: LocatorConfig) -> bool:
     breakdown = head.breakdown
     if breakdown.final_score < cfg.floor_score:
         return False
-    if breakdown.period_method not in ("folder", "filename", "mtime"):
+    if breakdown.period_method not in _PERIOD_EVIDENCE_METHODS:
         return False
     return bool(breakdown.matched_keywords)
 
@@ -100,7 +102,7 @@ def _has_period_evidence(head: CandidateFile, cfg: LocatorConfig) -> bool:
     breakdown = head.breakdown
     if breakdown.final_score < cfg.floor_score:
         return False
-    if breakdown.period_method not in ("folder", "filename", "mtime"):
+    if breakdown.period_method not in _PERIOD_EVIDENCE_METHODS:
         return False
     return not breakdown.matched_negative_keywords
 

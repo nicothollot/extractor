@@ -16,6 +16,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from pv_extractor.config import Config
@@ -185,6 +186,7 @@ class CodexCliClient:
         cwd: Path,
         allow_read_tool: bool = True,
         timeout: int | None = None,
+        event_sink: Callable[[dict[str, object]], None] | None = None,
     ) -> LlmCliResult:
         try:
             schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -199,6 +201,7 @@ class CodexCliClient:
             model=model,
             effort=effort,
             cwd=cwd,
+            event_sink=event_sink,
         )
 
     def extract_structured(
@@ -212,6 +215,7 @@ class CodexCliClient:
         model: str | None,
         effort: str | None,
         cwd: Path,
+        event_sink: Callable[[dict[str, object]], None] | None = None,
     ) -> LlmCliResult:
         caps = self.capabilities()
         unsupported_images = bool(images) and not caps.image_input

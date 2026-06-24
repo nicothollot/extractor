@@ -29,7 +29,9 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -50,6 +52,7 @@ LOGIN_REMEDIATION = (
 )
 
 _STDERR_DEBUG_CHARS = 400
+_INTERIM_CHARS = 800
 
 
 class ClaudeCodeResult(LlmCliResult):
@@ -62,6 +65,18 @@ def _sanitized_env() -> dict[str, str]:
     """Child environment: everything except ANTHROPIC_* (no API keys — the
     CLI must resolve its own `claude auth login` credentials)."""
     return {k: v for k, v in os.environ.items() if not k.upper().startswith("ANTHROPIC_")}
+
+
+def _emit_provider_event(
+    event_sink: Callable[[dict[str, object]], None] | None,
+    **payload: object,
+) -> None:
+    if event_sink is None:
+        return
+    try:
+        event_sink(payload)
+    except Exception:  # noqa: BLE001 - UI observers must never affect extraction
+        logger.debug("provider event sink failed", exc_info=True)
 
 
 class ClaudeSource(BaseModel):
@@ -368,6 +383,7 @@ class ClaudeCodeClient:
         cwd: Path,
         allow_read_tool: bool = True,
         timeout: int | None = None,
+        event_sink: Callable[[dict[str, object]], None] | None = None,
     ) -> ClaudeCodeResult:
         """One hidden `claude -p` extraction call. The prompt travels via
         stdin (never argv: no process-list leakage, no length limits); page
@@ -435,8 +451,57 @@ class ClaudeCodeClient:
             else:
                 popen_kwargs["start_new_session"] = True
             proc = subprocess.Popen(exec_argv, **popen_kwargs)
+            stdout_chunks: list[str] = []
+            stderr_chunks: list[str] = []
+
+            def _read_stream(name: str, chunks: list[str]) -> None:
+                stream = getattr(proc, name)
+                if stream is None:
+                    return
+                try:
+                    for line in stream:
+                        chunks.append(line)
+                        text = line.rstrip()
+                        if not text:
+                            continue
+                        if name == "stderr":
+                            _emit_provider_event(
+                                event_sink,
+                                stream="stderr",
+                                message=text[:_INTERIM_CHARS],
+                            )
+                        elif len(text) < 500 and not text.lstrip().startswith("{"):
+                            _emit_provider_event(
+                                event_sink,
+                                stream="stdout",
+                                message=text[:_INTERIM_CHARS],
+                            )
+                        else:
+                            _emit_provider_event(
+                                event_sink,
+                                stream="stdout",
+                                message=f"received stdout chunk ({len(line)} chars)",
+                            )
+                except Exception as exc:  # noqa: BLE001 - capture best effort output
+                    _emit_provider_event(
+                        event_sink,
+                        stream=name,
+                        message=f"{name} reader stopped: {exc}",
+                    )
+
+            stdout_thread = threading.Thread(
+                target=_read_stream, args=("stdout", stdout_chunks), daemon=True
+            )
+            stderr_thread = threading.Thread(
+                target=_read_stream, args=("stderr", stderr_chunks), daemon=True
+            )
+            stdout_thread.start()
+            stderr_thread.start()
             try:
-                stdout, stderr = proc.communicate(prompt, timeout=timeout or self._call_timeout)
+                if proc.stdin is not None:
+                    proc.stdin.write(prompt)
+                    proc.stdin.close()
+                proc.wait(timeout=timeout or self._call_timeout)
             except subprocess.TimeoutExpired:
                 if os.name == "nt":
                     subprocess.run(
@@ -454,12 +519,50 @@ class ClaudeCodeClient:
                     else:
                         os.killpg(proc.pid, signal.SIGKILL)
                 duration = round(time.perf_counter() - started, 2)
+                stdout_thread.join(timeout=1)
+                stderr_thread.join(timeout=1)
                 result = ClaudeCodeResult(
                     job_id=job_id, ok=False, duration_seconds=duration,
                     error=f"timed out after {timeout or self._call_timeout}s", argv=argv,
                 )
                 self._log(result, model, effort)
                 return result
+            except (BrokenPipeError, OSError) as exc:
+                _emit_provider_event(
+                    event_sink,
+                    stream="stdin",
+                    message=f"prompt write failed: {exc}",
+                )
+                try:
+                    proc.wait(timeout=timeout or self._call_timeout)
+                except subprocess.TimeoutExpired:
+                    if os.name == "nt":
+                        subprocess.run(
+                            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                            capture_output=True,
+                            text=True,
+                        )
+                    else:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        if os.name == "nt":
+                            proc.kill()
+                        else:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                    duration = round(time.perf_counter() - started, 2)
+                    result = ClaudeCodeResult(
+                        job_id=job_id, ok=False, duration_seconds=duration,
+                        error=f"timed out after {timeout or self._call_timeout}s", argv=argv,
+                    )
+                    self._log(result, model, effort)
+                    return result
+            finally:
+                stdout_thread.join(timeout=1)
+                stderr_thread.join(timeout=1)
+            stdout = "".join(stdout_chunks)
+            stderr = "".join(stderr_chunks)
         except OSError as exc:
             result = ClaudeCodeResult(
                 job_id=job_id, ok=False, error=f"failed to launch: {exc}", argv=argv,
@@ -532,6 +635,7 @@ class ClaudeCodeClient:
         model: str | None,
         effort: str | None,
         cwd: Path,
+        event_sink: Callable[[dict[str, object]], None] | None = None,
     ) -> ClaudeCodeResult:
         schema_path = cwd / f"{job_id}_schema.json"
         with guarded_open_write(schema_path, self._pv_root) as fh:
@@ -545,6 +649,7 @@ class ClaudeCodeClient:
             cwd=cwd,
             allow_read_tool=True,
             timeout=timeout,
+            event_sink=event_sink,
         )
 
     def _log(self, result: ClaudeCodeResult, model: str, effort: str) -> None:

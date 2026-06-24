@@ -947,6 +947,16 @@ timeout/retry/cache status, finalization duration, provider/model/effort and
 usage/cost availability. The GUI run result shows a concise task/page/timeout
 digest.
 
+The GUI also receives a dedicated `llm_activity` event stream for Run progress.
+Each provider invocation emits a stable call id, provider/model/effort,
+memo/deal identifiers, selected fields/pages/images, source document paths,
+prompt/schema artifact paths, cache/start/finish/failure/deferred status,
+usage/cost, elapsed timing, and bounded provider stderr/interim messages when
+the CLI produces them. The persisted event preview intentionally omits page
+text; the full prompt is written under the run's `llm/` payload directory and
+referenced by path so analysts can inspect it locally without turning
+`jobs.sqlite` into a document-content store.
+
 `LLM_VERSION` 4.2.0 (cache key). NB: `claude --json-schema` takes the schema
 JSON **inline** (a string), not a file path — `claude_code_client` reads the
 compiled schema and passes its content; a non-zero CLI exit records the CLI's

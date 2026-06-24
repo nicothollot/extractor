@@ -106,10 +106,11 @@ def settings(**overrides) -> LlmSettings:
     return LlmSettings(**base)
 
 
-def run_escalation(config, memos, client, *, llm_settings=None):
+def run_escalation(config, memos, client, *, llm_settings=None, event_sink=None):
     return process_memos(
         memos, config, llm_settings or settings(), SCHEMA_FIELDS,
         run_id="RUN_TEST", run_dir=Path(config.output_dir) / "RUN_TEST", client=client,
+        event_sink=event_sink,
     )
 
 
@@ -456,6 +457,37 @@ def test_response_cache_prevents_repaying_and_force_bypasses(tmp_path):
     memo3 = make_memo(tmp_path, hits=[], plan_fields=list(plan_fields))
     run_escalation(config, [memo3], fake3, llm_settings=settings(force=True))
     assert len(fake3.calls) == 1  # --force-llm bypasses the cache
+
+
+def test_llm_activity_events_capture_call_lifecycle_without_page_text(tmp_path):
+    config = make_config(tmp_path)
+    memo = make_memo(tmp_path, hits=[], plan_fields=[escalation_field("Fund Name", "required_empty")])
+    fake = FakeClaudeCodeClient(
+        {"Fund Name": field_result("Test Fund I", page=1, quote="Fund Name: Test Fund I")}
+    )
+    events: list[tuple[str, dict[str, object]]] = []
+
+    run_escalation(config, [memo], fake, event_sink=lambda event, payload: events.append((event, payload)))
+
+    activity = [payload for event, payload in events if event == "llm_activity"]
+    assert [payload["status"] for payload in activity] == ["started", "finished"]
+    started = activity[0]
+    assert started["provider"] == "claude"
+    assert started["model"] == "sonnet"
+    assert started["fields_requested"] == 1
+    assert started["selected_pages"] == [1]
+    assert started["documents"] == [
+        {"document_id": "D01", "name": "memo.pdf", "path": str(tmp_path / "docs" / "memo.pdf")}
+    ]
+    prompt_path = Path(str(started["prompt_path"]))
+    assert prompt_path.exists()
+    preview = str(started["prompt_preview"])
+    assert "Fields to extract" in preview
+    assert "document/page payload omitted" in preview
+    assert "Fund Name: Test Fund I" not in preview
+    assert "Fund Name: Test Fund I" in prompt_path.read_text(encoding="utf-8")
+    assert activity[-1]["status"] == "finished"
+    assert activity[-1]["session_id"] == "sess-fake-001"
 
 
 def test_auth_failure_fails_plans_with_login_instruction(tmp_path):

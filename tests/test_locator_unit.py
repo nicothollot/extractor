@@ -235,6 +235,16 @@ def test_period_same_quarter_off_when_flag_disabled(config: Config) -> None:
     assert bd.period_method == "folder_mismatch"
 
 
+def test_locate_accepts_same_reporting_period_candidate(conn, config: Config) -> None:
+    _ingest(conn, [
+        make_record(config, "Angelo Gordon\\Accell\\3.31.2025\\Client\\Accell Valuation Memo.pdf"),
+    ])
+    result = locate(conn, config, _query(period="2025-01-31"))
+    assert result.status is ResolutionStatus.FOUND
+    assert result.winner is not None
+    assert result.winner.breakdown.period_method == "folder_same_period"
+
+
 def test_period_in_filename(config: Config) -> None:
     bd = scored(config, "Angelo Gordon\\Accell\\Client\\Accell Valuation Memo 1.31.25.pdf").breakdown
     assert bd.period_score == config.locator.weights.period_in_filename

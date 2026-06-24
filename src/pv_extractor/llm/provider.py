@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
 from pydantic import BaseModel, Field
 
 from pv_extractor.models import LlmUsage
+
+LlmProviderEventSink = Callable[[dict[str, object]], None]
 
 
 class LlmProviderCapabilities(BaseModel):
@@ -57,4 +60,5 @@ class StructuredExtractionProvider(Protocol):
         model: str | None,
         effort: str | None,
         cwd: Path,
+        event_sink: LlmProviderEventSink | None = None,
     ) -> LlmCliResult: ...

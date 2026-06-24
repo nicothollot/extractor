@@ -30,9 +30,11 @@ reviewer_attention — values are never invented.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field as dataclass_field, replace
 from pathlib import Path
@@ -91,6 +93,8 @@ from pv_extractor.normalize import normalize_text
 logger = logging.getLogger(__name__)
 
 _NUMERIC_DTYPES = {"number", "percent", "basis_points", "multiple_x", "years", "integer"}
+LlmActivitySink = Callable[[str, dict[str, object]], None]
+_PROMPT_PREVIEW_CHARS = 2600
 
 
 @dataclass
@@ -159,6 +163,135 @@ class LlmRunSummary:
     ledger_path: Path | None = None
     detail: str = ""
     diagnostics: dict[str, object] = dataclass_field(default_factory=dict)
+
+
+def _emit_llm_activity(
+    event_sink: LlmActivitySink | None,
+    status: str,
+    **payload: object,
+) -> None:
+    if event_sink is None:
+        return
+    safe_payload = {"status": status, **payload}
+    try:
+        event_sink("llm_activity", safe_payload)
+    except Exception:  # noqa: BLE001 - UI observers must never affect extraction
+        logger.debug("llm activity sink failed", exc_info=True)
+
+
+def _supports_kw(method, name: str) -> bool:
+    try:
+        return name in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _prompt_preview(prompt: str) -> str:
+    """Live job events avoid embedding document text. The full prompt is
+    written beside the payload; the UI preview shows static instructions and
+    requested fields with the page/document payload elided."""
+    page_marker = "== DOCUMENT PAGES =="
+    field_marker = "Fields to extract"
+    head = prompt.split(page_marker, 1)[0].strip()
+    if field_marker in prompt:
+        fields = field_marker + prompt.rsplit(field_marker, 1)[1]
+    else:
+        fields = prompt[-_PROMPT_PREVIEW_CHARS:]
+    if len(head) > _PROMPT_PREVIEW_CHARS:
+        head = head[:_PROMPT_PREVIEW_CHARS] + "\n...[truncated]"
+    if len(fields) > _PROMPT_PREVIEW_CHARS:
+        fields = fields[:_PROMPT_PREVIEW_CHARS] + "\n...[truncated]"
+    return (
+        f"{head}\n\n"
+        "[document/page payload omitted from live event; open prompt_path for the full local prompt]\n\n"
+        f"{fields}"
+    ).strip()
+
+
+def _activity_documents(
+    memo: MemoResult,
+    source_files: list[tuple[str, str]] | None,
+) -> list[dict[str, object]]:
+    if source_files:
+        return [
+            {
+                "document_id": f"D{index + 1:02d}",
+                "name": label,
+                "path": file_path,
+            }
+            for index, (file_path, label) in enumerate(source_files)
+        ]
+    return [
+        {
+            "document_id": "D01",
+            "name": memo.file_name,
+            "path": memo.file_path,
+        }
+    ]
+
+
+def _activity_payload_pages(payload: MemoPayload, pages: list[int]) -> list[dict[str, object]]:
+    wanted = set(pages)
+    return [
+        {
+            "page": page.number,
+            "kind": page.kind,
+            "page_class": page.page_class.value,
+            "file": page.rel_path,
+        }
+        for page in payload.pages
+        if page.number in wanted
+    ]
+
+
+def _activity_base(
+    *,
+    memo: MemoResult,
+    payload: MemoPayload,
+    task: AssistanceTask,
+    selection: ModelSelection,
+    job_id: str,
+    slug: str,
+    tier: int,
+    fields: list[SchemaField],
+    pages: list[int],
+    prompt: str,
+    prompt_path: Path,
+    schema_path: Path,
+    image_paths: list[Path],
+    source_files: list[tuple[str, str]] | None,
+    provider_name: str,
+    config: Config,
+) -> dict[str, object]:
+    return {
+        "call_id": job_id,
+        "memo_id": memo.memo_id,
+        "client": memo.client,
+        "deal": memo.deal,
+        "task_id": task.record.task_id,
+        "wave": task.record.wave,
+        "tier": tier,
+        "slug": slug,
+        "provider": provider_name,
+        "model": selection.entry.alias,
+        "model_id": selection.entry.id,
+        "effort": selection.effort,
+        "prompt_version": config.llm.planner.prompt_version,
+        "schema_version": config.llm.planner.sparse_schema_version,
+        "fields_requested": len(fields),
+        "field_names": [field.header for field in fields],
+        "selected_pages": list(pages),
+        "selected_page_count": len(pages),
+        "selected_image_count": len(image_paths),
+        "payload_pages": _activity_payload_pages(payload, pages),
+        "documents": _activity_documents(memo, source_files),
+        "prompt_chars": len(prompt),
+        "prompt_path": str(prompt_path),
+        "prompt_preview": _prompt_preview(prompt),
+        "schema_path": str(schema_path),
+        "image_paths": [str(path) for path in image_paths],
+        "timeout_seconds": config.llm.timeout_seconds,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -886,6 +1019,8 @@ def _run_tier(
     budget: BudgetTracker,
     run_id: str,
     corrective: bool = False,
+    event_sink: LlmActivitySink | None = None,
+    source_files: list[tuple[str, str]] | None = None,
 ) -> tuple[LlmAttempt, dict | None]:
     fields = task.schema_fields
     pages = task.record.selected_pages
@@ -938,6 +1073,19 @@ def _run_tier(
                     f"for page(s): {', '.join(str(p) for p in unsupported_pages)}"
                 )
                 attempt.retry_status = "non_retryable"
+                _emit_llm_activity(
+                    event_sink,
+                    "failed",
+                    call_id=job_id,
+                    memo_id=memo.memo_id,
+                    client=memo.client,
+                    deal=memo.deal,
+                    task_id=task.record.task_id,
+                    provider=provider_name,
+                    model=selection.entry.alias,
+                    effort=selection.effort,
+                    error=attempt.error,
+                )
                 return attempt, None
             prompt = build_call_prompt(
                 fields,
@@ -946,6 +1094,28 @@ def _run_tier(
                 corrective=corrective,
             )
             image_paths = []
+
+    prompt_path = payload.directory / f"prompt_call_{slug}.txt"
+    with guarded_open_write(prompt_path, config.pv_root) as fh:
+        fh.write(prompt)
+    activity = _activity_base(
+        memo=memo,
+        payload=payload,
+        task=task,
+        selection=selection,
+        job_id=job_id,
+        slug=slug,
+        tier=tier,
+        fields=fields,
+        pages=list(pages),
+        prompt=prompt,
+        prompt_path=prompt_path,
+        schema_path=schema_path,
+        image_paths=image_paths,
+        source_files=source_files,
+        provider_name=provider_name,
+        config=config,
+    )
 
     key = llm_cache.task_cache_key(
         provider=provider_name,
@@ -977,6 +1147,13 @@ def _run_tier(
                 attempt.usage = cached["usage"] or attempt.usage
                 attempt.cost_usd = 0.0  # no new spend on a cache hit
                 attempt.cost_source = "cache"
+                _emit_llm_activity(
+                    event_sink,
+                    "cache_hit",
+                    **activity,
+                    session_id=attempt.session_id,
+                    usage=attempt.usage.model_dump() if attempt.usage else None,
+                )
                 return attempt, cached["structured"]
 
     estimated = estimate_usage(
@@ -986,13 +1163,47 @@ def _run_tier(
     estimated_cost_maybe = registry.cost_usd(estimated, selection.entry)
     estimated_cost = estimated_cost_maybe if estimated_cost_maybe is not None else 0.0
     budget.reserve(estimated_cost)  # BudgetExceeded propagates: memo deferred, no call made
+    _emit_llm_activity(
+        event_sink,
+        "started",
+        **activity,
+        estimated_cost_usd=round(estimated_cost, 6),
+        estimated_usage=estimated.model_dump(),
+    )
+
+    def provider_event(payload_event: dict[str, object]) -> None:
+        _emit_llm_activity(
+            event_sink,
+            "message",
+            call_id=job_id,
+            memo_id=memo.memo_id,
+            client=memo.client,
+            deal=memo.deal,
+            provider=provider_name,
+            model=selection.entry.alias,
+            effort=selection.effort,
+            **payload_event,
+        )
 
     result = _call_provider(
         client=client, job_id=job_id, prompt=prompt, schema=schema,
         schema_path=schema_path, image_paths=image_paths,
         selection=selection, payload=payload, config=config,
+        event_sink=provider_event,
     )
     if _should_fallback_legacy(result.error) and not result.ok:
+        _emit_llm_activity(
+            event_sink,
+            "message",
+            call_id=job_id,
+            memo_id=memo.memo_id,
+            client=memo.client,
+            deal=memo.deal,
+            provider=provider_name,
+            model=selection.entry.alias,
+            effort=selection.effort,
+            message="primary sparse schema failed; retrying legacy schema",
+        )
         legacy_schema = build_legacy_response_schema(fields)
         legacy_schema_path = payload.directory / f"schema_{slug}_legacy.json"
         with guarded_open_write(legacy_schema_path, config.pv_root, mode="wb") as fh:
@@ -1002,10 +1213,14 @@ def _run_tier(
             payload.scoped_prompt_with_ocr_fallback(pages) if not image_paths else payload.scoped_prompt(pages),
             corrective=corrective,
         )
+        legacy_prompt_path = payload.directory / f"prompt_call_{slug}_legacy.txt"
+        with guarded_open_write(legacy_prompt_path, config.pv_root) as fh:
+            fh.write(legacy_prompt)
         result = _call_provider(
             client=client, job_id=f"{job_id}-legacy", prompt=legacy_prompt,
             schema=legacy_schema, schema_path=legacy_schema_path, image_paths=image_paths,
             selection=selection, payload=payload, config=config,
+            event_sink=provider_event,
         )
         schema_version = 1
         attempt.schema_version = 1
@@ -1034,12 +1249,38 @@ def _run_tier(
     if not result.ok or result.structured is None:
         attempt.error = result.error or "no structured output"
         attempt.retry_status = "retryable" if _is_retryable_error(attempt.error) else "non_retryable"
+        _emit_llm_activity(
+            event_sink,
+            "failed",
+            **activity,
+            duration_seconds=attempt.duration_seconds,
+            exit_code=attempt.exit_code,
+            session_id=attempt.session_id,
+            usage=attempt.usage.model_dump() if attempt.usage else None,
+            cost_usd=attempt.cost_usd,
+            cost_source=attempt.cost_source,
+            error=attempt.error,
+            stdout_sha256=result.stdout_sha256,
+        )
         return attempt, None
     try:
         decode_structured_response(result.structured, fields)
     except StructuredResponseError as exc:
         attempt.error = f"structured output failed accounting validation: {exc}"
         attempt.retry_status = "retryable"
+        _emit_llm_activity(
+            event_sink,
+            "failed",
+            **activity,
+            duration_seconds=attempt.duration_seconds,
+            exit_code=attempt.exit_code,
+            session_id=attempt.session_id,
+            usage=attempt.usage.model_dump() if attempt.usage else None,
+            cost_usd=attempt.cost_usd,
+            cost_source=attempt.cost_source,
+            error=attempt.error,
+            stdout_sha256=result.stdout_sha256,
+        )
         return attempt, None
 
     cache_store_key = key
@@ -1064,6 +1305,18 @@ def _run_tier(
         )
     finally:
         conn.close()
+    _emit_llm_activity(
+        event_sink,
+        "finished",
+        **activity,
+        duration_seconds=attempt.duration_seconds,
+        exit_code=attempt.exit_code,
+        session_id=attempt.session_id,
+        usage=attempt.usage.model_dump() if attempt.usage else None,
+        cost_usd=attempt.cost_usd,
+        cost_source=attempt.cost_source,
+        stdout_sha256=result.stdout_sha256,
+    )
     return attempt, result.structured
 
 
@@ -1078,17 +1331,28 @@ def _call_provider(
     selection: ModelSelection,
     payload: MemoPayload,
     config: Config,
+    event_sink: Callable[[dict[str, object]], None] | None = None,
 ):
     if hasattr(client, "extract_structured"):
-        return client.extract_structured(
+        kwargs = dict(
             job_id=job_id, prompt=prompt, schema=schema, images=image_paths,
             timeout=config.llm.timeout_seconds, model=selection.entry.cli_model_arg() or None,
             effort=selection.effort, cwd=payload.directory,
         )
-    return client.extract_json(
+        if _supports_kw(client.extract_structured, "event_sink"):
+            kwargs["event_sink"] = event_sink
+        return client.extract_structured(
+            **kwargs,
+        )
+    kwargs = dict(
         job_id=job_id, prompt=prompt, schema_path=schema_path,
         model=selection.entry.cli_model_arg() or None, effort=selection.effort,
         cwd=payload.directory, allow_read_tool=True, timeout=config.llm.timeout_seconds,
+    )
+    if _supports_kw(client.extract_json, "event_sink"):
+        kwargs["event_sink"] = event_sink
+    return client.extract_json(
+        **kwargs,
     )
 
 
@@ -1135,6 +1399,7 @@ def _escalate_memo(
     run_id: str,
     run_dir: Path,
     deal_files: list[tuple[str, str]] | None = None,
+    event_sink: LlmActivitySink | None = None,
 ) -> None:
     plan = memo.escalation
     assert plan is not None and plan.fields
@@ -1207,9 +1472,24 @@ def _escalate_memo(
                     config=config, settings=settings, client=client,
                     registry=registry, budget=budget, run_id=run_id,
                     corrective=tier > 0,
+                    event_sink=event_sink,
+                    source_files=deal_files,
                 )
             except BudgetExceeded as exc:
                 deferred = True
+                _emit_llm_activity(
+                    event_sink,
+                    "deferred",
+                    call_id=f"pv-{run_id}-{memo.memo_id}-{slug}",
+                    memo_id=memo.memo_id,
+                    client=memo.client,
+                    deal=memo.deal,
+                    task_id=task.record.task_id,
+                    provider=getattr(client, "provider_name", selection.entry.provider),
+                    model=selection.entry.alias,
+                    effort=selection.effort,
+                    error=str(exc),
+                )
                 plan.merge_log.append(
                     f"{task.record.task_id} [{slug}] ({selection.entry.alias}): deferred — {exc}"
                 )
@@ -1367,6 +1647,7 @@ def process_memos(
     run_dir: Path,
     client: ClaudeCodeClient | None = None,
     registry: ModelRegistry | None = None,
+    event_sink: LlmActivitySink | None = None,
 ) -> LlmRunSummary:
     """Execute the Phase-3 second pass for one run. Mutates the MemoResults
     in place (merged hits, plan attempts/status, flags) and returns the
@@ -1406,6 +1687,7 @@ def process_memos(
                 _escalate_memo, memo, config=config, settings=settings,
                 schema_by_header=schema_by_header, client=client, registry=registry,
                 budget=budget, ledger=ledger, run_id=run_id, run_dir=run_dir,
+                event_sink=event_sink,
             ): memo
             for memo in eligible
         }
@@ -1463,6 +1745,7 @@ def process_deals(
     run_dir: Path,
     client: ClaudeCodeClient | None = None,
     registry: ModelRegistry | None = None,
+    event_sink: LlmActivitySink | None = None,
 ) -> LlmRunSummary:
     """Combined-deal second pass: one provider call per deal-period over
     the combined payload of all its documents. Mirrors process_memos (shared
@@ -1503,6 +1786,7 @@ def process_deals(
                 schema_by_header=schema_by_header, client=client, registry=registry,
                 budget=budget, ledger=ledger, run_id=run_id, run_dir=run_dir,
                 deal_files=group.files,
+                event_sink=event_sink,
             ): group
             for group in eligible
         }
