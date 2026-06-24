@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 First-run setup for PV Extractor (PowerShell mirror of bootstrap.py):
 find Python >= 3.12, create .venv, install the package editable.
@@ -140,7 +140,7 @@ Write-Host "Using $($Py.Exe) $($Py.Args -join ' ')"
 $ConfigTemplatePath = Join-Path $ProjectRoot "config.example.yaml"
 if ((-not (Test-Path $ConfigPath)) -and (Test-Path $ConfigTemplatePath)) {
     Copy-Item $ConfigTemplatePath $ConfigPath
-    Write-Host "Seeded config.yaml from config.example.yaml — edit it for this machine (set output_dir to a local writable folder)."
+    Write-Host "Seeded config.yaml from config.example.yaml - edit it for this machine (set output_dir to a local writable folder)."
 }
 
 # --- venv --------------------------------------------------------------------
@@ -160,7 +160,7 @@ if (Test-Path $VenvPython) {
 $Extras = if ($WithGui) { ".[dev,gui]" } else { ".[dev]" }
 
 # Completeness probe: EVERY dependency for the selected profile must resolve, not just the
-# package — a venv left over from an earlier phase must trigger a re-install.
+# package - a venv left over from an earlier phase must trigger a re-install.
 # Keep the module list in sync with pyproject.toml / REQUIRED_IMPORTS in
 # bootstrap.py. find_spec executes no module code, so the probe is fast.
 $ProbeNames = @("pv_extractor", "fitz", "rapidfuzz", "pydantic", "typer", "dateutil", "rich", "yaml", "openpyxl", "pdfplumber", "docx", "pptx", "rapidocr", "onnxruntime")
@@ -175,7 +175,7 @@ for n in sys.argv[1:]:
         ok = False
     if not ok:
         missing.append(n)
-print(" ".join(missing)); raise SystemExit(1 if missing else 0)'
+print(*missing); raise SystemExit(1 if missing else 0)'
 
 if ((Invoke-Native $VenvPython (@("-c", $Probe) + $ProbeNames) -ShowOutputOnError) -ne 0) {
     if (-not (Read-InstallMissingDeps)) {

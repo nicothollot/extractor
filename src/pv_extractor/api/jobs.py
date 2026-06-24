@@ -566,6 +566,16 @@ class JobManager:
             # (one workbook). A single doc type + period stays on the legacy path.
             from pv_extractor.api import run_slots as _rs
 
+            # The wizard has two period inputs — a single `period` and a
+            # multi-`periods` selector — and the launch is valid when EITHER is
+            # set. When the analyst fills only `periods` (even with one entry),
+            # `request.period` is "", so the legacy single-period path below would
+            # call locate(period="") and raise "could not resolve period ''".
+            # Collapse to the effective single period so `periods=[X], period=""`
+            # behaves exactly like `period=X`.
+            eff_periods = _rs.effective_periods(request.period, request.periods)
+            effective_period = eff_periods[0] if eff_periods else request.period
+
             if _rs.needs_expansion(request.doc_type, request.doc_types, request.period, request.periods):
                 conn = db.open_db(run_config.db_path, run_config.pv_root)
                 try:
@@ -579,14 +589,14 @@ class JobManager:
                 finally:
                     conn.close()
                 report = run_pipeline(
-                    run_config, scope=request.scope, period=request.period,
+                    run_config, scope=request.scope, period=effective_period,
                     template=request.template, dry_run=request.dry_run, force=request.force,
                     now=now, llm_settings=settings, control=control, slots=slots,
                 )
             else:
                 report = run_pipeline(
                     run_config,
-                    scope=request.scope, period=request.period,
+                    scope=request.scope, period=effective_period,
                     client=request.client, deal=request.deal, doc_type=request.doc_type,
                     restrict_to_client_sourced=request.restrict_to_client_sourced,
                     template=request.template, dry_run=request.dry_run, force=request.force,

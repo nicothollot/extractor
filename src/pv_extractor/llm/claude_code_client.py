@@ -274,19 +274,87 @@ def _extract_structured(envelope: dict) -> dict | None:
     return None
 
 
+def _result_envelope(stdout: str) -> dict | None:
+    """The final ``{"type":"result", ...}`` envelope from a print-mode call.
+
+    With ``--output-format stream-json`` the CLI emits NDJSON — one JSON object
+    per line (system/assistant/user/result events) — so the envelope (the same
+    shape ``--output-format json`` produced as a single object: structured_output,
+    usage, session_id, total_cost_usd) is the LAST line whose ``type`` is
+    ``result``. Falls back to parsing the whole buffer as one object so the older
+    single-envelope ``json`` mode (and the test fakes) still parse."""
+    text = (stdout or "").strip()
+    if not text:
+        return None
+    last_result: dict | None = None
+    any_obj: dict | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict):
+            any_obj = obj
+            if obj.get("type") == "result":
+                last_result = obj
+    if last_result is not None:
+        return last_result
+    # Single-object (non-NDJSON) output: the whole buffer is the envelope.
+    try:
+        whole = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return any_obj
+    return whole if isinstance(whole, dict) else any_obj
+
+
+def _stream_line_message(line: str) -> str | None:
+    """A short human-readable progress note for one stream-json event line, or
+    None when the line carries nothing worth surfacing (system init, the final
+    result envelope, raw tool payloads). Used to feed the LLM-activity view so a
+    long call shows what the model is doing (reading pages, emitting output)
+    instead of going silent for minutes."""
+    try:
+        ev = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        # Non-JSON noise on stdout: surface a trimmed snippet, not nothing.
+        text = line.strip()
+        return text[:_INTERIM_CHARS] if text and not text.startswith("{") else None
+    if not isinstance(ev, dict):
+        return None
+    etype = ev.get("type")
+    if etype == "assistant":
+        parts: list[str] = []
+        for block in ev.get("message", {}).get("content", []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                name = block.get("name") or "tool"
+                parts.append(f"using {name}")
+            elif block.get("type") == "text":
+                snippet = (block.get("text") or "").strip()
+                if snippet:
+                    parts.append(snippet[:200])
+        return "; ".join(parts)[:_INTERIM_CHARS] if parts else None
+    if etype == "user":
+        # tool_result coming back (e.g. a page image was read)
+        return "tool result received"
+    # system / rate_limit_event / result: not useful as progress
+    return None
+
+
 def _error_from_stdout(stdout: str) -> str:
     """Best-effort error message when `claude` exits non-zero with empty stderr:
-    the CLI's print-mode JSON envelope often carries the real reason on stdout
+    the CLI's print-mode result envelope often carries the real reason on stdout
     (is_error=true + a `result`/`error` string, or an `api_error_status`). Falls
     back to a raw stdout snippet so the failure is never an undiagnosable
     'exit N'."""
     text = (stdout or "").strip()
     if not text:
         return ""
-    try:
-        env = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        return re.sub(r"\s+", " ", text)
+    env = _result_envelope(text)
     if isinstance(env, dict):
         for key in ("error", "result", "message", "api_error_status", "subtype"):
             value = env.get(key)
@@ -418,15 +486,22 @@ class ClaudeCodeClient:
             tail += ["--allowedTools", "Read"]
         if self._exclude_dynamic and self.supports("--exclude-dynamic-system-prompt-sections"):
             tail.append("--exclude-dynamic-system-prompt-sections")
+        # stream-json (NDJSON) instead of json: the CLI then emits one event per
+        # line AS IT WORKS (assistant turns, tool_use/Read calls, tool results)
+        # so the LLM-activity view shows live progress on a long call instead of
+        # going silent until the single json envelope lands at the very end. The
+        # final {"type":"result"} line is the same envelope json mode produced.
+        # --verbose is REQUIRED by the CLI for stream-json with --print.
+        stream_args = ["--output-format", "stream-json", "--verbose"]
         # exec_argv carries the inline schema; argv (stored/logged) redacts it to
         # keep the audit pointer flags-only (the schema can be many KB).
         exec_argv = [
             self._command, *self._command_args, "-p",
-            "--output-format", "json", "--json-schema", schema_arg, *tail,
+            *stream_args, "--json-schema", schema_arg, *tail,
         ]
         argv = [
             self._command, *self._command_args, "-p",
-            "--output-format", "json", "--json-schema", f"<inline schema:{len(schema_arg)} chars>", *tail,
+            *stream_args, "--json-schema", f"<inline schema:{len(schema_arg)} chars>", *tail,
         ]
 
         started = time.perf_counter()
@@ -470,18 +545,15 @@ class ClaudeCodeClient:
                                 stream="stderr",
                                 message=text[:_INTERIM_CHARS],
                             )
-                        elif len(text) < 500 and not text.lstrip().startswith("{"):
-                            _emit_provider_event(
-                                event_sink,
-                                stream="stdout",
-                                message=text[:_INTERIM_CHARS],
-                            )
                         else:
-                            _emit_provider_event(
-                                event_sink,
-                                stream="stdout",
-                                message=f"received stdout chunk ({len(line)} chars)",
-                            )
+                            # stdout is NDJSON in stream-json mode: turn each
+                            # event line into a short progress note (skip system
+                            # init / raw payloads / the final result envelope).
+                            message = _stream_line_message(text)
+                            if message:
+                                _emit_provider_event(
+                                    event_sink, stream="stdout", message=message,
+                                )
                 except Exception as exc:  # noqa: BLE001 - capture best effort output
                     _emit_provider_event(
                         event_sink,
@@ -591,10 +663,9 @@ class ClaudeCodeClient:
             self._log(result, model, effort)
             return result
 
-        try:
-            envelope = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            result.error = f"non-JSON stdout: {exc}"
+        envelope = _result_envelope(stdout)
+        if envelope is None:
+            result.error = "no result envelope in stdout"
             self._log(result, model, effort)
             return result
         if not isinstance(envelope, dict):

@@ -73,9 +73,14 @@ for band, band_schema in schema["properties"].items():
                             "verbatim_quote": "q", "confidence": "low",
                             "not_found": False}}
                  for header in band_schema["properties"]}}
+# stream-json (NDJSON): interim events first, then the final result envelope.
+print(json.dumps({{"type": "system", "subtype": "init", "session_id": "sess-001"}}))
+print(json.dumps({{"type": "assistant", "message": {{"content": [
+    {{"type": "tool_use", "name": "StructuredOutput", "input": {{}}}}]}}}}))
 print(json.dumps({{
     "type": "result", "subtype": "success",
     "result": json.dumps(doc),
+    "structured_output": doc,
     "session_id": "sess-001",
     "usage": {{"input_tokens": 1000, "output_tokens": 100,
                "cache_read_input_tokens": 50, "cache_creation_input_tokens": 25}},
@@ -142,7 +147,10 @@ def test_extract_json_flags_parsing_and_env_isolation(fake_env):
     extraction = _logged_calls(log)[-1]
     argv = extraction["argv"]
     assert argv[0] == "-p"
-    assert argv[argv.index("--output-format") + 1] == "json"
+    # stream-json (+ required --verbose) so the call streams interim events
+    # rather than going silent until the final envelope.
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in argv
     # the schema is passed INLINE as a JSON string (not a path): the CLI parses
     # --json-schema as JSON, and inline avoids any cwd/path translation when
     # the call is bridged from Windows into WSL.
@@ -157,6 +165,25 @@ def test_extract_json_flags_parsing_and_env_isolation(fake_env):
     assert all(call["has_anthropic_key"] is False for call in _logged_calls(log))
     # the prompt travels on stdin, never argv
     assert all("page text" not in " ".join(call["argv"]) for call in _logged_calls(log))
+
+
+def test_stream_json_emits_interim_events(fake_env):
+    """stream-json mode surfaces interim progress: the per-line event_sink
+    receives the assistant tool_use note BEFORE the final result lands, so a
+    long call is no longer silent. The final envelope still parses out of the
+    NDJSON stream."""
+    client, schema_path, _, tmp_path = fake_env
+    events: list[dict] = []
+    result = client.extract_json(
+        job_id="pv-RUN-MEMO-t0", prompt="page text", schema_path=schema_path,
+        model="sonnet", effort="low", cwd=tmp_path,
+        event_sink=events.append,
+    )
+    assert result.ok and result.structured is not None
+    messages = [str(e.get("message", "")) for e in events if e.get("stream") == "stdout"]
+    assert any("StructuredOutput" in m for m in messages), messages
+    # the final result envelope must NOT leak as an interim progress note
+    assert not any('"type": "result"' in m or "'type': 'result'" in m for m in messages)
 
 
 def test_command_args_are_prepended(fake_env):
@@ -200,7 +227,7 @@ def test_malformed_json_is_an_error_result(fake_env, monkeypatch):
         job_id="j", prompt="x", schema_path=schema_path,
         model="sonnet", effort="low", cwd=tmp_path,
     )
-    assert not result.ok and "non-JSON" in (result.error or "")
+    assert not result.ok and "no result envelope" in (result.error or "")
 
 
 def test_nonzero_exit_is_an_error_result(fake_env, monkeypatch):

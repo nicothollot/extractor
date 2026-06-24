@@ -246,8 +246,17 @@ comments preserved), and setup/doctor flows.
       llm/               Phase 3: Claude Code CLI fallback (no SDK, no API key)
         claude_code_client.py  subprocess wrapper around the local `claude`
                          binary: auth/version/update probes, hidden
-                         `claude -p --output-format json --json-schema` calls,
-                         ANTHROPIC_* stripped from child env, log redaction;
+                         `claude -p --output-format stream-json --verbose
+                         --json-schema` calls (NDJSON: each event line is turned
+                         into an LLM-activity progress note as the model works —
+                         `using Read`/`using StructuredOutput`/etc. — so a long
+                         call shows live progress instead of going silent until
+                         the final envelope; the closing {type:result} line is
+                         the same envelope the old `--output-format json` emitted
+                         as one object, parsed by _result_envelope, which also
+                         falls back to whole-buffer parse for single-object
+                         output), ANTHROPIC_* stripped from child env, log
+                         redaction;
                          claude_code.command_args = Windows->WSL bridge
                          (command: wsl, command_args: [-e, /abs/path/claude] —
                          wsl -e skips the login shell, so the path must be
