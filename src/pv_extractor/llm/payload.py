@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -62,6 +63,29 @@ class MemoPayload:
     payload_hash: str = ""  # sha256 of the canonical manifest (incl. file hashes)
     image_count: int = 0
     ocr_hostile: bool = False  # any SCANNED/IMAGE_TABLE page in the payload
+    # (document_id, relative filename) of the SOURCE documents copied into the
+    # payload dir for direct_document_read — the model reads these with its own
+    # tool instead of consuming a pre-rendered page payload.
+    source_documents: list[tuple[str, str]] = field(default_factory=list)
+
+    def read_instruction(self) -> str:
+        """Prompt section for direct_document_read: point the model at the real
+        source files in its working directory and have it Read them, instead of
+        embedding a rasterized/OCR'd page payload. Cite the document_id we assign
+        here so values map back to the right document."""
+        if not self.source_documents:
+            return self.dynamic_prompt  # nothing copied — fall back to the payload
+        lines = ["== SOURCE DOCUMENTS =="]
+        for doc_id, name in self.source_documents:
+            lines.append(f'- document_id {doc_id}: "{name}"')
+        lines.append("")
+        lines.append(
+            "Each document above is a real file in your current working directory. "
+            "Use the Read tool to read each one IN FULL (every page) before you "
+            "answer. Cite that document_id and the page number for every value. "
+            "Read the actual documents — do not guess."
+        )
+        return "\n".join(lines) + "\n"
 
     def page_kind(self, number: int) -> str:
         """'image' | 'text' for a page in this payload (defaults to 'text')."""
@@ -202,6 +226,23 @@ def _write_payload_file(path: Path, data: bytes, pv_root: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# Filenames safe to drop in the call's working dir (and to type into a Read tool
+# arg across the WSL bridge): keep the original stem readable, strip the rest.
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _copy_source_document(file_path: str, payload_dir: Path, doc_id: str, pv_root: str) -> str:
+    """Copy the source document (read-only) into the payload dir so the model can
+    Read it directly. Returns the relative filename to cite in the prompt."""
+    src = Path(file_path)
+    safe = _SAFE_NAME_RE.sub("_", src.name) or f"{doc_id}{src.suffix.lower()}"
+    rel = f"{doc_id}_{safe}"
+    with open_read(file_path) as fh:
+        data = fh.read()
+    _write_payload_file(payload_dir / rel, data, pv_root)
+    return rel
+
+
 def assemble_payload(
     *,
     file_path: str,
@@ -253,6 +294,9 @@ def assemble_payload(
             pdf_bytes = fh.read()
 
     payload = MemoPayload(directory=payload_dir)
+    if config.llm.direct_document_read:
+        rel = _copy_source_document(file_path, payload_dir, "D01", config.pv_root)
+        payload.source_documents.append(("D01", rel))
     prompt_sections: list[str] = ["== DOCUMENT PAGES =="]
     block_start = len(prompt_sections)
     for number in selected:
@@ -384,6 +428,11 @@ def assemble_deal_payload(
             )
             continue
         readable += 1
+
+        if config.llm.direct_document_read:
+            doc_id = f"D{doc_index + 1:02d}"
+            src_rel = _copy_source_document(file_path, payload_dir, doc_id, config.pv_root)
+            payload.source_documents.append((doc_id, src_rel))
 
         doc_cap = min(per_doc_cap, total_cap - global_no)
         if content.page_count <= doc_cap:

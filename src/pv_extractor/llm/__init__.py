@@ -39,4 +39,7 @@ that can alter prompts, payload assembly, parsing or merge behavior.
 # 5.1.0: extended thinking forced on for every model/effort
 # (llm.always_enable_thinking) — the model reasons before answering, which can
 # change extracted values, so prior non-thinking cache entries are invalidated.
-LLM_VERSION = "5.1.0"
+# 5.2.0: direct_document_read — the source document is copied into the call dir
+# and the model Reads it itself (small prompt) instead of consuming a
+# pre-rendered/embedded page payload; different prompt + inputs, so cache reset.
+LLM_VERSION = "5.2.0"

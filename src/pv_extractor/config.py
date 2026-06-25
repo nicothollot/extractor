@@ -609,6 +609,12 @@ class LlmConfig(BaseModel):
     workers: int = 2  # hidden local provider session queue concurrency (keep 1-2)
     models_path: str = "./config/models.yaml"
     cache_enabled: bool = True  # response cache; --force-llm bypasses reads
+    # Direct document read: copy the SOURCE document into the call's working dir
+    # and have the model Read it with its own tool, instead of pre-assembling a
+    # rasterized/OCR'd page payload + embedding it in the prompt. The model reads
+    # the real PDF (native tables/scans), the prompt stays small, and the call
+    # completes fast — the assembled-payload path was timing out on large memos.
+    direct_document_read: bool = True
     # Stream the provider's partial output (token deltas) so the live activity
     # view shows the model's thinking + answer AS IT WORKS, not just heartbeats.
     stream_partial_messages: bool = True

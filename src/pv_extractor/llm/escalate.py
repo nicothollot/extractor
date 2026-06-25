@@ -1036,9 +1036,15 @@ def _run_tier(
         payload.directory / f"prompt_static_{slug}.txt", config.pv_root
     ) as fh:
         fh.write(static_prompt)
+    # Direct document read: hand the model the real source files (copied into the
+    # call dir) to Read itself, instead of a big embedded page payload. Keeps the
+    # prompt small so a large field set completes fast (the embedded-payload path
+    # was timing out); page_texts are still kept in memory for quote-grounding.
+    direct_read = config.llm.direct_document_read and bool(payload.source_documents)
+    page_payload = payload.read_instruction() if direct_read else payload.scoped_prompt(pages)
     prompt = build_call_prompt(
         fields,
-        payload.scoped_prompt(pages),
+        page_payload,
         inferable_fields=inferable,
         corrective=corrective,
     )
@@ -1059,7 +1065,9 @@ def _run_tier(
         estimated_output_tokens=task.record.estimated_output_tokens,
         fields_requested=len(fields),
     )
-    image_paths = payload.scoped_image_paths(pages)
+    # In direct-read mode the model reads the original PDF, so do not also attach
+    # pre-rendered page images.
+    image_paths = [] if direct_read else payload.scoped_image_paths(pages)
     if image_paths and hasattr(client, "capabilities"):
         caps = client.capabilities()
         if not caps.image_input:
@@ -1210,7 +1218,8 @@ def _run_tier(
             fh.write(schema_json_bytes(legacy_schema))
         legacy_prompt = build_legacy_call_prompt(
             fields,
-            payload.scoped_prompt_with_ocr_fallback(pages) if not image_paths else payload.scoped_prompt(pages),
+            payload.read_instruction() if direct_read
+            else (payload.scoped_prompt_with_ocr_fallback(pages) if not image_paths else payload.scoped_prompt(pages)),
             corrective=corrective,
         )
         legacy_prompt_path = payload.directory / f"prompt_call_{slug}_legacy.txt"

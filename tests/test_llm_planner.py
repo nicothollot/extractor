@@ -40,6 +40,9 @@ def make_config(tmp_path: Path) -> Config:
         db_path=tmp_path / "output" / "pv.db",
     )
     config.llm.models_path = str(PROJECT_ROOT / "config" / "models.yaml")
+    # Pin the embedded page-payload path; direct_document_read (production
+    # default) is validated separately and changes the call prompt/inputs.
+    config.llm.direct_document_read = False
     (tmp_path / "output").mkdir(parents=True, exist_ok=True)
     return config
 

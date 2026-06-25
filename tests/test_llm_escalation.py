@@ -56,6 +56,10 @@ def make_config(tmp_path: Path) -> Config:
         db_path=tmp_path / "output" / "pv.db",
     )
     config.llm.models_path = str(PROJECT_ROOT / "config" / "models.yaml")
+    # These tests pin the EMBEDDED page-payload path (assembled page text/images
+    # in the prompt). direct_document_read (the production default) replaces that
+    # with a copy-the-file + Read-it call and is validated separately.
+    config.llm.direct_document_read = False
     (tmp_path / "output").mkdir(parents=True, exist_ok=True)
     return config
 
@@ -157,6 +161,28 @@ def test_assemble_payload_text_pages_inline_no_images(tmp_path):
     assert (tmp_path / "output" / "payload" / "manifest.json").exists()
     assert (tmp_path / "output" / "payload" / "pages" / "page_001.txt").exists()
     assert payload.payload_hash
+
+
+def test_direct_document_read_copies_source_and_builds_read_instruction(tmp_path):
+    """direct_document_read: the source file is copied into the call dir and the
+    prompt points the model at it (Read it directly) instead of embedding the
+    rendered page payload."""
+    config = make_config(tmp_path)
+    config.llm.direct_document_read = True
+    pdf = tmp_path / "docs" / "memo.pdf"
+    make_text_pdf(pdf, [PAGE1])
+    payload = assemble_payload(
+        file_path=str(pdf), fields=[escalation_field("Fund Name", "required")],
+        config=config, payload_dir=tmp_path / "output" / "payload",
+    )
+    assert payload.source_documents, "the source document should be copied in"
+    _doc_id, rel = payload.source_documents[0]
+    assert (payload.directory / rel).exists()
+    instruction = payload.read_instruction()
+    assert "SOURCE DOCUMENTS" in instruction
+    assert rel in instruction and "Read tool" in instruction
+    # grounding text is still kept even though it is not embedded in the prompt
+    assert payload.page_texts
 
 
 def test_cleanly_ocrd_scanned_page_travels_as_text_not_image(tmp_path):

@@ -653,7 +653,15 @@ combine_deal_documents, max_pages_per_deal, band_batched,
 single_call_max_pages, retry_not_found, surface_ungrounded_values,
 ungrounded_confidence_cap, prefer_ocr_text_over_image, ocr_text_min_confidence,
 band_relevance_floor, max_fields_per_call, no_evidence_effort,
-stream_partial_messages, always_enable_thinking. always_enable_thinking forces
+stream_partial_messages, always_enable_thinking, direct_document_read.
+direct_document_read (DEFAULT, payload.py copies the SOURCE document into the
+call's working dir and the prompt — payload.read_instruction() — points the model
+at it to Read with its own tool, instead of embedding a rasterized/OCR'd page
+payload; the prompt stays small so a large field set completes in seconds, and
+the model reads scanned PDFs natively via its vision Read tool instead of via the
+local OCR pipeline. page_texts are still built in-memory for quote-grounding;
+image attachments are skipped. The embedded-payload path is preserved when the
+flag is off). always_enable_thinking forces
 extended thinking on for EVERY model/effort via the Claude Code
 `alwaysThinkingEnabled` setting (passed as `--settings`), and
 stream_partial_messages adds `--include-partial-messages`; both feed the live

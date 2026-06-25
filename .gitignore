@@ -7,3 +7,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+
+# Local test artifacts (client data — never commit)
+/*.pdf
+/MEMO_*.json
