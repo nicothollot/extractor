@@ -123,6 +123,30 @@ def test_planner_emits_one_natural_primary_task(tmp_path):
     assert planned.diagnostics["execution_shape"] == "natural_request_unit"
 
 
+def test_field_batch_count_splits_into_n_calls(tmp_path):
+    """field_batch_count=N splits the fields into N near-equal batches (one task
+    = one call each), the last batch absorbing the remainder, with unique ids."""
+    config = make_config(tmp_path)
+    config.llm.field_batch_count = 4
+    fields = [
+        esc(field.header, "force_llm_assist", pages=[1, 2, 3])
+        for field in SCHEMA_FIELDS
+        if field.header not in {"\U0001f511 Memo ID", "Run ID"} and field.slot_group is None
+    ][:30]
+    memo = memo_with_plan(tmp_path, fields)
+    registry = ModelRegistry.load(config.llm.models_path)
+    planned = plan_assistance_tasks(
+        memo=memo, plan=memo.escalation, payload=fake_payload(tmp_path),
+        schema_by_header=BY_HEADER, config=config, settings=settings(),
+        registry=registry, provider="claude",
+    )
+    sizes = [len(t.schema_fields) for t in planned.tasks]
+    assert len(planned.tasks) == 4
+    assert sizes == [8, 8, 8, 6]  # ceil(30/4)=8; last batch takes the remainder
+    assert sum(sizes) == 30  # every field accounted for exactly once
+    assert len({t.record.task_id for t in planned.tasks}) == 4  # unique ids
+
+
 def test_normal_mode_catalog_includes_protected_deterministic_field(tmp_path):
     config = make_config(tmp_path)
     value_field = BY_HEADER["Implied EV ($M)"]

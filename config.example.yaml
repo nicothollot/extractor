@@ -410,6 +410,9 @@ llm:
   cache_enabled: true              # task cache keyed on provider/model/effort/schema/prompt/page hashes/fields
   direct_document_read: true       # copy the source doc into the call dir and let the model Read it directly
                                    #   (small prompt, fast) instead of embedding a rasterized/OCR'd page payload
+  field_batch_count: 1             # split a document's fields into N near-equal batches, one provider call each
+                                   #   (191 fields, 4 -> 4 calls of ~48; last batch takes the remainder). 1 = single call
+  max_concurrent_agents: 4         # max batches of ONE document run simultaneously (capped by field_batch_count)
   stream_partial_messages: true    # stream the model's thinking + answer token deltas to the live activity view
   always_enable_thinking: true     # force extended thinking on for every model/effort (budget still scales with effort)
   timeout_seconds: 600             # per primary provider request (a single call

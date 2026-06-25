@@ -615,6 +615,17 @@ class LlmConfig(BaseModel):
     # the real PDF (native tables/scans), the prompt stays small, and the call
     # completes fast — the assembled-payload path was timing out on large memos.
     direct_document_read: bool = True
+    # Split each document's escalated fields into this many near-equal batches,
+    # each its OWN provider call (191 fields, field_batch_count=4 -> 4 calls of
+    # ~48 fields; the last batch absorbs the remainder). 1 = one call for all
+    # fields (legacy). Smaller batches finish faster and are more reliable than
+    # one huge call.
+    field_batch_count: int = 1
+    # Maximum provider calls running AT THE SAME TIME for one document's batches
+    # (e.g. 4 batches with max_concurrent_agents=8 all run together). Bounded by
+    # the number of batches. Keep modest — every concurrent call is a local CLI
+    # subprocess hitting the same login.
+    max_concurrent_agents: int = 4
     # Stream the provider's partial output (token deltas) so the live activity
     # view shows the model's thinking + answer AS IT WORKS, not just heartbeats.
     stream_partial_messages: bool = True

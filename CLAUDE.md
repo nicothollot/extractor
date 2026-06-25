@@ -653,7 +653,14 @@ combine_deal_documents, max_pages_per_deal, band_batched,
 single_call_max_pages, retry_not_found, surface_ungrounded_values,
 ungrounded_confidence_cap, prefer_ocr_text_over_image, ocr_text_min_confidence,
 band_relevance_floor, max_fields_per_call, no_evidence_effort,
-stream_partial_messages, always_enable_thinking, direct_document_read.
+stream_partial_messages, always_enable_thinking, direct_document_read,
+field_batch_count, max_concurrent_agents. field_batch_count splits a document's
+escalated fields into N near-equal batches in the planner (plan_assistance_tasks
+— one AssistanceTask/call per batch, last batch absorbs the remainder; 1 = the
+single-call default), and max_concurrent_agents runs those batches CONCURRENTLY
+inside _escalate_memo (the slow provider calls run on a ThreadPoolExecutor, then
+results merge single-threaded since field batches are disjoint). Both are
+GUI-editable (Settings → LLM routing).
 direct_document_read (DEFAULT, payload.py copies the SOURCE document into the
 call's working dir and the prompt — payload.read_instruction() — points the model
 at it to Read with its own tool, instead of embedding a rasterized/OCR'd page

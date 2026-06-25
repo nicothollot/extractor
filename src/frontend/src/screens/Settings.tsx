@@ -997,6 +997,28 @@ export default function Settings() {
               <Field label="Budget cap (USD / run)">
                 <input className={inputCls} type="number" step="0.5" value={Number(value("llm.budget_usd", c.llm.budget_usd))} onChange={(e) => setValue("llm.budget_usd", Number(e.target.value))} />
               </Field>
+              <Field label="Field batches per document">
+                <input
+                  className={inputCls}
+                  type="number"
+                  step="1"
+                  min="1"
+                  value={Number(value("llm.field_batch_count", c.llm.field_batch_count ?? 1))}
+                  onChange={(e) => setValue("llm.field_batch_count", Math.max(1, Math.round(Number(e.target.value))))}
+                />
+                <p className="mt-1 text-[11px] text-ink-400">Split a document's fields into this many batches, one LLM call each (191 fields ÷ 4 = ~48 each). 1 = a single call.</p>
+              </Field>
+              <Field label="Max simultaneous agents">
+                <input
+                  className={inputCls}
+                  type="number"
+                  step="1"
+                  min="1"
+                  value={Number(value("llm.max_concurrent_agents", c.llm.max_concurrent_agents ?? 4))}
+                  onChange={(e) => setValue("llm.max_concurrent_agents", Math.max(1, Math.round(Number(e.target.value))))}
+                />
+                <p className="mt-1 text-[11px] text-ink-400">How many of a document's batches run at the same time (capped by the batch count).</p>
+              </Field>
               <div className="pt-6">
                 <Toggle checked={Boolean(value("llm.allow_fable", c.llm.allow_fable))} onChange={(v) => setValue("llm.allow_fable", v)} label="Allow Fable tier (most expensive — explicit opt-in)" />
               </div>

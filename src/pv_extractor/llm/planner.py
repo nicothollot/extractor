@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import time
 from dataclasses import dataclass
 
@@ -313,7 +314,15 @@ def plan_assistance_tasks(
     )
     chunks: list[list[SchemaField]]
     fallback_reason = ""
-    if oversized:
+    batch_count = max(1, int(getattr(config.llm, "field_batch_count", 1) or 1))
+    if fields and batch_count > 1:
+        # Operator-chosen batching: split the fields into N near-equal contiguous
+        # batches (each its own call); ceil sizing means the last batch absorbs
+        # the remainder (191 / 4 -> 48, 48, 48, 47).
+        size = math.ceil(len(fields) / batch_count)
+        chunks = [fields[i : i + size] for i in range(0, len(fields), size)]
+        fallback_reason = f"field_batch_count={batch_count}: {len(chunks)} field batches"
+    elif oversized:
         target = max(1, profile.oversized_target_fields)
         chunks = [fields[i : i + target] for i in range(0, len(fields), target)]
         fallback_reason = (
@@ -342,7 +351,10 @@ def plan_assistance_tasks(
             provider=provider_name,
             selection=selection,
         )
-        if oversized:
+        # Multiple chunks (operator batching OR oversized fallback) must get
+        # UNIQUE task ids — they drive the per-call slug, prompt/schema filenames
+        # and event ids; a shared id would collide on disk and in the UI.
+        if len(chunks) > 1:
             record.reason = fallback_reason
             record.task_id = f"{record.task_id}-part{index + 1}-of-{len(chunks)}"
         tasks.append(AssistanceTask(record=record, schema_fields=draft.fields,

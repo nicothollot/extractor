@@ -1463,8 +1463,37 @@ def _escalate_memo(
     deferred = False
     any_merged = False
     any_ok_attempt = False
+
+    # Run the per-batch provider calls CONCURRENTLY (up to max_concurrent_agents),
+    # then merge their results sequentially below (merging mutates the shared memo
+    # and must stay single-threaded). Field batches are disjoint, so a batch never
+    # depends on another's result. precomputed[task_index] = ("ok",(attempt,
+    # structured)) | ("budget", exc) | ("error", exc).
+    agents = max(1, int(getattr(config.llm, "max_concurrent_agents", 1) or 1))
+    precomputed: dict[int, tuple[str, object]] = {}
+    if len(tasks) > 1 and agents > 1:
+        def _call_tier0(idx: int, t: AssistanceTask) -> tuple[int, tuple[str, object]]:
+            try:
+                res = _run_tier(
+                    memo=memo, payload=payload, task=t, selection=t.first_selection,
+                    tier=0, slug=f"{t.record.task_id}-t0",
+                    config=config, settings=settings, client=client,
+                    registry=registry, budget=budget, run_id=run_id,
+                    corrective=False, event_sink=event_sink, source_files=deal_files,
+                )
+                return idx, ("ok", res)
+            except BudgetExceeded as exc:
+                return idx, ("budget", exc)
+            except Exception as exc:  # noqa: BLE001 — surfaced per-batch below
+                return idx, ("error", exc)
+
+        with ThreadPoolExecutor(max_workers=min(agents, len(tasks))) as tpool:
+            for fut in [tpool.submit(_call_tier0, i, t) for i, t in enumerate(tasks)]:
+                idx, outcome = fut.result()
+                precomputed[idx] = outcome
+
     for task_index, task in enumerate(tasks):
-        if deferred:
+        if deferred and not precomputed:
             break
         remaining = {f.field: f for f in task.escalation_fields if f.field in unresolved}
         if not remaining:
@@ -1475,15 +1504,24 @@ def _escalate_memo(
                 break
             slug = f"{task.record.task_id}-t{tier}"
             try:
-                attempt, structured = _run_tier(
-                    memo=memo, payload=payload, task=task, selection=selection,
-                    tier=tier, slug=slug,
-                    config=config, settings=settings, client=client,
-                    registry=registry, budget=budget, run_id=run_id,
-                    corrective=tier > 0,
-                    event_sink=event_sink,
-                    source_files=deal_files,
-                )
+                pre = precomputed.get(task_index)
+                if pre is not None:
+                    # already executed in the concurrent pre-pass above
+                    kind, value = pre
+                    if kind == "ok":
+                        attempt, structured = value  # type: ignore[assignment]
+                    else:
+                        raise value  # BudgetExceeded or a call exception
+                else:
+                    attempt, structured = _run_tier(
+                        memo=memo, payload=payload, task=task, selection=selection,
+                        tier=tier, slug=slug,
+                        config=config, settings=settings, client=client,
+                        registry=registry, budget=budget, run_id=run_id,
+                        corrective=tier > 0,
+                        event_sink=event_sink,
+                        source_files=deal_files,
+                    )
             except BudgetExceeded as exc:
                 deferred = True
                 _emit_llm_activity(
