@@ -490,6 +490,16 @@ class JobManager:
         event = self._cancel_events.get(job_id)
         if event is not None:
             event.set()
+            # FORCE cancel: kill every running provider subprocess (and its WSL/
+            # CLI children) immediately — don't wait for in-flight agents to
+            # finish. The cooperative flag above still stops new work.
+            if job.kind in ("run", "multi_run"):
+                try:
+                    from pv_extractor.llm.claude_code_client import abort_all_calls
+
+                    abort_all_calls()
+                except Exception:  # noqa: BLE001 — cancel must never raise
+                    logger.exception("force-cancel: abort_all_calls failed for %s", job_id)
             self._update(job_id, status="cancelling")
             self.emit_event(job_id, "cancel_requested", {})
         else:
@@ -532,8 +542,10 @@ class JobManager:
             self._cancel_events.pop(job_id, None)
 
     def _execute_run(self, job_id: str, request: RunRequest, cancel: threading.Event) -> None:
+        from pv_extractor.llm.claude_code_client import reset_abort
         from pv_extractor.llm.escalate import resolve_settings
 
+        reset_abort()  # clear any prior force-cancel before a new run
         self._update(job_id, status="running", started_at=_now())
         now = datetime.now()
         run_id = f"RUN_{now:%Y%m%d_%H%M%S}"
@@ -632,8 +644,10 @@ class JobManager:
         drive ONE pipeline run over them (slots path), reusing the exact
         event/cancel/cost-bridge machinery as the single-firm run."""
         from pv_extractor.api import multi_search_service
+        from pv_extractor.llm.claude_code_client import reset_abort
         from pv_extractor.llm.escalate import resolve_settings
 
+        reset_abort()  # clear any prior force-cancel before a new run
         self._update(job_id, status="running", started_at=_now())
         now = datetime.now()
         run_id = f"RUN_{now:%Y%m%d_%H%M%S}"

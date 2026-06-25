@@ -626,6 +626,14 @@ class LlmConfig(BaseModel):
     # the number of batches. Keep modest — every concurrent call is a local CLI
     # subprocess hitting the same login.
     max_concurrent_agents: int = 4
+    # Stagger the START of concurrent provider subprocesses by this many seconds
+    # so simultaneous batches don't all cold-start a WSL session at once (the
+    # Windows->WSL bridge throws Wsl/Service/0x8007274c under that race). The
+    # slow API work still overlaps; only the launches are spread out.
+    launch_stagger_seconds: float = 1.0
+    # Retry a call this many times when it fails with a TRANSIENT bridge error
+    # (WSL service drop, broken stdin pipe, connection timeout) before giving up.
+    transient_retries: int = 2
     # Stream the provider's partial output (token deltas) so the live activity
     # view shows the model's thinking + answer AS IT WORKS, not just heartbeats.
     stream_partial_messages: bool = True

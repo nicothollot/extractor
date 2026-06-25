@@ -66,6 +66,10 @@ if mode == "sleep":
     time.sleep(30)
 if mode == "slow_ok":
     time.sleep(1)  # succeed, but slowly enough for a heartbeat to fire
+if mode == "wsl_fail":
+    # a transient Windows->WSL bridge failure (printed on stdout, non-zero exit)
+    print("Error code: Wsl/Service/0x8007274c")
+    sys.exit(1)
 
 # `claude --json-schema` takes the schema JSON inline (a string), not a path.
 schema = json.loads(argv[argv.index("--json-schema") + 1])
@@ -210,6 +214,45 @@ def test_heartbeat_emits_while_call_runs(fake_env, monkeypatch):
     heartbeats = [e for e in events if e.get("stream") == "heartbeat"]
     assert heartbeats, [e.get("stream") for e in events]
     assert "elapsed" in str(heartbeats[0].get("message", ""))
+
+
+def test_transient_wsl_error_is_retried(fake_env, monkeypatch):
+    """A transient WSL/connection bridge failure is retried transient_retries
+    times before giving up (the cause of the 0x8007274c storms under batching)."""
+    _client, schema_path, log, tmp_path = fake_env
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "wsl_fail")
+    config = Config(
+        pv_root=str(tmp_path / "not_pv"), output_dir=tmp_path / "output",
+        db_path=tmp_path / "output" / "pv.db",
+        claude_code=ClaudeCodeConfig(command=str(tmp_path / "claude"), default_timeout_seconds=30),
+    )
+    config.llm.transient_retries = 2
+    config.llm.launch_stagger_seconds = 0
+    client = ClaudeCodeClient(config)
+    result = client.extract_json(
+        job_id="j", prompt="x", schema_path=schema_path,
+        model="sonnet", effort="low", cwd=tmp_path,
+    )
+    assert not result.ok and "0x8007274c" in (result.error or "")
+    calls = [c for c in _logged_calls(log) if "--json-schema" in c["argv"]]
+    assert len(calls) == 3  # initial attempt + 2 retries
+
+
+def test_abort_short_circuits_calls(fake_env):
+    """A force-cancel (_ABORT) returns 'cancelled' WITHOUT launching the CLI."""
+    import pv_extractor.llm.claude_code_client as ccc
+
+    client, schema_path, log, tmp_path = fake_env
+    ccc._ABORT.set()
+    try:
+        result = client.extract_json(
+            job_id="j", prompt="x", schema_path=schema_path,
+            model="sonnet", effort="low", cwd=tmp_path,
+        )
+        assert not result.ok and result.error == "cancelled"
+        assert not [c for c in _logged_calls(log) if "--json-schema" in c["argv"]]
+    finally:
+        ccc.reset_abort()
 
 
 def test_command_args_are_prepended(fake_env):

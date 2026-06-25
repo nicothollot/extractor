@@ -63,6 +63,71 @@ _HEARTBEAT_SECONDS = 15
 _STREAM_EMIT_SECONDS = 1.0
 _THINKING_TAIL_CHARS = 600  # how much of the running thinking text to surface
 
+# Transient WSL/launch failures (the Windows->WSL bridge drops the connection
+# under concurrency: "Wsl/Service/0x8007274c", a broken stdin pipe, or a TCP
+# "connection attempt failed"). These are retried with backoff rather than
+# surfaced as a real extraction failure.
+_TRANSIENT_ERROR_MARKERS = (
+    "wsl/service",
+    "0x8007274c",
+    "0x8007274d",
+    "broken pipe",
+    "connection attempt failed",
+    "did not properly respond",
+    "failed to launch",
+    "errno 32",
+)
+
+
+def _is_transient_launch_error(error: str | None) -> bool:
+    low = (error or "").lower()
+    return any(marker in low for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+# Live provider subprocesses, so a force-cancel can kill them IMMEDIATELY
+# (taskkill /T on Windows tears down the wsl.exe + claude child tree) instead of
+# waiting for in-flight calls to finish. _ABORT short-circuits calls that have
+# not launched yet. One pipeline runs at a time, so global state is safe.
+_LIVE_PROCS: "set[subprocess.Popen]" = set()
+_LIVE_LOCK = threading.Lock()
+_ABORT = threading.Event()
+# Serialize the START of provider subprocesses so concurrent batches do not all
+# cold-start a WSL session at the same instant (the cause of the 0x8007274c
+# storms); the slow API work still overlaps fully.
+_LAUNCH_LOCK = threading.Lock()
+_last_launch_at = [0.0]
+
+
+def _kill_proc_tree(proc: "subprocess.Popen") -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True, text=True,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:  # noqa: BLE001 — best effort; fall back to a direct kill
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def abort_all_calls() -> None:
+    """Force-cancel: stop launching new calls and KILL every running provider
+    subprocess (and its WSL/CLI children) immediately."""
+    _ABORT.set()
+    with _LIVE_LOCK:
+        procs = list(_LIVE_PROCS)
+    for proc in procs:
+        _kill_proc_tree(proc)
+
+
+def reset_abort() -> None:
+    """Clear the force-cancel flag at the start of a new run."""
+    _ABORT.clear()
+
 
 class ClaudeCodeResult(LlmCliResult):
     """Outcome of one non-interactive extraction call."""
@@ -394,6 +459,8 @@ class ClaudeCodeClient:
         self._exclude_dynamic = config.llm.exclude_dynamic_system_prompt_sections
         self._stream_partial = getattr(config.llm, "stream_partial_messages", True)
         self._always_think = getattr(config.llm, "always_enable_thinking", True)
+        self._launch_stagger = max(0.0, float(getattr(config.llm, "launch_stagger_seconds", 0.0) or 0.0))
+        self._transient_retries = max(0, int(getattr(config.llm, "transient_retries", 0) or 0))
         self._pv_root = config.pv_root
         self._help_text: str | None = None
 
@@ -460,7 +527,54 @@ class ClaudeCodeClient:
     # extraction
     # ------------------------------------------------------------------
 
+    def _stagger_launch(self) -> None:
+        """Block until at least launch_stagger_seconds have passed since the last
+        provider launch, so concurrent batches don't cold-start WSL all at once."""
+        if self._launch_stagger <= 0:
+            return
+        with _LAUNCH_LOCK:
+            wait = _last_launch_at[0] + self._launch_stagger - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            _last_launch_at[0] = time.perf_counter()
+
     def extract_json(
+        self,
+        *,
+        job_id: str,
+        prompt: str,
+        schema_path: Path,
+        model: str,
+        effort: str,
+        cwd: Path,
+        allow_read_tool: bool = True,
+        timeout: int | None = None,
+        event_sink: Callable[[dict[str, object]], None] | None = None,
+    ) -> ClaudeCodeResult:
+        """Run one extraction call, retrying TRANSIENT bridge failures (WSL
+        service drops, broken stdin pipes, connection timeouts) with backoff.
+        A force-cancel (_ABORT) short-circuits before each attempt."""
+        attempts = self._transient_retries + 1
+        result: ClaudeCodeResult | None = None
+        for index in range(attempts):
+            if _ABORT.is_set():
+                return ClaudeCodeResult(job_id=job_id, ok=False, error="cancelled")
+            result = self._extract_json_once(
+                job_id=job_id, prompt=prompt, schema_path=schema_path,
+                model=model, effort=effort, cwd=cwd, allow_read_tool=allow_read_tool,
+                timeout=timeout, event_sink=event_sink,
+            )
+            if result.ok or _ABORT.is_set() or not _is_transient_launch_error(result.error):
+                return result
+            if index < attempts - 1:
+                _emit_provider_event(
+                    event_sink, stream="stdout",
+                    message=f"transient bridge error — retrying ({index + 1}/{attempts - 1})",
+                )
+                time.sleep(min(5.0, 1.0 * (index + 1)))
+        return result  # type: ignore[return-value]
+
+    def _extract_json_once(
         self,
         *,
         job_id: str,
@@ -531,6 +645,10 @@ class ClaudeCodeClient:
             *stream_args, "--json-schema", f"<inline schema:{len(schema_arg)} chars>", *tail,
         ]
 
+        if _ABORT.is_set():
+            return ClaudeCodeResult(job_id=job_id, ok=False, error="cancelled", argv=argv)
+        # Stagger the launch so concurrent batches don't cold-start WSL together.
+        self._stagger_launch()
         started = time.perf_counter()
         try:
             # text=True alone encodes stdin/decodes stdout with the LOCALE
@@ -557,6 +675,8 @@ class ClaudeCodeClient:
             else:
                 popen_kwargs["start_new_session"] = True
             proc = subprocess.Popen(exec_argv, **popen_kwargs)
+            with _LIVE_LOCK:
+                _LIVE_PROCS.add(proc)  # so a force-cancel can kill it immediately
             stdout_chunks: list[str] = []
             stderr_chunks: list[str] = []
             # Live-stream state: accumulate token deltas and emit coalesced
@@ -738,6 +858,8 @@ class ClaudeCodeClient:
                 heartbeat_thread.join(timeout=1)
                 stdout_thread.join(timeout=1)
                 stderr_thread.join(timeout=1)
+                with _LIVE_LOCK:
+                    _LIVE_PROCS.discard(proc)
             stdout = "".join(stdout_chunks)
             stderr = "".join(stderr_chunks)
         except OSError as exc:
@@ -746,6 +868,15 @@ class ClaudeCodeClient:
             )
             self._log(result, model, effort)
             return result
+
+        # A force-cancel killed this process — report it as cancelled (not a
+        # spurious exit/transient error that would trigger a retry).
+        if _ABORT.is_set():
+            return ClaudeCodeResult(
+                job_id=job_id, ok=False, exit_code=proc.returncode,
+                duration_seconds=round(time.perf_counter() - started, 2),
+                error="cancelled", argv=argv,
+            )
 
         duration = round(time.perf_counter() - started, 2)
         stdout = stdout or ""

@@ -660,7 +660,16 @@ escalated fields into N near-equal batches in the planner (plan_assistance_tasks
 single-call default), and max_concurrent_agents runs those batches CONCURRENTLY
 inside _escalate_memo (the slow provider calls run on a ThreadPoolExecutor, then
 results merge single-threaded since field batches are disjoint). Both are
-GUI-editable (Settings → LLM routing).
+GUI-editable (Settings → LLM routing). Concurrent batches over the Windows->WSL
+bridge can storm the WSL service (Wsl/Service/0x8007274c); two more tunables
+harden this: launch_stagger_seconds (serialize the START of provider
+subprocesses so they don't cold-start WSL simultaneously) and transient_retries
+(retry a call on a transient bridge error — WSL drop / broken stdin pipe /
+connection timeout — with backoff). The GUI Cancel button is now a FORCE cancel
+for runs: jobs.cancel() calls claude_code_client.abort_all_calls(), which sets a
+module ABORT flag and kills every live provider subprocess tree immediately
+(taskkill /T on Windows) instead of waiting for in-flight agents; reset_abort()
+clears it at the next run start.
 direct_document_read (DEFAULT, payload.py copies the SOURCE document into the
 call's working dir and the prompt — payload.read_instruction() — points the model
 at it to Read with its own tool, instead of embedding a rasterized/OCR'd page
