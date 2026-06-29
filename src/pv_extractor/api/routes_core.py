@@ -877,7 +877,7 @@ def search_resolve(request: Request, body: IntentResolveRequest) -> dict:
     """Resolve a free-text query into a DocTypeSpec via the rule engine, with an
     optional one-shot Claude Code CLI augmentation. NEVER raises if the CLI is
     unavailable — resolve_intent degrades to the rule spec on any failure.
-    ``use_cli`` defaults to config.smart_search.use_cli_fallback."""
+    ``use_cli`` defaults to the configured fallback for ambiguous rule matches."""
     from pv_extractor.search import intent
 
     config = _config(request)

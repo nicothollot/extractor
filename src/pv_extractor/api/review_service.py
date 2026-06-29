@@ -60,6 +60,7 @@ class ReviewItem(BaseModel):
     evidence: str = ""
     evidence_ref: EvidenceRef | None = None
     evidence_refs: list[EvidenceRef] = Field(default_factory=list)
+    evidence_mode: str = "quote"  # quote | visual_region | reasoned
     grounding_status: str = "none"  # box | page_only | none
     grounding_reason: str = ""
     issue_code: str = ""
@@ -186,7 +187,26 @@ def _grounding(ref: EvidenceRef | None) -> tuple[str, str]:
         return "none", ""
     if ref.bbox is not None:
         return "box", ""
+    if ref.match_method is EvidenceMatchMethod.llm_reasoned:
+        return "page_only", ref.no_geometry_reason or "reasoned value has no highlightable region"
     return "page_only", ref.no_geometry_reason or "page evidence available, exact box unavailable"
+
+
+def _evidence_mode(ref: EvidenceRef | None) -> str:
+    if ref is None:
+        return "quote"
+    if ref.match_method is EvidenceMatchMethod.llm_reasoned or ref.provenance == "llm_reasoning":
+        return "reasoned"
+    if ref.match_method is EvidenceMatchMethod.llm_visual_region or ref.provenance == "llm_visual_region":
+        return "visual_region"
+    return "quote"
+
+
+def _has_renderable_page(audit: dict, ref: EvidenceRef | None, page: int | None) -> bool:
+    if page is None:
+        return False
+    file_path = (ref.source_file if ref and ref.source_file else audit.get("file_path")) or ""
+    return str(file_path).lower().endswith(".pdf")
 
 
 def _method_chip(method: str | None, page_classes: dict, page: int | None) -> str | None:
@@ -208,9 +228,17 @@ def _hit_by_field(asset: dict) -> dict[str, dict]:
     return {hit["field"]: hit for hit in asset.get("hits", [])}
 
 
-def _value_needs_approval(confidence: float | None, *, auto_enabled: bool, auto_confidence: float) -> bool:
+def _value_needs_approval(
+    confidence: float | None,
+    *,
+    auto_enabled: bool,
+    auto_confidence: float,
+    evidence_mode: str = "quote",
+) -> bool:
     """A surfaced value awaits manual approval when auto-approval is off, or when
     its confidence is below the auto-approval bar (None confidence never clears)."""
+    if evidence_mode == "reasoned":
+        return True
     if not auto_enabled:
         return True
     if confidence is None:
@@ -265,6 +293,7 @@ def build_review(run_dir: Path, config: Config) -> tuple[list[ReviewItem], list[
                 ] if hit else []
                 evidence_refs = _distinct_evidence_refs([evidence_ref, *conflict_refs])
                 grounding_status, grounding_reason = _grounding(evidence_ref)
+                evidence_mode = _evidence_mode(evidence_ref)
                 action = actions.get(item_id)
                 if action is None:
                     action = next((actions.get(legacy) for legacy in group["legacy_ids"] if actions.get(legacy)), None)
@@ -288,6 +317,7 @@ def build_review(run_dir: Path, config: Config) -> tuple[list[ReviewItem], list[
                         evidence=(evidence_ref.quote if evidence_ref else hit.get("evidence", "")) if hit else "",
                         evidence_ref=evidence_ref,
                         evidence_refs=evidence_refs,
+                        evidence_mode=evidence_mode,
                         grounding_status=grounding_status,
                         grounding_reason=grounding_reason,
                         issue_code=issue_code,
@@ -295,7 +325,9 @@ def build_review(run_dir: Path, config: Config) -> tuple[list[ReviewItem], list[
                         reviewer_comment=(action or {}).get("note") if action else None,
                         page=(evidence_ref.display_page if evidence_ref else hit.get("page")) if hit else None,
                         bbox=(list(evidence_ref.bbox) if evidence_ref and evidence_ref.bbox else hit.get("bbox")) if hit else None,
-                        has_page_image=bool(renderable and hit and (evidence_ref.display_page if evidence_ref else hit.get("page"))),
+                        has_page_image=bool(hit and _has_renderable_page(
+                            audit, evidence_ref, evidence_ref.display_page if evidence_ref else hit.get("page")
+                        )),
                         category=flag.get("category", ""),
                         description=description,
                         severity=severity,
@@ -329,6 +361,7 @@ def build_review(run_dir: Path, config: Config) -> tuple[list[ReviewItem], list[
                 evidence_ref = _evidence_ref_from_hit(audit, hit)
                 evidence_refs = _distinct_evidence_refs([evidence_ref])
                 grounding_status, grounding_reason = _grounding(evidence_ref)
+                evidence_mode = _evidence_mode(evidence_ref)
                 quote = (evidence_ref.quote if evidence_ref else hit.get("evidence", "")) or ""
                 conf_text = "n/a" if confidence is None else f"{float(confidence):.2f}"
                 # The list subtitle: prefer the model's quote (where it was found /
@@ -346,6 +379,7 @@ def build_review(run_dir: Path, config: Config) -> tuple[list[ReviewItem], list[
                         evidence=quote,
                         evidence_ref=evidence_ref,
                         evidence_refs=evidence_refs,
+                        evidence_mode=evidence_mode,
                         grounding_status=grounding_status,
                         grounding_reason=grounding_reason,
                         issue_code="extracted",
@@ -353,12 +387,15 @@ def build_review(run_dir: Path, config: Config) -> tuple[list[ReviewItem], list[
                         reviewer_comment=(action or {}).get("note") if action else None,
                         page=evidence_ref.display_page if evidence_ref else hit.get("page"),
                         bbox=list(evidence_ref.bbox) if evidence_ref and evidence_ref.bbox else hit.get("bbox"),
-                        has_page_image=bool(renderable and (evidence_ref.display_page if evidence_ref else hit.get("page"))),
+                        has_page_image=_has_renderable_page(
+                            audit, evidence_ref, evidence_ref.display_page if evidence_ref else hit.get("page")
+                        ),
                         category="extracted",
                         description=description,
                         severity="info",
                         needs_approval=action is None and _value_needs_approval(
-                            confidence, auto_enabled=auto_enabled, auto_confidence=auto_confidence
+                            confidence, auto_enabled=auto_enabled, auto_confidence=auto_confidence,
+                            evidence_mode=evidence_mode,
                         ),
                         qa_fail_reasons=[],
                         conflicts=hit.get("conflicts") or [],

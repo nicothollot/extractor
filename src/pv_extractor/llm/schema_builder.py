@@ -12,7 +12,8 @@ Default structured output is sparse schema v5:
       "schema_version": 5,
       "scope": {"type": "deal|document", "id": "..."},
       "values": [{field_id, value, unit, document_id, page, as_of_date, quote,
-                  evidence_kind, model_confidence}],
+                  evidence_kind, evidence_mode, evidence_explanation,
+                  evidence_bbox, model_confidence}],
       "not_found": [...],
       "conflicts": [{field_id, reason, candidates: [...]}],
       "warnings": [...]
@@ -101,13 +102,25 @@ SPARSE_CANDIDATE_SCHEMA: dict = {
         "document_id": {"type": "string"},
         "page": {"type": "integer"},
         "as_of_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "quote": {"type": "string"},
+        "quote": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "evidence_kind": {"type": "string"},
+        "evidence_mode": {"enum": ["quote", "visual_region", "reasoned"]},
+        "evidence_explanation": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "evidence_bbox": {
+            "anyOf": [
+                {
+                    "type": "array",
+                    "items": {"type": "number"},
+                },
+                {"type": "null"},
+            ]
+        },
         "model_confidence": {"type": "number"},
     },
     "required": [
         "field_id", "value", "unit", "document_id", "page", "as_of_date",
-        "quote", "evidence_kind", "model_confidence",
+        "quote", "evidence_kind", "evidence_mode", "evidence_explanation",
+        "evidence_bbox", "model_confidence",
     ],
 }
 
@@ -120,13 +133,25 @@ SPARSE_CONFLICT_CANDIDATE_SCHEMA: dict = {
         "document_id": {"type": "string"},
         "page": {"type": "integer"},
         "as_of_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "quote": {"type": "string"},
+        "quote": {"anyOf": [{"type": "string"}, {"type": "null"}]},
         "evidence_kind": {"type": "string"},
+        "evidence_mode": {"enum": ["quote", "visual_region", "reasoned"]},
+        "evidence_explanation": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "evidence_bbox": {
+            "anyOf": [
+                {
+                    "type": "array",
+                    "items": {"type": "number"},
+                },
+                {"type": "null"},
+            ]
+        },
         "model_confidence": {"type": "number"},
     },
     "required": [
         "value", "unit", "document_id", "page", "as_of_date", "quote",
-        "evidence_kind", "model_confidence",
+        "evidence_kind", "evidence_mode", "evidence_explanation",
+        "evidence_bbox", "model_confidence",
     ],
 }
 
@@ -143,9 +168,15 @@ Use only the supplied documents. Check every requested field before responding
 and do not stop after headline valuation metrics. Follow each field's type,
 unit, allowed values, extraction policy, source priority, reporting-period rule,
 and merge policy. Do not calculate generated/formula/QA fields. Every value
-must cite document_id, page, and a short direct quote. Return a conflict instead
-of silently guessing. Account for each requested field exactly once. Return only
-the required JSON.
+must cite document_id, page, and one evidence mode:
+- quote: a short direct quote supports the value.
+- visual_region: the value is visible in a page region, usually on an image or
+  scanned page; provide evidence_bbox when you can identify the region.
+- reasoned: the value is inferred from the document but not explicitly written
+  in one highlightable place; use this rarely, explain the reasoning, and leave
+  evidence_bbox null.
+Return a conflict instead of silently guessing. Account for each requested field
+exactly once. Return only the required JSON.
 </rules>
 
 <schema>
@@ -155,6 +186,13 @@ Return sparse schema_version=5 JSON with:
 - not_found: field ids that are absent from this response scope
 - conflicts: fields with materially different candidates
 - warnings: concise response-scope warnings
+
+For value/conflict candidates, evidence_bbox is [x0,y0,x1,y1] in page
+coordinates when a visual region is available, otherwise null. For quote mode,
+quote must be direct supporting text. For visual_region mode, quote may be null
+only when the cited page is image-only and the bbox/explanation carries the
+evidence. For reasoned mode, quote and evidence_bbox must be null and
+evidence_explanation must say why the value follows from the document.
 
 For a whole-deal task, not_found means absent across every supplied document.
 For a per-document task, not_found means absent from that document only.
@@ -179,9 +217,9 @@ merely to describe document readability. Use these anchors consistently:
 </candidate_confidence>
 
 <examples>
-{"schema_version":5,"scope":{"type":"document","id":"D01"},"values":[{"field_id":"F001","value":1349,"unit":"USD_millions","document_id":"D01","page":7,"as_of_date":"2026-03-31","quote":"Implied Enterprise Value of $1,349 million","evidence_kind":"explicit_label","model_confidence":0.88}],"not_found":[],"conflicts":[],"warnings":[]}
+{"schema_version":5,"scope":{"type":"document","id":"D01"},"values":[{"field_id":"F001","value":1349,"unit":"USD_millions","document_id":"D01","page":7,"as_of_date":"2026-03-31","quote":"Implied Enterprise Value of $1,349 million","evidence_kind":"explicit_label","evidence_mode":"quote","evidence_explanation":null,"evidence_bbox":null,"model_confidence":0.88}],"not_found":[],"conflicts":[],"warnings":[]}
 {"schema_version":5,"scope":{"type":"document","id":"D01"},"values":[],"not_found":["F002"],"conflicts":[],"warnings":[]}
-{"schema_version":5,"scope":{"type":"deal","id":"D01-D02"},"values":[],"not_found":[],"conflicts":[{"field_id":"F003","reason":"different quarter-specific candidates","candidates":[{"value":100,"unit":"USD_millions","document_id":"D01","page":4,"as_of_date":"2026-03-31","quote":"Enterprise value was $100 million","evidence_kind":"table","model_confidence":0.84},{"value":92,"unit":"USD_millions","document_id":"D02","page":3,"as_of_date":"2025-12-31","quote":"Enterprise value was $92 million","evidence_kind":"explicit_label","model_confidence":0.76}]}],"warnings":[]}
+{"schema_version":5,"scope":{"type":"deal","id":"D01-D02"},"values":[],"not_found":[],"conflicts":[{"field_id":"F003","reason":"different quarter-specific candidates","candidates":[{"value":100,"unit":"USD_millions","document_id":"D01","page":4,"as_of_date":"2026-03-31","quote":"Enterprise value was $100 million","evidence_kind":"table","evidence_mode":"quote","evidence_explanation":null,"evidence_bbox":null,"model_confidence":0.84},{"value":92,"unit":"USD_millions","document_id":"D02","page":3,"as_of_date":"2025-12-31","quote":"Enterprise value was $92 million","evidence_kind":"explicit_label","evidence_mode":"quote","evidence_explanation":null,"evidence_bbox":null,"model_confidence":0.76}]}],"warnings":[]}
 </examples>
 """
 
@@ -470,6 +508,24 @@ def _confidence_number(value: object, *, default: float = 0.35) -> float:
     return number
 
 
+def _evidence_bbox(value: object, *, field_id: str) -> list[float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != 4:
+        raise StructuredResponseError(f"candidate {field_id!r} has invalid evidence_bbox {value!r}")
+    out: list[float] = []
+    for coord in value:
+        if isinstance(coord, bool) or not isinstance(coord, (int, float)):
+            raise StructuredResponseError(f"candidate {field_id!r} has non-numeric evidence_bbox coordinate")
+        number = float(coord)
+        if not math.isfinite(number):
+            raise StructuredResponseError(f"candidate {field_id!r} has non-finite evidence_bbox coordinate")
+        out.append(number)
+    if out[0] == out[2] or out[1] == out[3]:
+        raise StructuredResponseError(f"candidate {field_id!r} has empty evidence_bbox")
+    return out
+
+
 def _candidate_from_v5(item: dict, *, field_id: str | None = None) -> dict:
     fid = field_id or item.get("field_id")
     if not isinstance(fid, str) or not fid:
@@ -480,9 +536,33 @@ def _candidate_from_v5(item: dict, *, field_id: str | None = None) -> dict:
     document_id = item.get("document_id")
     if not isinstance(document_id, str) or not document_id.strip():
         raise StructuredResponseError(f"candidate {fid!r} missing document_id")
-    quote = item.get("quote")
-    if not isinstance(quote, str) or not quote.strip():
+    raw_quote = item.get("quote")
+    if raw_quote is None:
+        quote = ""
+    elif isinstance(raw_quote, str):
+        quote = raw_quote.strip()
+    else:
+        raise StructuredResponseError(f"candidate {fid!r} has invalid quote")
+    evidence_mode = item.get("evidence_mode") or "quote"
+    if evidence_mode not in ("quote", "visual_region", "reasoned"):
+        raise StructuredResponseError(f"candidate {fid!r} has invalid evidence_mode {evidence_mode!r}")
+    raw_explanation = item.get("evidence_explanation")
+    if raw_explanation is None:
+        explanation = ""
+    elif isinstance(raw_explanation, str):
+        explanation = raw_explanation.strip()
+    else:
+        raise StructuredResponseError(f"candidate {fid!r} has invalid evidence_explanation")
+    bbox = _evidence_bbox(item.get("evidence_bbox"), field_id=fid)
+    if evidence_mode == "quote" and not quote:
         raise StructuredResponseError(f"candidate {fid!r} missing quote")
+    if evidence_mode == "visual_region" and not (quote or explanation or bbox is not None):
+        raise StructuredResponseError(f"candidate {fid!r} missing visual evidence")
+    if evidence_mode == "reasoned":
+        if not explanation:
+            raise StructuredResponseError(f"candidate {fid!r} missing reasoned evidence explanation")
+        if bbox is not None:
+            raise StructuredResponseError(f"candidate {fid!r} reasoned evidence must not include a bbox")
     confidence = _confidence_number(item.get("model_confidence"), default=0.0)
     return {
         "field_key": fid,
@@ -493,6 +573,9 @@ def _candidate_from_v5(item: dict, *, field_id: str | None = None) -> dict:
         "document_id": document_id,
         "as_of_date": item.get("as_of_date"),
         "evidence_kind": item.get("evidence_kind") or "",
+        "evidence_mode": evidence_mode,
+        "evidence_explanation": explanation,
+        "evidence_bbox": bbox,
         "verbatim_quote": quote,
         "quote": quote,
         "confidence": confidence,

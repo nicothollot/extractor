@@ -89,7 +89,8 @@ def test_field_object_carries_embedded_provenance(fields):
     assert field_obj["additionalProperties"] is False
     assert set(field_obj["properties"]) == {
         "field_id", "value", "unit", "document_id", "page", "as_of_date",
-        "quote", "evidence_kind", "model_confidence",
+        "quote", "evidence_kind", "evidence_mode", "evidence_explanation",
+        "evidence_bbox", "model_confidence",
     }
     assert sorted(field_obj["required"]) == sorted(field_obj["properties"])
     assert field_obj["properties"]["model_confidence"]["type"] == "number"
@@ -130,6 +131,9 @@ def test_response_round_trips_sanitized_keys_back_to_headers(fields):
                 "as_of_date": None,
                 "quote": "x",
                 "evidence_kind": "explicit_label",
+                "evidence_mode": "quote",
+                "evidence_explanation": None,
+                "evidence_bbox": None,
                 "model_confidence": 0.92,
             }
             for field_key in key_map
@@ -141,6 +145,38 @@ def test_response_round_trips_sanitized_keys_back_to_headers(fields):
     flat = decode_structured_response(structured, fields)
     assert set(flat) == set(HEADERS)
     assert all(v["verbatim_quote"] == "x" for v in flat.values())
+
+
+def test_reasoned_value_decodes_without_quote(fields):
+    field_key = next(iter(sparse_response_key_map(fields)))
+    structured = {
+        "schema_version": 5,
+        "scope": {"type": "document", "id": "D01"},
+        "values": [
+            {
+                "field_id": field_key,
+                "value": "Yes",
+                "unit": None,
+                "document_id": "D01",
+                "page": 1,
+                "as_of_date": None,
+                "quote": None,
+                "evidence_kind": "inferred",
+                "evidence_mode": "reasoned",
+                "evidence_explanation": "The memo states the asset was sold after quarter-end.",
+                "evidence_bbox": None,
+                "model_confidence": 0.62,
+            }
+        ],
+        "not_found": [key for key in sparse_response_key_map(fields) if key != field_key],
+        "conflicts": [],
+        "warnings": [],
+    }
+    flat = decode_structured_response(structured, fields)
+    first = flat[sparse_response_key_map(fields)[field_key]]
+    assert first["evidence_mode"] == "reasoned"
+    assert first["verbatim_quote"] == ""
+    assert "sold after quarter-end" in first["evidence_explanation"]
 
 
 def test_legacy_response_still_decodes(fields):

@@ -790,7 +790,10 @@ def test_one_call_per_deal_extracts_all_documents_in_one_call(tmp_path):
     hits = {h.field: h for h in primary.assets[0].hits}
     assert hits["Gross IRR %"].value == 12.5
     assert hits["Gross IRR %"].method.startswith("llm:claude:")
-    assert hits["MOIC"].value == 1.4 and hits["MOIC"].page == 2
+    assert hits["MOIC"].value == 1.4 and hits["MOIC"].page == 1
+    assert hits["MOIC"].source_file == str(support_pdf)
+    assert hits["MOIC"].evidence_ref is not None
+    assert hits["MOIC"].evidence_ref.source_file == str(support_pdf)
 
 
 # ---------------------------------------------------------------------------

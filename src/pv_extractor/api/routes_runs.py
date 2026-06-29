@@ -236,6 +236,7 @@ def evidence_image(
     run_id: str, memo_id: str, request: Request,
     page: int, l: float | None = None, t: float | None = None,
     r: float | None = None, b: float | None = None,
+    source_file: str | None = None,
 ) -> FileResponse:
     """The source page as PNG, with the evidence bbox highlighted when all
     four coordinates are given (PDF points, from the audit's FieldHit)."""
@@ -243,19 +244,25 @@ def evidence_image(
     run_dir = _run_dir(config, run_id)
     bbox = (l, t, r, b) if None not in (l, t, r, b) else None
     try:
-        path = evidence_service.render_page(run_dir, config, memo_id, page, bbox)
+        path = evidence_service.render_page(run_dir, config, memo_id, page, bbox, source_file=source_file)
     except evidence_service.EvidenceError as exc:
         raise HTTPException(404, detail=str(exc)) from exc
     return FileResponse(path, media_type="image/png")
 
 
 @router.get("/runs/{run_id}/page-words/{memo_id}")
-def page_words(run_id: str, memo_id: str, request: Request, page: int) -> dict:
+def page_words(
+    run_id: str,
+    memo_id: str,
+    request: Request,
+    page: int,
+    source_file: str | None = None,
+) -> dict:
     """Page geometry + selectable word boxes for the Add-Value highlighter."""
     config = _config(request)
     run_dir = _run_dir(config, run_id)
     try:
-        return evidence_service.page_words(run_dir, config, memo_id, page)
+        return evidence_service.page_words(run_dir, config, memo_id, page, source_file=source_file)
     except evidence_service.EvidenceError as exc:
         raise HTTPException(404, detail=str(exc)) from exc
 

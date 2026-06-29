@@ -67,6 +67,27 @@ test("null geometry returns page-only fallback message", () => {
   assert.match(state.fallbackMessage ?? "", /no bbox/);
 });
 
+test("reasoned evidence carries explanation without a highlight box", () => {
+  const state = selectedHighlight({
+    page: 7,
+    bbox: null,
+    evidence_mode: "reasoned",
+    grounding_reason: "inferred from two statements on the cited page",
+    evidence_ref: {
+      display_page: 7,
+      source_file: "/pv/support.pdf",
+      bbox: null,
+      match_method: "llm_reasoned",
+      match_score: null,
+      no_geometry_reason: "no explicit highlightable value",
+    },
+  });
+  assert.equal(state.highlightPage, 7);
+  assert.equal(state.highlightBbox, null);
+  assert.equal(state.sourceFile, "/pv/support.pdf");
+  assert.match(state.fallbackMessage ?? "", /inferred/);
+});
+
 test("memo QA issues are looked up separately from field items", () => {
   const selected = { memo_id: "MEMO_001" };
   const issues = [

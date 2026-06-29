@@ -57,6 +57,7 @@ def task_cache_key(
     prompt_version: str,
     page_hashes: list[str],
     field_keys: list[str],
+    source_hashes: list[str] | None = None,
 ) -> str:
     """Cache key for one bounded assistance task.
 
@@ -69,6 +70,9 @@ def task_cache_key(
     digest.update(f"\x1fschema={schema_version}\x1fprompt={prompt_version}".encode("utf-8"))
     digest.update("\x1fpages=".encode("utf-8"))
     digest.update("\x1e".join(sorted(page_hashes)).encode("utf-8"))
+    if source_hashes:
+        digest.update("\x1fsources=".encode("utf-8"))
+        digest.update("\x1e".join(sorted(source_hashes)).encode("utf-8"))
     digest.update("\x1ffields=".encode("utf-8"))
     digest.update("\x1e".join(sorted(field_keys)).encode("utf-8"))
     digest.update(f"\x1fversion={LLM_VERSION}".encode("utf-8"))

@@ -449,6 +449,7 @@ function QueueForRun({ runId }: { runId: string }) {
                       fileName={selected.source_filename}
                       page={highlight.highlightPage}
                       bbox={highlight.highlightBbox}
+                      sourceFile={highlight.sourceFile}
                       className="max-h-[45vh]"
                     />
                     {highlight.fallbackMessage && (
@@ -560,6 +561,7 @@ function QueueForRun({ runId }: { runId: string }) {
           startPage={highlight.highlightPage ?? 1}
           highlightPage={highlight.highlightPage}
           highlightBbox={highlight.highlightBbox}
+          sourceFile={highlight.sourceFile}
           evidenceMeta={highlight}
           onClose={() => setViewerOpen(false)}
         />
@@ -591,12 +593,16 @@ function MemoIssueSummary({ issues }: { issues: MemoIssue[] }) {
 }
 
 function GroundingChip({ item }: { item: ReviewItem }) {
-  const label =
-    item.grounding_status === "box"
-      ? "grounded box"
-      : item.grounding_status === "page_only"
-        ? "page only"
-        : "no grounding";
+  let label = "no grounding";
+  if (item.evidence_mode === "reasoned") {
+    label = "reasoned";
+  } else if (item.evidence_mode === "visual_region") {
+    label = item.grounding_status === "box" ? "visual box" : "visual page";
+  } else if (item.grounding_status === "box") {
+    label = "grounded box";
+  } else if (item.grounding_status === "page_only") {
+    label = "page only";
+  }
   const title =
     item.evidence_ref?.match_method || item.grounding_reason
       ? `${item.evidence_ref?.match_method ?? "page_only"}${item.evidence_ref?.match_score !== null && item.evidence_ref?.match_score !== undefined ? ` · ${(item.evidence_ref.match_score * 100).toFixed(0)}%` : ""}${item.grounding_reason ? ` · ${item.grounding_reason}` : ""}`
@@ -623,6 +629,7 @@ function EvidencePageImage({
   fileName,
   page,
   bbox,
+  sourceFile,
   className = "",
 }: {
   runId: string;
@@ -630,6 +637,7 @@ function EvidencePageImage({
   fileName: string;
   page: number;
   bbox: number[] | null;
+  sourceFile?: string | null;
   className?: string;
 }) {
   const [pageInfo, setPageInfo] = useState<PageWords | null>(null);
@@ -637,13 +645,15 @@ function EvidencePageImage({
   useEffect(() => {
     let live = true;
     setPageInfo(null);
-    get<PageWords>(`/api/runs/${runId}/page-words/${memoId}?page=${page}`)
+    const params = new URLSearchParams({ page: String(page) });
+    if (sourceFile) params.set("source_file", sourceFile);
+    get<PageWords>(`/api/runs/${runId}/page-words/${memoId}?${params}`)
       .then((info) => live && setPageInfo(info))
       .catch(() => live && setPageInfo(null));
     return () => {
       live = false;
     };
-  }, [runId, memoId, page]);
+  }, [runId, memoId, page, sourceFile]);
 
   const style = pageInfo ? bboxToPercentStyle(bbox, { width: pageInfo.width, height: pageInfo.height }) : null;
 
@@ -651,7 +661,7 @@ function EvidencePageImage({
     <div className={`border border-line rounded overflow-auto bg-ink-100 ${className}`}>
       <div className="relative inline-block min-w-full">
         <img
-          src={evidenceUrl(runId, memoId, page, null)}
+          src={evidenceUrl(runId, memoId, page, null, sourceFile)}
           alt={`page ${page} of ${fileName}`}
           className="w-full block"
           loading="lazy"
@@ -707,7 +717,9 @@ function AddValueModal({
     let live = true;
     setWords(null);
     setBox(null);
-    get<PageWords>(`/api/runs/${item.run_id}/page-words/${item.memo_id}?page=${page}`)
+    const params = new URLSearchParams({ page: String(page) });
+    if (item.evidence_ref?.source_file) params.set("source_file", item.evidence_ref.source_file);
+    get<PageWords>(`/api/runs/${item.run_id}/page-words/${item.memo_id}?${params}`)
       .then((w) => live && setWords(w))
       .catch(() => live && setWords(null));
     return () => {
@@ -865,7 +877,7 @@ function AddValueModal({
               <img
                 ref={imgRef}
                 key={page}
-                src={evidenceUrl(item.run_id, item.memo_id, page, null)}
+                src={evidenceUrl(item.run_id, item.memo_id, page, null, item.evidence_ref?.source_file)}
                 alt={`page ${page}`}
                 className="block max-w-full pointer-events-none"
                 draggable={false}
@@ -945,6 +957,7 @@ function FullDocViewer({
   startPage,
   highlightPage,
   highlightBbox,
+  sourceFile,
   evidenceMeta,
   onClose,
 }: {
@@ -955,6 +968,7 @@ function FullDocViewer({
   startPage: number;
   highlightPage: number | null;
   highlightBbox: number[] | null;
+  sourceFile: string | null;
   evidenceMeta: ReturnType<typeof selectedHighlight>;
   onClose: () => void;
 }) {
@@ -1025,6 +1039,7 @@ function FullDocViewer({
             fileName={fileName}
             page={page}
             bbox={overlayForPage(page, highlightPage, highlightBbox)}
+            sourceFile={sourceFile}
             className="border-0 rounded-none max-w-full self-start"
           />
         </div>

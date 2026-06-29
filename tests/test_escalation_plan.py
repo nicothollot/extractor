@@ -47,19 +47,14 @@ def test_qa_fail_with_no_value_hits_still_escalates_value_fields():
     assert all(f.reason in ("required_empty", "qa_fail_rescue") for f in plan.fields)
 
 
-def test_qa_pass_without_force_uses_primary_catalog_not_broad_rescue():
-    """A clean pass still builds the LLM-extractable primary catalog, but does
-    not use broad rescue/force reasons."""
+def test_qa_pass_without_force_skips_primary_catalog():
+    """A clean pass does not spend LLM calls on the whole extractable catalog."""
     asset = _asset(QaStatus.qa_pass, hits=[_hit(VALUE_HEADER, 100.0, 0.95)])
     plan = _build_escalation(
         "MEMO_X_001", [asset], BY_HEADER, {}, 0.75,
         force_assist=False, derived_headers=set(),
     )
-    reasons = {f.reason for f in plan.fields}
-    assert "qa_fail_rescue" not in reasons
-    assert "force_llm_assist" not in reasons
-    assert VALUE_HEADER in {f.field for f in plan.fields}
-    assert reasons <= {"primary_catalog", "below_confidence", "required_empty"}
+    assert plan.fields == []
 
 
 def test_force_assist_escalates_even_on_clean_pass():
@@ -70,10 +65,8 @@ def test_force_assist_escalates_even_on_clean_pass():
         force_assist=True, derived_headers=set(),
     )
     headers = {f.field for f in plan.fields}
-    # The populated value field is included in the primary catalog, while other
-    # empty extractable fields are tagged force_llm_assist.
     assert plan.fields
-    assert VALUE_HEADER in headers
+    assert VALUE_HEADER in headers  # force-assist is explicitly LLM-primary
     assert any(f.reason == "force_llm_assist" for f in plan.fields)
 
 

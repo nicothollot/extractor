@@ -18,11 +18,12 @@ Design points:
   * Phase-3 escalation: per memo, fields below extraction.confidence_threshold
     plus required-but-empty fields become an EscalationPlan. When an asset
     QA-FAILS (e.g. the engine recognized nothing and found no valuation value)
-    OR llm_settings.force_assist is set, the plan ALSO broadens to every empty
-    LLM-extractable field (excludes IDENTIFICATION/QA/THRESHOLD bands, computed
-    fields per rule 7, and positional slots) — so a memo the deterministic
-    engine could not parse still gets a real LLM second pass instead of an empty
-    plan. force_assist additionally bypasses the deterministic result cache (a
+    the plan ALSO broadens to every empty LLM-extractable field; when
+    llm_settings.force_assist is set, it broadens to the full LLM-extractable
+    field set (excludes IDENTIFICATION/QA/THRESHOLD bands, computed fields per
+    rule 7, and positional slots) — so a memo the deterministic engine could
+    not parse still gets a real LLM second pass instead of an empty plan.
+    force_assist additionally bypasses the deterministic result cache (a
     cached memo carries the OLD narrow plan) and is never written back to it.
     When LLM settings are supplied (CLI default unless --no-llm), the plans are executed through
     hidden local provider sessions (llm/escalate.py) AFTER the deterministic
@@ -646,11 +647,10 @@ def _build_escalation(
 
     Always escalates below-confidence hits and required-but-empty fields. When
     an asset QA-FAILED (e.g. the deterministic engine recognized nothing and
-    found no valuation value) OR force_assist is set, ALSO escalates every empty
-    LLM-extractable field for that asset — so a memo the engine could not parse
-    still gets a real LLM second pass instead of silently coming back empty.
-    force_assist applies this to every asset regardless of QA outcome (the
-    analyst chose 'use the LLM to extract')."""
+    found no valuation value), ALSO escalates every empty LLM-extractable field
+    for that asset. A clean QA-pass asset does not send the whole primary
+    catalog to the LLM. force_assist applies full broad extraction to every
+    asset regardless of QA outcome."""
     derived_headers = derived_headers or set()
     fields: list[EscalationField] = []
     seen: set[tuple[str, str]] = set()
@@ -687,9 +687,11 @@ def _build_escalation(
             elif schema_field.required and schema_field.header not in populated:
                 reason = "required_empty"
             elif broad:
+                if not force_assist and schema_field.header in populated:
+                    continue
                 reason = "force_llm_assist" if force_assist else "qa_fail_rescue"
             else:
-                reason = "primary_catalog"
+                continue
             key = (asset.row_memo_id, schema_field.header)
             if key in seen:
                 continue

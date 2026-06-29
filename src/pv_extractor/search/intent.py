@@ -273,21 +273,23 @@ def resolve_intent(
     """Resolve free text into a (DocTypeSpec, provenance) pair.
 
     The rule layer ALWAYS runs first and always yields a valid spec. The CLI
-    layer only fires when (use_cli if not None else
-    config.smart_search.use_cli_fallback) is True; it can only ADD anchors and
-    never blocks — any failure leaves the rule spec untouched. provenance is
-    'rules' or 'rules+cli'. `conn` is accepted for symmetry/future profile
-    persistence; resolution itself needs no DB.
+    layer fires only when explicitly forced with use_cli=True, or when the
+    configured fallback is enabled and the rule layer did not match a known
+    phrase. It can only ADD anchors and never blocks — any failure leaves the
+    rule spec untouched. provenance is 'rules' or 'rules+cli'. `conn` is
+    accepted for symmetry/future profile persistence; resolution itself needs
+    no DB.
     """
     # The rule layer is the mandatory self-sufficient path: it must never raise.
     # normalize_text/DocTypeSpec don't raise on a str, but guard defensively so
     # a pathological query still yields a usable (empty-include) spec.
     try:
-        spec, _matched = _rule_spec(query, config)
+        spec, matched = _rule_spec(query, config)
     except Exception as exc:  # noqa: BLE001 — the no-LLM contract must always return a spec
         log_event(logger, "smart search rule layer fell back to empty spec", error=str(exc))
         spec = DocTypeSpec(slug=_slug_from_query(query), label=query.strip() or "Search")
-    want_cli = config.smart_search.use_cli_fallback if use_cli is None else use_cli
+        matched = False
+    want_cli = bool(use_cli) if use_cli is not None else (config.smart_search.use_cli_fallback and not matched)
     provenance = "rules"
     if want_cli:
         if _cli_augment(spec, query, config, cc_client=cc_client):

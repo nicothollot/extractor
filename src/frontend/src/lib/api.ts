@@ -164,7 +164,14 @@ export interface EvidenceRef {
   raw_text: string;
   bbox: number[] | null;
   bbox_coordinate_system: "pdf_points_topleft_page_rect" | string;
-  match_method: "native_text" | "table_cell" | "ocr_word_alignment" | "manual_box" | "page_only";
+  match_method:
+    | "native_text"
+    | "table_cell"
+    | "ocr_word_alignment"
+    | "manual_box"
+    | "llm_visual_region"
+    | "llm_reasoned"
+    | "page_only";
   match_score: number | null;
   word_ids: string[];
   span_ids: string[];
@@ -208,6 +215,7 @@ export interface ReviewItem {
   evidence: string;
   evidence_ref: EvidenceRef | null;
   evidence_refs: EvidenceRef[];
+  evidence_mode: "quote" | "visual_region" | "reasoned" | string;
   grounding_status: "box" | "page_only" | "none" | string;
   grounding_reason: string;
   issue_code: string;
@@ -739,7 +747,13 @@ export interface ClientsStatus {
   db_error?: string | null;
 }
 
-export const evidenceUrl = (runId: string, memoId: string, page: number, bbox: number[] | null) => {
+export const evidenceUrl = (
+  runId: string,
+  memoId: string,
+  page: number,
+  bbox: number[] | null,
+  sourceFile?: string | null,
+) => {
   const params = new URLSearchParams({ page: String(page) });
   if (bbox && bbox.length === 4) {
     params.set("l", String(bbox[0]));
@@ -747,6 +761,7 @@ export const evidenceUrl = (runId: string, memoId: string, page: number, bbox: n
     params.set("r", String(bbox[2]));
     params.set("b", String(bbox[3]));
   }
+  if (sourceFile) params.set("source_file", sourceFile);
   return `/api/runs/${runId}/evidence/${memoId}?${params}`;
 };
 

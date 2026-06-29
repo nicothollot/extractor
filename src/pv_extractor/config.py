@@ -207,7 +207,7 @@ class DealDiscoveryLlmConfig(BaseModel):
     # Alias resolved against config/models.yaml; latest_alias entries float to
     # the newest model of that tier as Claude Code updates, so a cheap default
     # keeps pointing at the current cheap tier without config edits.
-    model: str = "sonnet"
+    model: str = "haiku"
     effort: str = "low"
     trigger_confidence: float = 0.45  # auto-assist when the best heuristic deal scores below this
     timeout_seconds: int = 300
@@ -321,7 +321,7 @@ class SmartSearchConfig(BaseModel):
 
     enabled: bool = True
     use_cli_fallback: bool = True  # optional Claude Code assist for ambiguous queries
-    cli_model: str = "sonnet"  # ALIAS from config/models.yaml — floats to current cheap tier
+    cli_model: str = "haiku"  # ALIAS from config/models.yaml — floats to current cheap tier
     cli_effort: str = "low"
     bm25_k1: float = 1.2  # BM25 term-frequency saturation
     bm25_b: float = 0.75  # BM25 length normalization
@@ -621,11 +621,11 @@ class LlmConfig(BaseModel):
     workers: int = 2  # hidden local provider session queue concurrency (keep 1-2)
     models_path: str = "./config/models.yaml"
     cache_enabled: bool = True  # response cache; --force-llm bypasses reads
-    # Direct document read: copy the SOURCE document into the call's working dir
-    # and have the model Read it with its own tool, instead of pre-assembling a
-    # rasterized/OCR'd page payload + embedding it in the prompt. The model reads
-    # the real PDF (native tables/scans), the prompt stays small, and the call
-    # completes fast — the assembled-payload path was timing out on large memos.
+    # Direct document read: allow copying the SOURCE document into the call's
+    # working dir so hard cases can use the provider's Read tool. Ordinary
+    # text-first tasks still use the bounded embedded page payload because it is
+    # cheaper and easier to quote-ground; image-heavy and LLM-first tasks use
+    # source reads when this is enabled.
     direct_document_read: bool = True
     # Split each document's escalated fields into this many near-equal batches,
     # each its OWN provider call (191 fields, field_batch_count=4 -> 4 calls of

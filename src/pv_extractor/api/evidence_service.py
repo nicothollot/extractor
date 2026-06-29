@@ -26,22 +26,46 @@ class EvidenceError(RuntimeError):
     pass
 
 
+def _known_source_files(audit: dict) -> set[str]:
+    out = {str(audit.get("file_path") or "")}
+    for asset in audit.get("assets", []):
+        for hit in asset.get("hits", []):
+            if hit.get("source_file"):
+                out.add(str(hit["source_file"]))
+            ref = hit.get("evidence_ref") or {}
+            if isinstance(ref, dict) and ref.get("source_file"):
+                out.add(str(ref["source_file"]))
+            for conflict in hit.get("conflicts") or []:
+                conflict_ref = conflict.get("evidence_ref") if isinstance(conflict, dict) else None
+                if isinstance(conflict_ref, dict) and conflict_ref.get("source_file"):
+                    out.add(str(conflict_ref["source_file"]))
+    return {path for path in out if path}
+
+
+def _source_file_from_audit(audit: dict, config: Config, source_file: str | None) -> str:
+    file_path = source_file or audit.get("file_path")
+    if not file_path:
+        raise EvidenceError("audit carries no source path")
+    if source_file is not None and str(source_file) not in _known_source_files(audit):
+        raise EvidenceError("source file is not referenced by this audit")
+    if Path(file_path).suffix.lower() != ".pdf":
+        raise EvidenceError("page rendering is only available for PDF sources")
+    return str(file_path)
+
+
 def render_page(
     run_dir: Path,
     config: Config,
     memo_id: str,
     page_number: int,
     bbox: tuple[float, float, float, float] | None = None,
+    source_file: str | None = None,
 ) -> Path:
     """Render one source page to a cached PNG; returns the PNG path."""
     audit = runs_service.load_audit(run_dir, memo_id)
     if audit is None:
         raise EvidenceError(f"no audit record for memo {memo_id!r}")
-    file_path = audit.get("file_path")
-    if not file_path:
-        raise EvidenceError(f"audit for {memo_id!r} carries no source path")
-    if audit.get("reader") != "pdf":
-        raise EvidenceError(f"page rendering is only available for PDF sources (reader={audit.get('reader')!r})")
+    file_path = _source_file_from_audit(audit, config, source_file)
 
     dpi = config.gui.evidence_dpi
     key = hashlib.sha1(
@@ -132,7 +156,13 @@ def render_file_page(
     return png_path
 
 
-def page_words(run_dir: Path, config: Config, memo_id: str, page_number: int) -> dict:
+def page_words(
+    run_dir: Path,
+    config: Config,
+    memo_id: str,
+    page_number: int,
+    source_file: str | None = None,
+) -> dict:
     """Page geometry + word boxes (PDF points) for the Add-Value highlighter.
 
     The frontend overlays selectable word spans on the rendered page so the
@@ -142,13 +172,7 @@ def page_words(run_dir: Path, config: Config, memo_id: str, page_number: int) ->
     audit = runs_service.load_audit(run_dir, memo_id)
     if audit is None:
         raise EvidenceError(f"no audit record for memo {memo_id!r}")
-    file_path = audit.get("file_path")
-    if not file_path:
-        raise EvidenceError(f"audit for {memo_id!r} carries no source path")
-    if audit.get("reader") != "pdf":
-        raise EvidenceError(
-            f"word extraction is only available for PDF sources (reader={audit.get('reader')!r})"
-        )
+    file_path = _source_file_from_audit(audit, config, source_file)
 
     with open_read(file_path) as fh:
         data = fh.read()

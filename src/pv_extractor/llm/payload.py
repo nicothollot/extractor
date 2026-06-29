@@ -67,25 +67,103 @@ class MemoPayload:
     # payload dir for direct_document_read — the model reads these with its own
     # tool instead of consuming a pre-rendered page payload.
     source_documents: list[tuple[str, str]] = field(default_factory=list)
+    # Original source paths/hashes keyed by document_id. These are used for
+    # review rendering and cache invalidation; the model only sees the copied
+    # relative filenames above.
+    source_document_paths: dict[str, str] = field(default_factory=dict)
+    source_document_hashes: dict[str, str] = field(default_factory=dict)
+    source_document_sizes: dict[str, int] = field(default_factory=dict)
+    # Direct-read citations use document-local page numbers, while embedded
+    # multi-document prompts use a global page sequence. This map bridges them.
+    source_page_map: dict[str, int] = field(default_factory=dict)  # "D01:7" -> global page
+    page_sources: dict[int, dict[str, object]] = field(default_factory=dict)
 
-    def read_instruction(self) -> str:
+    def read_instruction(self, pages: list[int] | None = None) -> str:
         """Prompt section for direct_document_read: point the model at the real
         source files in its working directory and have it Read them, instead of
         embedding a rasterized/OCR'd page payload. Cite the document_id we assign
         here so values map back to the right document."""
         if not self.source_documents:
             return self.dynamic_prompt  # nothing copied — fall back to the payload
+        wanted_pages = sorted(set(pages or []))
+        wanted_doc_ids = {
+            str(info.get("document_id"))
+            for number, info in self.page_sources.items()
+            if not wanted_pages or number in wanted_pages
+        }
+        if not wanted_doc_ids:
+            wanted_doc_ids = {doc_id for doc_id, _name in self.source_documents}
         lines = ["== SOURCE DOCUMENTS =="]
         for doc_id, name in self.source_documents:
+            if doc_id not in wanted_doc_ids:
+                continue
             lines.append(f'- document_id {doc_id}: "{name}"')
+        if wanted_pages and self.page_sources:
+            lines.append("")
+            lines.append("Relevant pages from the bounded extraction plan:")
+            for global_page in wanted_pages:
+                info = self.page_sources.get(global_page)
+                if not info:
+                    continue
+                doc_id = info.get("document_id")
+                doc_page = info.get("document_page")
+                label = info.get("label") or doc_id
+                lines.append(f"- prompt page {global_page}: document_id {doc_id}, document page {doc_page} ({label})")
         lines.append("")
         lines.append(
             "Each document above is a real file in your current working directory. "
-            "Use the Read tool to read each one IN FULL (every page) before you "
-            "answer. Cite that document_id and the page number for every value. "
-            "Read the actual documents — do not guess."
+            "Use the Read tool to inspect the relevant pages first, then read "
+            "additional pages only when needed to answer a requested field. Cite "
+            "the document_id and that document's own 1-based page number for every "
+            "value. Read the actual documents; do not guess."
         )
         return "\n".join(lines) + "\n"
+
+    def resolve_citation(self, document_id: str | None, page: int | None) -> tuple[int | None, dict[str, object] | None]:
+        """Return (global_page_for_grounding, source_info) for an LLM citation.
+
+        Single-document payloads use the same page number for both concepts.
+        Combined deal payloads ask the model to cite document-local pages; this
+        maps that citation back to the global page used by page_texts/page_words.
+        """
+        if page is None:
+            return None, None
+        if document_id:
+            global_page = self.source_page_map.get(f"{document_id}:{page}")
+            if global_page is not None:
+                return global_page, self.page_sources.get(global_page)
+        return page, self.page_sources.get(page)
+
+    def selected_source_hashes(self, pages: list[int]) -> list[str]:
+        """Source-document hashes for direct-read cache keys."""
+        doc_ids = {
+            str(info.get("document_id"))
+            for number, info in self.page_sources.items()
+            if number in set(pages)
+        }
+        if not doc_ids:
+            doc_ids = set(self.source_document_hashes)
+        return [
+            f"{doc_id}:{self.source_document_hashes[doc_id]}"
+            for doc_id in sorted(doc_ids)
+            if doc_id in self.source_document_hashes
+        ]
+
+    def source_read_estimate_chars(self, pages: list[int]) -> int:
+        """Conservative prompt-size proxy for direct-read budget reservation.
+
+        The provider may read source PDFs outside the prompt text. Use local page
+        text plus a small source-byte proxy so unpriced/default models still
+        reserve non-zero budget for direct reads.
+        """
+        doc_ids = {
+            str(info.get("document_id"))
+            for number, info in self.page_sources.items()
+            if number in set(pages)
+        }
+        page_chars = sum(len(self.page_texts.get(number, "")) for number in set(pages))
+        size_proxy = sum(min(self.source_document_sizes.get(doc_id, 0), 200_000) // 4 for doc_id in doc_ids)
+        return max(page_chars, size_proxy)
 
     def page_kind(self, number: int) -> str:
         """'image' | 'text' for a page in this payload (defaults to 'text')."""
@@ -231,16 +309,16 @@ def _write_payload_file(path: Path, data: bytes, pv_root: str) -> str:
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def _copy_source_document(file_path: str, payload_dir: Path, doc_id: str, pv_root: str) -> str:
+def _copy_source_document(file_path: str, payload_dir: Path, doc_id: str, pv_root: str) -> tuple[str, str, int]:
     """Copy the source document (read-only) into the payload dir so the model can
-    Read it directly. Returns the relative filename to cite in the prompt."""
+    Read it directly. Returns (relative filename, sha256, byte length)."""
     src = Path(file_path)
     safe = _SAFE_NAME_RE.sub("_", src.name) or f"{doc_id}{src.suffix.lower()}"
     rel = f"{doc_id}_{safe}"
     with open_read(file_path) as fh:
         data = fh.read()
-    _write_payload_file(payload_dir / rel, data, pv_root)
-    return rel
+    digest = _write_payload_file(payload_dir / rel, data, pv_root)
+    return rel, digest, len(data)
 
 
 def assemble_payload(
@@ -295,12 +373,22 @@ def assemble_payload(
 
     payload = MemoPayload(directory=payload_dir)
     if config.llm.direct_document_read:
-        rel = _copy_source_document(file_path, payload_dir, "D01", config.pv_root)
+        rel, digest, size = _copy_source_document(file_path, payload_dir, "D01", config.pv_root)
         payload.source_documents.append(("D01", rel))
+        payload.source_document_paths["D01"] = file_path
+        payload.source_document_hashes["D01"] = digest
+        payload.source_document_sizes["D01"] = size
     prompt_sections: list[str] = ["== DOCUMENT PAGES =="]
     block_start = len(prompt_sections)
     for number in selected:
         page = pages_by_number[number]
+        payload.source_page_map[f"D01:{number}"] = number
+        payload.page_sources[number] = {
+            "document_id": "D01",
+            "document_page": number,
+            "source_file": file_path,
+            "label": Path(file_path).name,
+        }
         # A SCANNED page that OCR'd cleanly is sent as TEXT, not an image: the
         # Read-tool/vision path is slow (huge output, re-done per call) and the
         # OCR text is reliable at high confidence. IMAGE_TABLE always stays an
@@ -361,7 +449,17 @@ def assemble_payload(
             {"number": p.number, "page_class": p.page_class.value, "kind": p.kind,
              "file": p.rel_path, "sha256": p.sha256}
             for p in payload.pages
-        ]
+        ],
+        "source_documents": [
+            {
+                "document_id": doc_id,
+                "file": rel,
+                "sha256": payload.source_document_hashes.get(doc_id),
+                "source_file": payload.source_document_paths.get(doc_id),
+            }
+            for doc_id, rel in payload.source_documents
+        ],
+        "page_sources": payload.page_sources,
     }
     manifest_bytes = json.dumps(
         manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -411,6 +509,7 @@ def assemble_deal_payload(
     for doc_index, (file_path, label) in enumerate(files):
         if global_no >= total_cap:
             break
+        doc_id = f"D{doc_index + 1:02d}"
         extension = Path(file_path).suffix.lower()
         reader = reader_for_extension(extension, config.extraction.page_classification)
         if reader is None:
@@ -430,9 +529,11 @@ def assemble_deal_payload(
         readable += 1
 
         if config.llm.direct_document_read:
-            doc_id = f"D{doc_index + 1:02d}"
-            src_rel = _copy_source_document(file_path, payload_dir, doc_id, config.pv_root)
+            src_rel, digest, size = _copy_source_document(file_path, payload_dir, doc_id, config.pv_root)
             payload.source_documents.append((doc_id, src_rel))
+            payload.source_document_paths[doc_id] = file_path
+            payload.source_document_hashes[doc_id] = digest
+            payload.source_document_sizes[doc_id] = size
 
         doc_cap = min(per_doc_cap, total_cap - global_no)
         if content.page_count <= doc_cap:
@@ -475,6 +576,13 @@ def assemble_deal_payload(
                 break
             page = pages_by_number[number]
             global_no += 1
+            payload.source_page_map[f"{doc_id}:{number}"] = global_no
+            payload.page_sources[global_no] = {
+                "document_id": doc_id,
+                "document_page": number,
+                "source_file": file_path,
+                "label": label,
+            }
             high_ocr_text = (
                 page.page_class is PageClass.SCANNED
                 and config.llm.prefer_ocr_text_over_image
@@ -536,6 +644,16 @@ def assemble_deal_payload(
             for p in payload.pages
         ],
         "documents": manifest_docs,
+        "source_documents": [
+            {
+                "document_id": doc_id,
+                "file": rel,
+                "sha256": payload.source_document_hashes.get(doc_id),
+                "source_file": payload.source_document_paths.get(doc_id),
+            }
+            for doc_id, rel in payload.source_documents
+        ],
+        "page_sources": payload.page_sources,
     }
     manifest_bytes = json.dumps(
         manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False

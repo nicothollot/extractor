@@ -429,3 +429,31 @@ class ModelRegistry:
             + usage.cache_creation_input_tokens * p.cache_write_5m
         ) / 1_000_000.0
         return round(cost, 6)
+
+    def fallback_cost_usd(self, usage: LlmUsage, *, provider: str | None = None) -> float | None:
+        """Conservative estimate for an unpriced/default model.
+
+        Uses the highest configured price for the provider when available, or
+        across all configured models otherwise. This is a budget reservation
+        guardrail, not a claim about actual provider billing.
+        """
+        priced = [
+            entry.pricing_per_mtok
+            for entry in self.menu.models
+            if entry.pricing_per_mtok is not None and (provider is None or entry.provider == provider)
+        ]
+        if not priced and provider is not None:
+            priced = [entry.pricing_per_mtok for entry in self.menu.models if entry.pricing_per_mtok is not None]
+        if not priced:
+            return None
+        input_price = max(p.input for p in priced if p is not None)
+        output_price = max(p.output for p in priced if p is not None)
+        cache_hit_price = max(p.cache_hit for p in priced if p is not None)
+        cache_write_price = max(p.cache_write_5m for p in priced if p is not None)
+        cost = (
+            usage.input_tokens * input_price
+            + usage.output_tokens * output_price
+            + usage.cache_read_input_tokens * cache_hit_price
+            + usage.cache_creation_input_tokens * cache_write_price
+        ) / 1_000_000.0
+        return round(cost, 6)

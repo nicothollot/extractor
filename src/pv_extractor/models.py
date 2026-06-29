@@ -385,6 +385,8 @@ class EvidenceMatchMethod(str, enum.Enum):
     table_cell = "table_cell"
     ocr_word_alignment = "ocr_word_alignment"
     manual_box = "manual_box"
+    llm_visual_region = "llm_visual_region"
+    llm_reasoned = "llm_reasoned"
     page_only = "page_only"
 
 

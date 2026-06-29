@@ -147,7 +147,7 @@ def test_field_batch_count_splits_into_n_calls(tmp_path):
     assert len({t.record.task_id for t in planned.tasks}) == 4  # unique ids
 
 
-def test_normal_mode_catalog_includes_protected_deterministic_field(tmp_path):
+def test_normal_mode_skips_protected_deterministic_field(tmp_path):
     config = make_config(tmp_path)
     value_field = BY_HEADER["Implied EV ($M)"]
     asset = AssetExtraction(
@@ -160,8 +160,7 @@ def test_normal_mode_catalog_includes_protected_deterministic_field(tmp_path):
     )
     plan = _build_escalation("MEMO_X", [asset], BY_HEADER, {}, 0.75)
     by_field = {field.field: field for field in plan.fields}
-    assert value_field.header in by_field
-    assert by_field[value_field.header].reason == "primary_catalog"
+    assert value_field.header not in by_field
 
 
 def test_force_assist_broadens_but_still_one_primary_task(tmp_path):
@@ -242,6 +241,7 @@ def test_task_cache_key_changes_for_schema_prompt_provider_page_and_fields():
         ("schema_version", 1),
         ("prompt_version", "p2"),
         ("page_hashes", ["1:text:b"]),
+        ("source_hashes", ["D01:source-b"]),
         ("field_keys", ["MOIC"]),
     ]:
         changed = dict(base)

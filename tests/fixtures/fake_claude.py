@@ -26,6 +26,9 @@ def field_result(
     quote: str = "",
     confidence: str = "high",
     not_found: bool = False,
+    evidence_mode: str = "quote",
+    evidence_explanation: str | None = None,
+    evidence_bbox: list[float] | None = None,
 ) -> dict:
     """One response field object in the rule-5 provenance shape."""
     return {
@@ -35,6 +38,9 @@ def field_result(
         "verbatim_quote": quote,
         "confidence": confidence,
         "not_found": not_found,
+        "evidence_mode": evidence_mode,
+        "evidence_explanation": evidence_explanation,
+        "evidence_bbox": evidence_bbox,
     }
 
 
@@ -114,6 +120,9 @@ def sparse_response(
                 "as_of_date": value.get("as_of_date"),
                 "quote": value.get("verbatim_quote") or value.get("evidence_quote") or value.get("quote") or "",
                 "evidence_kind": value.get("evidence_kind") or "explicit_label",
+                "evidence_mode": value.get("evidence_mode") or "quote",
+                "evidence_explanation": value.get("evidence_explanation"),
+                "evidence_bbox": value.get("evidence_bbox"),
                 "model_confidence": float(score) if isinstance(score, (int, float)) else 0.35,
             }
         )

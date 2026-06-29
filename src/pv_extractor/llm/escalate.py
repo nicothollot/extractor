@@ -85,6 +85,8 @@ from pv_extractor.models import (
     AssetExtraction,
     ConflictingCandidate,
     EscalationField,
+    EvidenceMatchMethod,
+    EvidenceRef,
     FieldHit,
     FlagSeverity,
     LlmAttempt,
@@ -314,6 +316,196 @@ def quote_grounding(
     return ground_quote(quote, page, payload, fuzzy_threshold, text_fuzzy_threshold).status
 
 
+def _should_use_direct_read(
+    *,
+    config: Config,
+    settings: LlmSettings,
+    payload: MemoPayload,
+    pages: list[int],
+) -> bool:
+    """Use source-file Read only for cases where it pays for itself.
+
+    Text-first bounded prompts are cheaper and easier to ground locally. Direct
+    file reads are retained for image/scan-heavy pages and explicit LLM-first
+    runs where the model is expected to inspect the source document natively.
+    """
+    if not config.llm.direct_document_read or not payload.source_documents:
+        return False
+    if settings.force_assist:
+        return True
+    if payload.scoped_image_count(pages) > 0:
+        return True
+    scoped = payload.scoped_prompt(pages).strip()
+    return not scoped or scoped == "== DOCUMENT PAGES =="
+
+
+def _bbox_tuple(value: object) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        coords = tuple(float(v) for v in value)
+    except (TypeError, ValueError):
+        return None
+    if coords[0] == coords[2] or coords[1] == coords[3]:
+        return None
+    return coords  # renderer clamps to the actual page rectangle
+
+
+def _source_info(
+    payload: MemoPayload,
+    *,
+    document_id: str | None,
+    cited_page: int | None,
+) -> tuple[int | None, int | None, str | None, str | None]:
+    global_page, info = payload.resolve_citation(document_id, cited_page)
+    display_page = cited_page
+    source_file = payload.source_document_paths.get(document_id or "") if document_id else None
+    source_id = document_id
+    if info:
+        source_id = str(info.get("document_id") or document_id or "")
+        source_file = str(info.get("source_file") or source_file or "")
+        doc_page = info.get("document_page")
+        if isinstance(doc_page, int):
+            display_page = doc_page
+    return global_page, display_page, source_file or None, source_id or None
+
+
+def _with_source_ref(
+    ref: EvidenceRef | None,
+    *,
+    payload: MemoPayload,
+    document_id: str | None,
+    cited_page: int | None,
+    provider: str,
+    method: str,
+) -> EvidenceRef | None:
+    if ref is None:
+        return None
+    _global_page, display_page, source_file, source_id = _source_info(
+        payload, document_id=document_id, cited_page=cited_page
+    )
+    update = {
+        "provider": provider,
+        "extraction_method": method,
+    }
+    if display_page is not None:
+        update["display_page"] = display_page
+        update["pdf_page_index"] = display_page - 1
+    if source_file:
+        update["source_file"] = source_file
+    if source_id:
+        update["source_id"] = source_id
+    return ref.model_copy(update=update)
+
+
+def _ground_result(
+    result: dict,
+    *,
+    payload: MemoPayload,
+    config: Config,
+    provider: str,
+    method: str,
+) -> tuple[GroundingResult, str, int | None, str]:
+    quote = str(result.get("verbatim_quote") or result.get("evidence_quote") or result.get("quote") or "").strip()
+    explanation = str(result.get("evidence_explanation") or "").strip()
+    evidence_mode = str(result.get("evidence_mode") or "quote")
+    document_id = str(result.get("document_id") or "D01")
+    cited_page = result.get("page") if isinstance(result.get("page"), int) else None
+    global_page, display_page, source_file, source_id = _source_info(
+        payload, document_id=document_id, cited_page=cited_page
+    )
+    bbox = _bbox_tuple(result.get("evidence_bbox"))
+    evidence_text = quote or explanation
+
+    if evidence_mode == "reasoned":
+        ref = EvidenceRef(
+            source_id=source_id,
+            source_file=source_file,
+            display_page=display_page,
+            quote=explanation[:500],
+            raw_text=str(result.get("value") or ""),
+            match_method=EvidenceMatchMethod.llm_reasoned,
+            match_score=None,
+            provenance="llm_reasoning",
+            provider=provider,
+            extraction_method=method,
+            no_geometry_reason=explanation or "LLM supplied a reasoned value without highlightable evidence",
+        )
+        return (
+            GroundingResult(
+                "unverifiable", 0.0, explanation[:200], display_page,
+                "reasoned value has no highlightable source region", evidence_ref=ref,
+            ),
+            evidence_text,
+            display_page,
+            evidence_mode,
+        )
+
+    if evidence_mode == "visual_region" and bbox is not None:
+        ref = EvidenceRef(
+            source_id=source_id,
+            source_file=source_file,
+            display_page=display_page,
+            quote=quote[:500],
+            raw_text=explanation[:500],
+            bbox=bbox,
+            match_method=EvidenceMatchMethod.llm_visual_region,
+            match_score=None,
+            provenance="llm_visual_region",
+            provider=provider,
+            extraction_method=method,
+            no_geometry_reason=None,
+        )
+        return (
+            GroundingResult(
+                "grounded", 1.0, evidence_text[:200], display_page,
+                "LLM supplied visual evidence region", bbox=bbox, evidence_ref=ref,
+            ),
+            evidence_text,
+            display_page,
+            evidence_mode,
+        )
+
+    grounding = ground_quote(
+        quote,
+        global_page,
+        payload,
+        config.llm.quote_match_threshold,
+        config.llm.text_quote_match_threshold,
+    )
+    ref = _with_source_ref(
+        grounding.evidence_ref,
+        payload=payload,
+        document_id=document_id,
+        cited_page=cited_page,
+        provider=provider,
+        method=method,
+    )
+    if evidence_mode == "visual_region" and ref is not None:
+        ref = ref.model_copy(
+            update={
+                "raw_text": explanation[:500] or ref.raw_text,
+                "match_method": EvidenceMatchMethod.llm_visual_region if ref.bbox is not None else ref.match_method,
+                "provenance": "llm_visual_region",
+                "no_geometry_reason": ref.no_geometry_reason or "visual evidence did not include a bbox",
+            }
+        )
+    return (
+        GroundingResult(
+            grounding.status,
+            grounding.score,
+            grounding.matched_text,
+            display_page,
+            grounding.reason,
+            bbox=grounding.bbox,
+            evidence_ref=ref,
+        ),
+        evidence_text,
+        display_page,
+        evidence_mode,
+    )
+
+
 # ---------------------------------------------------------------------------
 # value coercion
 # ---------------------------------------------------------------------------
@@ -403,34 +595,29 @@ def _merge_field(
 
     if result.get("conflict_candidates"):
         candidates: list[Candidate] = []
+        candidate_pairs: list[tuple[dict, Candidate]] = []
         for raw_candidate in result.get("conflict_candidates") or []:
             if not isinstance(raw_candidate, dict):
                 continue
-            candidate_quote = str(
-                raw_candidate.get("verbatim_quote")
-                or raw_candidate.get("quote")
-                or raw_candidate.get("evidence_quote")
-                or ""
+            candidate_grounding, candidate_evidence, _candidate_page, _candidate_mode = _ground_result(
+                raw_candidate,
+                payload=payload,
+                config=config,
+                provider=selection.entry.provider,
+                method=method,
             )
-            candidate_page = (
-                raw_candidate.get("page") if isinstance(raw_candidate.get("page"), int) else None
+            candidate = Candidate.from_result(
+                header,
+                {**raw_candidate, "quote": candidate_evidence},
+                provider=selection.entry.provider,
+                model=selection.entry.alias,
+                effort=selection.effort,
+                prompt_version=config.llm.planner.prompt_version,
+                grounding_status=candidate_grounding.status,
+                source="primary",
             )
-            candidate_grounding = ground_quote(
-                candidate_quote, candidate_page, payload, config.llm.quote_match_threshold,
-                config.llm.text_quote_match_threshold,
-            )
-            candidates.append(
-                Candidate.from_result(
-                    header,
-                    {**raw_candidate, "quote": candidate_quote},
-                    provider=selection.entry.provider,
-                    model=selection.entry.alias,
-                    effort=selection.effort,
-                    prompt_version=config.llm.planner.prompt_version,
-                    grounding_status=candidate_grounding.status,
-                    source="primary",
-                )
-            )
+            candidates.append(candidate)
+            candidate_pairs.append((raw_candidate, candidate))
         decision = arbitrate_field(
             header,
             candidates,
@@ -463,10 +650,9 @@ def _merge_field(
             plan.merge_log.append(f"{header}: unresolved conflict — {decision.decision_reason}")
             return "rejected:unresolved_conflict"
         selected = decision.selected
-        return _merge_field(
-            memo,
-            schema_field,
-            {
+        selected_raw = next((raw for raw, candidate in candidate_pairs if candidate == selected), None)
+        if selected_raw is None:
+            selected_raw = {
                 "value": selected.value,
                 "unit": selected.unit,
                 "page": selected.page,
@@ -475,6 +661,12 @@ def _merge_field(
                 "verbatim_quote": selected.quote,
                 "quote": selected.quote,
                 "evidence_kind": selected.evidence_kind,
+            }
+        return _merge_field(
+            memo,
+            schema_field,
+            {
+                **selected_raw,
                 "confidence": decision.final_confidence,
                 "model_confidence": selected.raw_model_confidence,
                 "raw_model_confidence": selected.raw_model_confidence,
@@ -513,12 +705,14 @@ def _merge_field(
             )
             return "rejected:vocab"
 
-    quote = str(result.get("verbatim_quote") or result.get("evidence_quote") or "")
-    page = result.get("page") if isinstance(result.get("page"), int) else None
-    grounding = ground_quote(
-        quote, page, payload, config.llm.quote_match_threshold,
-        config.llm.text_quote_match_threshold,
+    grounding, evidence_text, page, evidence_mode = _ground_result(
+        result,
+        payload=payload,
+        config=config,
+        provider=selection.entry.provider,
+        method=method,
     )
+    quote = str(result.get("verbatim_quote") or result.get("evidence_quote") or result.get("quote") or "").strip()
     if grounding.status == "ungrounded" and not config.llm.surface_ungrounded_values:
         _flag_first_asset(
             memo,
@@ -556,7 +750,7 @@ def _merge_field(
             **result,
             "value": value,
             "model_confidence": confidence,
-            "quote": quote,
+            "quote": evidence_text,
             "document_id": result.get("document_id") or "D01",
         },
         provider=selection.entry.provider,
@@ -576,7 +770,10 @@ def _merge_field(
         # path below (capped confidence + UNGROUNDED flag), never overwriting a
         # confident deterministic value.
         arb_config = config.llm.candidate_arbitration
-        if config.llm.surface_ungrounded_values and grounding.status == "ungrounded":
+        if (
+            (config.llm.surface_ungrounded_values and grounding.status == "ungrounded")
+            or evidence_mode == "reasoned"
+        ):
             arb_config = arb_config.model_copy(update={"require_grounded_evidence": False})
         decision = arbitrate_field(
             header,
@@ -638,7 +835,7 @@ def _merge_field(
                 *existing.conflicts,
                 ConflictingCandidate(
                     raw_text=str(result.get("value")), value=value, page=page,
-                    confidence=confidence, evidence=quote[: config.extraction.max_evidence_chars],
+                    confidence=confidence, evidence=evidence_text[: config.extraction.max_evidence_chars],
                     evidence_ref=grounding.evidence_ref,
                 ),
             ]
@@ -657,10 +854,7 @@ def _merge_field(
             return "merged"
     evidence_ref = (
         grounding.evidence_ref.model_copy(
-            update={
-                "provider": selection.entry.provider,
-                "extraction_method": method,
-            }
+            update={"provider": selection.entry.provider, "extraction_method": method}
         )
         if grounding.evidence_ref is not None
         else None
@@ -671,7 +865,8 @@ def _merge_field(
         unit=result.get("unit") or schema_field.unit, page=page,
         bbox=grounding.bbox,
         method=method, confidence=confidence,
-        evidence=quote[: config.extraction.max_evidence_chars],
+        evidence=evidence_text[: config.extraction.max_evidence_chars],
+        source_file=evidence_ref.source_file if evidence_ref is not None else None,
         evidence_ref=evidence_ref,
         confidence_components={
             "llm_self_reported": raw_confidence if isinstance(raw_confidence, (int, float)) else confidence,
@@ -733,6 +928,20 @@ def _merge_field(
                 description=f"{header}: quote could not be machine-verified "
                 f"(no local text for page {page}) — review against the document",
                 severity=FlagSeverity.warning, reviewer_attention=True, field=header,
+            )
+        )
+    if evidence_mode == "reasoned":
+        explanation = str(result.get("evidence_explanation") or evidence_text or "").strip()
+        asset.flags.append(
+            ReviewFlag(
+                category="llm",
+                description=(
+                    f"LLM_REASONED_VALUE: {header}={value} — no highlightable source region; "
+                    f"{explanation or 'review the cited document before approval'}"
+                ),
+                severity=FlagSeverity.warning,
+                reviewer_attention=True,
+                field=header,
             )
         )
     if len(targets) > 1:
@@ -1079,12 +1288,10 @@ def _run_tier(
         payload.directory / f"prompt_static_{slug}.txt", config.pv_root
     ) as fh:
         fh.write(static_prompt)
-    # Direct document read: hand the model the real source files (copied into the
-    # call dir) to Read itself, instead of a big embedded page payload. Keeps the
-    # prompt small so a large field set completes fast (the embedded-payload path
-    # was timing out); page_texts are still kept in memory for quote-grounding.
-    direct_read = config.llm.direct_document_read and bool(payload.source_documents)
-    page_payload = payload.read_instruction() if direct_read else payload.scoped_prompt(pages)
+    direct_read = _should_use_direct_read(
+        config=config, settings=settings, payload=payload, pages=list(pages)
+    )
+    page_payload = payload.read_instruction(list(pages)) if direct_read else payload.scoped_prompt(pages)
     prompt = build_call_prompt(
         fields,
         page_payload,
@@ -1176,6 +1383,7 @@ def _run_tier(
         prompt_version=config.llm.planner.prompt_version,
         page_hashes=payload.selected_page_hashes(pages),
         field_keys=sparse_field_keys(fields),
+        source_hashes=payload.selected_source_hashes(pages) if direct_read else None,
     )
 
     if config.llm.cache_enabled and not settings.force:
@@ -1207,11 +1415,14 @@ def _run_tier(
                 )
                 return attempt, cached["structured"]
 
+    prompt_chars_for_estimate = len(prompt) + (payload.source_read_estimate_chars(pages) if direct_read else 0)
     estimated = estimate_usage(
-        prompt_chars=len(prompt), image_count=task.record.image_count,
+        prompt_chars=prompt_chars_for_estimate, image_count=task.record.image_count,
         field_count=len(fields), cfg=config.llm,
     )
     estimated_cost_maybe = registry.cost_usd(estimated, selection.entry)
+    if estimated_cost_maybe is None:
+        estimated_cost_maybe = registry.fallback_cost_usd(estimated, provider=selection.entry.provider)
     estimated_cost = estimated_cost_maybe if estimated_cost_maybe is not None else 0.0
     budget.reserve(estimated_cost)  # BudgetExceeded propagates: memo deferred, no call made
     _emit_llm_activity(
@@ -1261,7 +1472,7 @@ def _run_tier(
             fh.write(schema_json_bytes(legacy_schema))
         legacy_prompt = build_legacy_call_prompt(
             fields,
-            payload.read_instruction() if direct_read
+            payload.read_instruction(list(pages)) if direct_read
             else (payload.scoped_prompt_with_ocr_fallback(pages) if not image_paths else payload.scoped_prompt(pages)),
             corrective=corrective,
         )
@@ -1286,8 +1497,13 @@ def _run_tier(
     elif result.usage is not None:
         actual_cost = registry.cost_usd(result.usage, selection.entry)
         if actual_cost is None:
-            attempt.cost_usd = 0.0
-            attempt.cost_source = "unavailable"
+            fallback_cost = registry.fallback_cost_usd(result.usage, provider=selection.entry.provider)
+            if fallback_cost is None:
+                attempt.cost_usd = 0.0
+                attempt.cost_source = "unavailable"
+            else:
+                attempt.cost_usd = fallback_cost
+                attempt.cost_source = "estimated"
         else:
             attempt.cost_usd = actual_cost
             attempt.cost_source = "actual"  # actual tokens, configured prices
@@ -1352,6 +1568,7 @@ def _run_tier(
             prompt_version=f"{config.llm.planner.prompt_version}:legacy",
             page_hashes=payload.selected_page_hashes(pages),
             field_keys=sparse_field_keys(fields),
+            source_hashes=payload.selected_source_hashes(pages) if direct_read else None,
         )
 
     conn = sqlite3.connect(str(config.db_path), timeout=30)
@@ -1485,6 +1702,9 @@ def _write_readable_extraction(
                     "page": obj.get("page"),
                     "model_confidence": obj.get("model_confidence", obj.get("confidence")),
                     "quote": quote[: config.extraction.max_evidence_chars],
+                    "evidence_mode": obj.get("evidence_mode") or "quote",
+                    "evidence_explanation": obj.get("evidence_explanation") or "",
+                    "evidence_bbox": obj.get("evidence_bbox"),
                 }
             )
         rows.sort(key=lambda r: (r["not_found"], r["band"] or "", r["field"]))

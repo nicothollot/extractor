@@ -122,6 +122,18 @@ def test_rule_resolution_config_default_off_means_no_cli() -> None:
     assert all("SHOULD-NOT-APPEAR" not in inc for inc in spec.filename_include)
 
 
+def test_rule_match_skips_configured_cli_fallback() -> None:
+    """Configured fallback is for ambiguous queries; known rule hits stay local."""
+    config = _config()
+    config.smart_search.use_cli_fallback = True
+    spy = FakeClaudeCodeClient(mode="intent", intent_anchors={"filename_include": ["SHOULD-NOT-APPEAR"]})
+    spec, provenance = intent.resolve_intent("quarterly reports", config, cc_client=spy)
+
+    assert provenance == "rules"
+    assert spy.calls == []
+    assert all("SHOULD-NOT-APPEAR" not in inc for inc in spec.filename_include)
+
+
 def test_rule_resolution_unknown_query_degrades_to_tokens() -> None:
     """An unknown query still yields a non-empty spec (its own tokens become
     the includes) — never an empty/exception result."""

@@ -384,8 +384,8 @@ def build_answer_file_instruction(
             f"Overwrite {filename} in your current working directory now with a "
             "SINGLE valid JSON object exactly matching the required schema_version=5 "
             "structure (keys: schema_version, scope, values, not_found, conflicts, "
-            "warnings). Do not print the JSON — only write the file. Then confirm it "
-            "parses as valid JSON."
+            "warnings). Do not print the JSON; only write the file, then reply with "
+            "ONLY `done`."
         )
     return (
         "== OUTPUT FORMAT (REQUIRED) ==\n"
@@ -395,11 +395,10 @@ def build_answer_file_instruction(
         "matching the schema_version=5 structure described above (keys: schema_version, "
         "scope, values, not_found, conflicts, warnings). Each entry in `values` is one "
         "field: its field_id, the extracted value, unit, cited document_id + page, a "
-        "verbatim quote, and your model_confidence. Account for every requested field "
-        "exactly once across `values`, `not_found`, or `conflicts`. Write the JSON "
-        "pretty-printed (2-space indentation, one field object per array element) so it "
-        "is easy to read. After writing the file, read it back to confirm it parses as "
-        "valid JSON, then reply with ONLY the single word `done`. The file is the only "
+        "verbatim quote or visual/reasoned evidence fields, and your model_confidence. "
+        "Account for every requested field exactly once across `values`, `not_found`, "
+        "or `conflicts`. Write compact JSON with no extra whitespace, then reply with "
+        "ONLY the single word `done`. The file is the only "
         "output that is read — do NOT restate, summarize, list, or print any of the "
         "extracted values or the JSON in your text reply (doing so wastes tokens)."
     )

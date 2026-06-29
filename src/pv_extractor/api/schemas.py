@@ -295,9 +295,9 @@ class DealRefreshRequest(BaseModel):
 
 class IntentResolveRequest(BaseModel):
     """Resolve a free-text Smart Search query into a DocTypeSpec. ``use_cli``
-    overrides config.smart_search.use_cli_fallback for this one call; None =
-    use the config default. Never raises if the CLI is unavailable — the rule
-    engine always yields a spec."""
+    overrides config.smart_search.use_cli_fallback for this one call; None uses
+    the configured fallback only for ambiguous rule matches. Never raises if
+    the CLI is unavailable — the rule engine always yields a spec."""
 
     query: str
     use_cli: bool | None = None

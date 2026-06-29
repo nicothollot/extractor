@@ -3,11 +3,13 @@ export interface EvidenceSelectionLike {
   bbox: number[] | null;
   evidence_ref?: {
     display_page: number | null;
+    source_file?: string | null;
     bbox: number[] | null;
     match_method: string;
     match_score: number | null;
     no_geometry_reason: string | null;
   } | null;
+  evidence_mode?: string;
   grounding_status?: string;
   grounding_reason?: string;
   method?: string | null;
@@ -21,6 +23,7 @@ export interface MemoIssueLike {
 export interface SelectedHighlight {
   highlightPage: number | null;
   highlightBbox: number[] | null;
+  sourceFile: string | null;
   fallbackMessage: string | null;
   method: string | null;
   confidence: number | null;
@@ -45,6 +48,7 @@ export function selectedHighlight(item: EvidenceSelectionLike | null): SelectedH
     return {
       highlightPage: null,
       highlightBbox: null,
+      sourceFile: null,
       fallbackMessage: null,
       method: null,
       confidence: null,
@@ -55,16 +59,24 @@ export function selectedHighlight(item: EvidenceSelectionLike | null): SelectedH
   const ref = item.evidence_ref ?? null;
   const page = ref?.display_page ?? item.page ?? null;
   const bbox = normalizeBbox(ref?.bbox ?? item.bbox ?? null);
+  const evidenceMode = item.evidence_mode ?? (ref?.match_method === "llm_reasoned" ? "reasoned" : "quote");
   const hasGeometry = page !== null && bbox !== null;
-  const fallback =
-    page !== null && !hasGeometry
-      ? item.grounding_reason ||
-        ref?.no_geometry_reason ||
-        "page evidence available, exact box unavailable"
-      : null;
+  let fallback: string | null = null;
+  if (evidenceMode === "reasoned") {
+    fallback =
+      item.grounding_reason ||
+      ref?.no_geometry_reason ||
+      "reasoned value has no highlightable source region";
+  } else if (page !== null && !hasGeometry) {
+    fallback =
+      item.grounding_reason ||
+      ref?.no_geometry_reason ||
+      "page evidence available, exact box unavailable";
+  }
   return {
     highlightPage: page,
     highlightBbox: hasGeometry ? bbox : null,
+    sourceFile: ref?.source_file ?? null,
     fallbackMessage: fallback,
     method: item.method ?? null,
     confidence: item.confidence ?? null,

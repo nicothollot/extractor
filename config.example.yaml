@@ -105,7 +105,7 @@ deal_discovery:
     shared_bucket: 0.30          # per-cluster synthetic deal carved out of a shared mixed-investment folder
   llm:
     enabled: false               # auto Claude Code assist when heuristics are weak (manual opt-in)
-    model: sonnet                # ALIAS from config/models.yaml — floats to the newest cheap tier
+    model: haiku                 # ALIAS from config/models.yaml — cheap assist tier
     effort: low
     trigger_confidence: 0.45     # auto-assist (when enabled) if the best deal scores below this
     timeout_seconds: 300
@@ -125,7 +125,7 @@ deal_discovery:
 smart_search:
   enabled: true
   use_cli_fallback: true         # optional Claude Code assist for ambiguous queries
-  cli_model: sonnet              # ALIAS from config/models.yaml — floats to current cheap tier
+  cli_model: haiku               # ALIAS from config/models.yaml — cheap assist tier
   cli_effort: low
   bm25_k1: 1.2                   # BM25 term-frequency saturation
   bm25_b: 0.75                   # BM25 length normalization
@@ -435,8 +435,8 @@ llm:
   workers: 2                       # hidden local CLI session concurrency (don't hammer CLI/share)
   models_path: ./config/models.yaml  # provider model menu + editable pricing assumptions
   cache_enabled: true              # task cache keyed on provider/model/effort/schema/prompt/page hashes/fields
-  direct_document_read: true       # copy the source doc into the call dir and let the model Read it directly
-                                   #   (small prompt, fast) instead of embedding a rasterized/OCR'd page payload
+  direct_document_read: true       # allow source-doc Read fallback for image-heavy / LLM-first tasks
+                                   #   (ordinary text tasks use bounded embedded page payloads)
   field_batch_count: 1             # split a document's fields into N near-equal batches, one provider call each
                                    #   (191 fields, 4 -> 4 calls of ~48; last batch takes the remainder). 1 = single call
   max_concurrent_agents: 4         # max batches of ONE document run simultaneously (capped by field_batch_count)
