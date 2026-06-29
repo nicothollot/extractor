@@ -42,4 +42,15 @@ that can alter prompts, payload assembly, parsing or merge behavior.
 # 5.2.0: direct_document_read — the source document is copied into the call dir
 # and the model Reads it itself (small prompt) instead of consuming a
 # pre-rendered/embedded page payload; different prompt + inputs, so cache reset.
-LLM_VERSION = "5.2.0"
+# 5.3.0: file-based output — the model WRITES its answer to answers.json (Write
+# tool) instead of the --json-schema StructuredOutput tool; the prompt gains an
+# output-format override, the TEXT-page quote-grounding floor was relaxed from
+# 0.98 to text_quote_match_threshold, and ungrounded values now surface instead
+# of being rejected in arbitration. All change prompts/parsing/merging.
+# 5.4.0: confidence_selection toggle (off = accept LLM values at the model's own
+# confidence, no grounding cap/arbitration gate), per-call answer filename +
+# pretty-print + per-field guidance in the output instruction (prompt change).
+# 5.5.0: file-based output instruction now tells the model to reply with only
+# `done` and never restate/print the extracted values in text (cuts output-token
+# cost — the answers.json file is the only output read). Prompt change.
+LLM_VERSION = "5.5.0"

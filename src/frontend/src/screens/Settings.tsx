@@ -370,7 +370,7 @@ export default function Settings() {
   const rawDirty = rawDraft !== null && rawDraft !== raw.data?.text;
 
   return (
-    <Panel className="space-y-4 max-w-5xl">
+    <Panel className="space-y-4 max-w-[1600px]">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-ink-900">Settings</h1>
         <div className="flex items-center gap-3">
@@ -843,6 +843,44 @@ export default function Settings() {
           </Card>
 
           <Card>
+            <CardHeader title="Default reference workbook" sub="the workbook New Run / Direct Run prefill and the “Use local default” button points at" />
+            <div className="px-4 pb-4 max-w-3xl space-y-2">
+              <Field label="Reference workbook (template)">
+                <div className="flex gap-2">
+                  <input
+                    className={`${inputCls} flex-1 font-mono text-[12px]`}
+                    value={String(value("gui.default_reference_workbook", c.gui.default_reference_workbook ?? ""))}
+                    onChange={(e) => setValue("gui.default_reference_workbook", e.target.value || null)}
+                    placeholder="leave empty to use the system master index"
+                  />
+                  <Button
+                    kind="secondary"
+                    onClick={() =>
+                      setPicking({
+                        field: "gui.default_reference_workbook",
+                        title: "Choose the default reference workbook",
+                        initial: String(value("gui.default_reference_workbook", c.gui.default_reference_workbook ?? "")),
+                        pickFiles: true,
+                      })
+                    }
+                  >
+                    Browse…
+                  </Button>
+                  {Boolean(value("gui.default_reference_workbook", c.gui.default_reference_workbook ?? "")) && (
+                    <Button kind="ghost" onClick={() => setValue("gui.default_reference_workbook", null)}>
+                      Clear
+                    </Button>
+                  )}
+                </div>
+              </Field>
+              <p className="text-[11px] text-ink-400">
+                When set, New Run and Direct Run prefill this workbook (unless you used a different one more recently),
+                and the “Use local default” button resets to it. Empty = the committed master index (master_index_v4).
+              </p>
+            </div>
+          </Card>
+
+          <Card>
             <CardHeader title="LLM provider CLI" sub="local command execution only — no hosted API call from Python" />
             <div className="px-4 pb-4 space-y-4 max-w-3xl">
               {activeProvider === "claude" && (() => {
@@ -997,6 +1035,21 @@ export default function Settings() {
               <Field label="Budget cap (USD / run)">
                 <input className={inputCls} type="number" step="0.5" value={Number(value("llm.budget_usd", c.llm.budget_usd))} onChange={(e) => setValue("llm.budget_usd", Number(e.target.value))} />
               </Field>
+              <Field label="Parallel documents (extraction workers)">
+                <input
+                  className={inputCls}
+                  type="number"
+                  step="1"
+                  min="1"
+                  value={Number(value("llm.workers", c.llm.workers ?? 2))}
+                  onChange={(e) => setValue("llm.workers", Math.max(1, Math.round(Number(e.target.value))))}
+                />
+                <p className="mt-1 text-[11px] text-ink-400">
+                  How many documents (memos/deals) the LLM extracts <span className="font-medium">at the same time</span> —
+                  this is the knob that speeds up a multi-deal run. Each runs a separate local provider session; 2–4 is a
+                  good range (higher only loads your machine harder, not the read-only share).
+                </p>
+              </Field>
               <Field label="Field batches per document">
                 <input
                   className={inputCls}
@@ -1008,7 +1061,7 @@ export default function Settings() {
                 />
                 <p className="mt-1 text-[11px] text-ink-400">Split a document's fields into this many batches, one LLM call each (191 fields ÷ 4 = ~48 each). 1 = a single call.</p>
               </Field>
-              <Field label="Max simultaneous agents">
+              <Field label="Max simultaneous agents (within one document)">
                 <input
                   className={inputCls}
                   type="number"
@@ -1017,10 +1070,94 @@ export default function Settings() {
                   value={Number(value("llm.max_concurrent_agents", c.llm.max_concurrent_agents ?? 4))}
                   onChange={(e) => setValue("llm.max_concurrent_agents", Math.max(1, Math.round(Number(e.target.value))))}
                 />
-                <p className="mt-1 text-[11px] text-ink-400">How many of a document's batches run at the same time (capped by the batch count).</p>
+                <p className="mt-1 text-[11px] text-ink-400">
+                  How many of a single document's field batches run at once. Only has an effect when “Field batches per
+                  document” is above 1 — to run more <span className="font-medium">documents</span> in parallel, raise
+                  “Parallel documents” above.
+                </p>
               </Field>
+              <div className="pt-2">
+                <Toggle
+                  checked={Boolean(value("llm.scratch_cleanup_enabled", c.llm.scratch_cleanup_enabled ?? true))}
+                  onChange={(v) => setValue("llm.scratch_cleanup_enabled", v)}
+                  label="Auto-clean LLM working dirs during the run"
+                />
+                <p className="mt-1 text-[11px] text-ink-400">
+                  On: per-memo scratch dirs (copied source PDFs, page renders, the .claude session, prompts,
+                  schemas) are pruned as the run progresses so peak disk stays flat on large runs. The
+                  workbook and audit records keep the full extracted data either way.
+                </p>
+                {Boolean(value("llm.scratch_cleanup_enabled", c.llm.scratch_cleanup_enabled ?? true)) && (
+                  <div className="mt-2 space-y-2">
+                    <Field label="Keep most-recent N working dirs">
+                      <input
+                        className={inputCls}
+                        type="number"
+                        step="1"
+                        min="0"
+                        value={Number(value("llm.scratch_cleanup_retain", c.llm.scratch_cleanup_retain ?? 50))}
+                        onChange={(e) => setValue("llm.scratch_cleanup_retain", Math.max(0, Math.round(Number(e.target.value))))}
+                      />
+                      <p className="mt-1 text-[11px] text-ink-400">Most-recently-finished dirs left intact for debugging; older ones pruned. 0 = prune every dir immediately.</p>
+                    </Field>
+                    <Toggle
+                      checked={Boolean(value("llm.scratch_cleanup_keep_data", c.llm.scratch_cleanup_keep_data ?? true))}
+                      onChange={(v) => setValue("llm.scratch_cleanup_keep_data", v)}
+                      label="Keep per-field data JSONs (extracted / answers / manifest)"
+                    />
+                    <p className="text-[11px] text-ink-400">
+                      On: keep the small raw-model-output JSONs and delete only the heavy scratch. Off: full
+                      delete of each pruned memo dir (no raw LLM output retained).
+                    </p>
+                  </div>
+                )}
+              </div>
               <div className="pt-6">
                 <Toggle checked={Boolean(value("llm.allow_fable", c.llm.allow_fable))} onChange={(v) => setValue("llm.allow_fable", v)} label="Allow Fable tier (most expensive — explicit opt-in)" />
+              </div>
+              <div className="pt-2">
+                <Toggle
+                  checked={Boolean(value("llm.confidence_selection", c.llm.confidence_selection ?? true))}
+                  onChange={(v) => setValue("llm.confidence_selection", v)}
+                  label="Confidence selection (quote-grounding + arbitration gate)"
+                />
+                <p className="mt-1 text-[11px] text-ink-400">
+                  On: LLM values are quote-grounded and gated; values whose quote can't be verified are
+                  capped low and flagged. Off: trust the model — every extracted value is accepted at the
+                  model's own confidence (no ungrounded 0.20 cap, no UNGROUNDED flags). A confident
+                  deterministic value is never overwritten either way.
+                </p>
+              </div>
+              <div className="pt-2">
+                <Toggle
+                  checked={Boolean(value("llm.auto_approve_enabled", c.llm.auto_approve_enabled ?? true))}
+                  onChange={(v) => setValue("llm.auto_approve_enabled", v)}
+                  label="Auto-approve high-confidence values in the review queue"
+                />
+                <p className="mt-1 text-[11px] text-ink-400">
+                  On: values at or above the bar are auto-approved (shown for cross-checking, no sign-off
+                  needed); everything below — plus flagged items — lands in “Needs approval”. Off: every
+                  extracted value needs manual approval. The review queue always shows every value either way.
+                </p>
+                {Boolean(value("llm.auto_approve_enabled", c.llm.auto_approve_enabled ?? true)) && (
+                  <div className="mt-2">
+                    <Field label="Auto-approval confidence (%)">
+                      <input
+                        className={inputCls}
+                        type="number"
+                        step="1"
+                        min="0"
+                        max="100"
+                        value={Math.round(Number(value("llm.auto_approve_confidence", c.llm.auto_approve_confidence ?? 0.8)) * 100)}
+                        onChange={(e) => setValue("llm.auto_approve_confidence", Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
+                      />
+                      <p className="mt-1 text-[11px] text-ink-400">
+                        e.g. 80 = fields Claude returns at ≥80% confidence are auto-approved; the rest are
+                        flagged for manual approval.
+                      </p>
+                    </Field>
+                  </div>
+                )}
               </div>
               <Field label="Single-model default">
                 <select className={inputCls} value={String(value("llm.single_model_model", c.llm.single_model_model ?? c.llm.manual_model))} onChange={(e) => setValue("llm.single_model_model", e.target.value)}>

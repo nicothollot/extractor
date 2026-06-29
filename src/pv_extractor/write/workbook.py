@@ -23,7 +23,7 @@ import openpyxl
 
 from pv_extractor.io_guard import assert_write_allowed, guarded_open_write, open_read
 from pv_extractor.logging_setup import log_event
-from pv_extractor.models import FieldHit, QaStatus, ReviewFlag, SchemaField
+from pv_extractor.models import FieldHit, QaStatus, ReviewFlag, SchemaField, WorkbookLayout
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,15 @@ RUNLOG_SHEET = "Run Log"
 
 _HEADER_ROW = 2
 _FIRST_DATA_ROW = 4
+
+
+def _master_layout() -> WorkbookLayout:
+    """Layout of the legacy three-header-row master template (the default when
+    no explicit layout is supplied — keeps every existing caller unchanged)."""
+    return WorkbookLayout(
+        sheet_name=INDEX_SHEET, header_row=_HEADER_ROW,
+        data_start_row=_FIRST_DATA_ROW, memo_id_col=1, is_custom=False,
+    )
 
 RUN_LOG_COLUMNS = (
     "Run ID", "Run Date", "Memos Processed", "Assets Extracted", "QA Pass",
@@ -61,6 +70,41 @@ def copy_template(template_path: str | Path, dest_path: str | Path, pv_root: str
     return dest
 
 
+def create_custom_workbook(
+    dest_path: str | Path,
+    schema_fields: list[SchemaField],
+    layout: WorkbookLayout,
+    pv_root: str,
+) -> Path:
+    """Build a FRESH output workbook for a custom reference.
+
+    A user-supplied reference workbook only defines WHICH columns to populate
+    (the autodetected field set). We never mutate the user's own sheet — those
+    are often wide, pre-populated, merged-cell templates that openpyxl's
+    insert_cols mangles. Instead we write a clean sheet (`layout.sheet_name`)
+    whose row `layout.header_row` is the schema headers in column-index order,
+    plus the Review Flags / Run Log sheets. Data starts at `layout.data_start_row`.
+    """
+    dest = Path(dest_path)
+    wb = openpyxl.Workbook()
+    index = wb.active
+    index.title = layout.sheet_name
+    for field in sorted(schema_fields, key=lambda f: f.col_index):
+        index.cell(row=layout.header_row, column=field.col_index).value = field.header
+    flags = wb.create_sheet(FLAGS_SHEET)
+    flags.append(FLAG_COLUMNS)
+    runlog = wb.create_sheet(RUNLOG_SHEET)
+    runlog.append(RUN_LOG_COLUMNS)
+    assert_write_allowed(dest, pv_root)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(dest)
+    log_event(
+        logger, "custom workbook created", dest=str(dest),
+        sheet=layout.sheet_name, fields=len(schema_fields),
+    )
+    return dest
+
+
 def _cell_value(value: object) -> object:
     """Workbook representation: booleans 'Yes'/'No' (reference convention),
     dates ISO strings, formula-looking strings defused, numbers as numbers."""
@@ -74,22 +118,49 @@ def _cell_value(value: object) -> object:
 class WorkbookWriter:
     """All writes for one run, against one template COPY."""
 
-    def __init__(self, path: str | Path, schema_fields: list[SchemaField], pv_root: str) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        schema_fields: list[SchemaField],
+        pv_root: str,
+        layout: WorkbookLayout | None = None,
+    ) -> None:
         self.path = Path(path)
         self.pv_root = pv_root
         self.schema_fields = schema_fields
+        self.layout = layout or _master_layout()
         self.workbook = openpyxl.load_workbook(self.path)
+        if self.layout.is_custom:
+            self._ensure_support_sheets()
         self.assert_headers()
         self._existing_flag_keys = self._load_flag_keys()
+
+    @property
+    def index_sheet_name(self) -> str:
+        return self.layout.sheet_name
+
+    # ------------------------------------------------------------------
+    # custom reference support
+    # ------------------------------------------------------------------
+
+    def _ensure_support_sheets(self) -> None:
+        """A custom-reference output is built clean by create_custom_workbook
+        (the user's own template is never mutated — see that function). This is a
+        defensive guarantee that the Review Flags / Run Log sheets exist before
+        any append (e.g. if a workbook reaches the writer by another path)."""
+        if FLAGS_SHEET not in self.workbook.sheetnames:
+            self.workbook.create_sheet(FLAGS_SHEET).append(FLAG_COLUMNS)
+        if RUNLOG_SHEET not in self.workbook.sheetnames:
+            self.workbook.create_sheet(RUNLOG_SHEET).append(RUN_LOG_COLUMNS)
 
     # ------------------------------------------------------------------
     # header drift gate
     # ------------------------------------------------------------------
 
     def assert_headers(self) -> None:
-        sheet = self.workbook[INDEX_SHEET]
+        sheet = self.workbook[self.layout.sheet_name]
         for field in self.schema_fields:
-            actual = sheet.cell(row=_HEADER_ROW, column=field.col_index).value
+            actual = sheet.cell(row=self.layout.header_row, column=field.col_index).value
             if (actual or "") != field.header:
                 raise HeaderDriftError(
                     f"Index header drift at column {field.col_index}: template has "
@@ -109,19 +180,21 @@ class WorkbookWriter:
     # ------------------------------------------------------------------
 
     def _next_index_row(self) -> int:
-        sheet = self.workbook[INDEX_SHEET]
-        for row in range(sheet.max_row, _FIRST_DATA_ROW - 1, -1):
+        sheet = self.workbook[self.layout.sheet_name]
+        first = self.layout.data_start_row
+        probe_cols = (self.layout.memo_id_col, 1, 2, 3)
+        for row in range(sheet.max_row, first - 1, -1):
             if any(
                 sheet.cell(row=row, column=col).value is not None
-                for col in (1, 2, 3)
+                for col in probe_cols
             ):
                 return row + 1
-        return _FIRST_DATA_ROW
+        return first
 
     def append_index_row(self, hits: list[FieldHit]) -> int:
         """One memo-asset row, written by schema column index. Returns the
         worksheet row number used."""
-        sheet = self.workbook[INDEX_SHEET]
+        sheet = self.workbook[self.layout.sheet_name]
         row = self._next_index_row()
         for hit in hits:
             if hit.value is None:
@@ -134,10 +207,12 @@ class WorkbookWriter:
         return row
 
     def find_index_row(self, row_memo_id: str) -> int | None:
-        """Worksheet row of an existing memo-asset row (Memo ID = column 1)."""
-        sheet = self.workbook[INDEX_SHEET]
-        for row in range(_FIRST_DATA_ROW, sheet.max_row + 1):
-            value = sheet.cell(row=row, column=1).value
+        """Worksheet row of an existing memo-asset row (matched on the Memo ID
+        column from the layout)."""
+        sheet = self.workbook[self.layout.sheet_name]
+        memo_col = self.layout.memo_id_col
+        for row in range(self.layout.data_start_row, sheet.max_row + 1):
+            value = sheet.cell(row=row, column=memo_col).value
             if value is not None and str(value) == row_memo_id:
                 return row
         return None
@@ -151,7 +226,7 @@ class WorkbookWriter:
         row = self.find_index_row(row_memo_id)
         if row is None:
             raise KeyError(f"no Index row for memo id {row_memo_id!r}")
-        sheet = self.workbook[INDEX_SHEET]
+        sheet = self.workbook[self.layout.sheet_name]
         cell = sheet.cell(row=row, column=col_index)
         rendered = _cell_value(value)
         cell.value = rendered
@@ -197,14 +272,18 @@ class WorkbookWriter:
         continuity baseline (D5)."""
         if not portfolio_company:
             return None
-        sheet = self.workbook[INDEX_SHEET]
+        sheet = self.workbook[self.layout.sheet_name]
         col_by_header = {field.header: field.col_index for field in self.schema_fields}
+        # QoQ continuity is a master-schema feature; a custom reference sheet
+        # need not carry these columns, in which case there is no prior baseline.
+        if not {"Portfolio Company", "Fund Name", "Valuation Date"} <= col_by_header.keys():
+            return None
         company_col = col_by_header["Portfolio Company"]
         fund_col = col_by_header["Fund Name"]
         date_col = col_by_header["Valuation Date"]
 
         best: tuple[date, int] | None = None
-        for row in range(_FIRST_DATA_ROW, sheet.max_row + 1):
+        for row in range(self.layout.data_start_row, sheet.max_row + 1):
             company = sheet.cell(row=row, column=company_col).value
             if not company or str(company).strip().lower() != portfolio_company.strip().lower():
                 continue

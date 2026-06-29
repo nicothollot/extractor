@@ -59,7 +59,17 @@ def ground_quote(
     page: int | None,
     payload: MemoPayload,
     fuzzy_threshold: int,
+    text_fuzzy_threshold: int | None = None,
 ) -> GroundingResult:
+    """Ground an LLM quote against the locally extracted page text.
+
+    `fuzzy_threshold` is the floor for IMAGE/OCR pages (where the model reads a
+    rasterized page and our text comes from OCR). `text_fuzzy_threshold` is the
+    floor for native TEXT pages; when None it defaults to 98 (near-exact). It is
+    configurable because direct_document_read has the model read the source PDF
+    itself and lightly reflow/paraphrase its quotes, so a near-exact match
+    silently rejects correct values.
+    """
     if not quote.strip() or page is None or page not in payload.page_texts:
         return GroundingResult("ungrounded", 0.0, "", page, "missing quote or page")
     page_text = payload.page_texts.get(page) or ""
@@ -103,7 +113,8 @@ def ground_quote(
 
     score, matched_text = _window_match(quote, page_text)
     kind = payload.page_kind(page)
-    threshold = (fuzzy_threshold / 100.0) if kind == "image" else 0.98
+    text_floor = (text_fuzzy_threshold / 100.0) if text_fuzzy_threshold is not None else 0.98
+    threshold = (fuzzy_threshold / 100.0) if kind == "image" else text_floor
     if score >= threshold:
         resolution = resolve_quote_to_words(
             quote=quote,

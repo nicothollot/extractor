@@ -8,6 +8,7 @@ straight from the run's own output workbook copy (read-only)."""
 from __future__ import annotations
 
 import json
+import shutil
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,63 @@ def load_audit(run_dir: Path, memo_id: str) -> dict | None:
         return None
     with open_read(path) as fh:
         return json.loads(fh.read().decode("utf-8"))
+
+
+def _norm_path(p: str) -> str:
+    return str(p or "").replace("\\", "/").strip().lower()
+
+
+def find_runs_for_file(config: Config, file_path: str) -> list[dict]:
+    """Prior runs that already extracted this exact document (matched by file
+    path, newest first). Powers the Direct Run 'use previous output or re-run?'
+    prompt so a cached extraction is never silently reused."""
+    target = _norm_path(file_path)
+    if not target:
+        return []
+    matches: list[dict] = []
+    for run_dir in run_dirs(config):
+        for audit in load_audits(run_dir):
+            if _norm_path(audit.get("file_path", "")) == target:
+                _, finished, _ = _run_timing(run_dir)
+                matches.append({
+                    "run_id": run_dir.name,
+                    "memo_id": audit.get("memo_id"),
+                    "finished_at": finished,
+                    "has_workbook": workbook_path(run_dir) is not None,
+                })
+                break  # one hit per run is enough
+    return matches
+
+
+def file_shas_for_run(run_dir: Path) -> list[str]:
+    return [s for a in load_audits(run_dir) if (s := a.get("file_sha256"))]
+
+
+def delete_run(config: Config, run_id: str) -> dict:
+    """Remove a run from history: delete its output directory and forget every
+    cached extraction for the files it contained, so re-running re-extracts.
+    Only deletes inside output_dir under a validated RUN_ id."""
+    if "/" in run_id or "\\" in run_id or not run_id.startswith("RUN_"):
+        raise ValueError(f"invalid run id {run_id!r}")
+    run_dir = Path(config.output_dir) / run_id
+    if not run_dir.is_dir():
+        raise FileNotFoundError(run_id)
+    shas = file_shas_for_run(run_dir)
+    forgotten = 0
+    try:
+        from pv_extractor.extract import cache as result_cache
+        from pv_extractor.indexer import db
+
+        conn = db.open_db(config.db_path, config.pv_root)
+        try:
+            result_cache.init_cache(conn)
+            forgotten = result_cache.forget_by_sha256(conn, shas)
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — forgetting the cache is best-effort
+        forgotten = 0
+    shutil.rmtree(run_dir)
+    return {"run_id": run_id, "cache_entries_forgotten": forgotten}
 
 
 def ledger_summary(run_dir: Path) -> dict | None:
@@ -257,15 +315,34 @@ def index_rows_mirror(run_dir: Path, run_id: str | None = None) -> list[dict]:
     if wb is None:
         return []
     qa_by_row = _qa_status_by_row_memo(run_dir)
+    # A custom-reference run wrote to its own sheet at its own header/data rows;
+    # the snapshot records that layout. Master runs leave no snapshot -> the
+    # committed master layout (sheet "Index", header row 2, data row 4).
+    sheet_name, header_row_idx, data_start_row, memo_header = "Index", 2, 4, "\U0001f511 Memo ID"
+    snapshot = run_dir / "schema_snapshot.json"
+    if snapshot.is_file():
+        try:
+            doc = json.loads(snapshot.read_text(encoding="utf-8"))
+            layout = doc.get("layout") or {}
+            sheet_name = layout.get("sheet_name", sheet_name)
+            header_row_idx = layout.get("header_row", header_row_idx)
+            data_start_row = layout.get("data_start_row", data_start_row)
+            memo_header = "Memo ID"
+        except (OSError, ValueError):
+            pass
     workbook = openpyxl.load_workbook(wb, read_only=True, data_only=True)
     try:
-        sheet = workbook["Index"]
-        header_row = next(sheet.iter_rows(min_row=2, max_row=2, values_only=True), ())
+        if sheet_name not in workbook.sheetnames:
+            return []
+        sheet = workbook[sheet_name]
+        header_row = next(
+            sheet.iter_rows(min_row=header_row_idx, max_row=header_row_idx, values_only=True), ()
+        )
         col_by_header = {h: i for i, h in enumerate(header_row) if h is not None}
         run_col = col_by_header.get("Run ID")
-        memo_col = col_by_header.get("\U0001f511 Memo ID")
+        memo_col = col_by_header.get(memo_header)
         rows: list[dict] = []
-        for row in sheet.iter_rows(min_row=4, values_only=True):
+        for row in sheet.iter_rows(min_row=data_start_row, values_only=True):
             if all(cell is None for cell in row):
                 continue
             if run_id is not None and run_col is not None:

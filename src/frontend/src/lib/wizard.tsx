@@ -1,5 +1,5 @@
 import { ReactNode, createContext, useCallback, useContext, useState } from "react";
-import { MultiSelectionResponse, PreflightEstimate } from "./api";
+import { FieldEdits, MultiSelectionResponse, PreflightEstimate } from "./api";
 
 /* One firm row in the Multi-Search flow. Mirrors the backend MultiSearchFirm
    shape (camelCase here; the screen maps to snake_case at the API boundary).
@@ -11,6 +11,7 @@ export interface FirmEntry {
   docTypes: string[];
   llmAssist: boolean;
   enhancedPeriodCheck: boolean;
+  sourceMode: "client" | "any" | "hl";
   dealSearchModel: string;
   addedFolders: string[];
   removedDeals: string[];
@@ -34,13 +35,16 @@ export interface WizardState {
   periods: string[]; // multi-period / expanded-range run (empty = the single `period`)
   docType: string;
   docTypes: string[]; // multi doc-type run (empty = the single `docType`)
-  restrictClientSourced: boolean; // false = allow HL/non-client sources (rank-only)
+  // Source preference: "client" only client docs (rejects HL work product);
+  // "any" no source preference (rank-only); "hl" prefer HL work product.
+  sourceMode: "client" | "any" | "hl";
   discoveryMode: "browse" | "search" | "llm";
   llmDiscoverModel: string;
   llmDiscoverEffort: string;
   // template
   template: string | null;
   templateInitialized: boolean;
+  fieldEdits: FieldEdits; // analyst column edits to the reference workbook
   dryRunOnly: boolean;
   // ai / model
   llmEnabled: boolean;
@@ -79,12 +83,13 @@ export const initialWizardState: WizardState = {
   periods: [],
   docType: "any_client_valuation_doc",
   docTypes: [],
-  restrictClientSourced: true,
+  sourceMode: "client",
   discoveryMode: "browse",
   llmDiscoverModel: "sonnet",
   llmDiscoverEffort: "low",
   template: null,
   templateInitialized: false,
+  fieldEdits: { added: [], renamed: [], removed: [] },
   dryRunOnly: false,
   llmEnabled: true,
   mode: "auto",

@@ -133,6 +133,28 @@ def test_index_metadata_endpoints(client) -> None:
     assert templates["default_template"].endswith("master_index_v4.xlsx")
 
 
+def test_template_inspect_master_and_custom(client, tmp_path) -> None:
+    import openpyxl
+
+    default = client.get("/api/templates").json()["default_template"]
+    master = client.post("/api/templates/inspect", json={"path": default}).json()
+    assert master["is_custom"] is False and master["ready"] is True
+    assert master["sheet_name"] == "Index" and not master["prepended_admin"]
+
+    custom_path = tmp_path / "custom.xlsx"
+    wb = openpyxl.Workbook()
+    wb.active.title = "Valuations"
+    wb.active.append(["Company", "NAV ($M)", "IRR %"])
+    wb.save(custom_path)
+    custom = client.post("/api/templates/inspect", json={"path": str(custom_path)}).json()
+    assert custom["is_custom"] is True and custom["sheet_name"] == "Valuations"
+    assert "Memo ID" in custom["prepended_admin"]
+    assert any(f["header"] == "Company" for f in custom["fields"])
+
+    missing = client.post("/api/templates/inspect", json={"path": str(tmp_path / "nope.xlsx")})
+    assert missing.status_code == 404
+
+
 def test_deal_discovery_refresh_and_search_endpoints(client) -> None:
     # heuristic refresh job populates deal_folders for the client
     r = client.post("/api/index/deals/refresh", json={"client": "Angelo Gordon"})
@@ -415,6 +437,32 @@ def test_dry_run_job_events_and_preflight(client) -> None:
     assert bad.status_code == 400
 
 
+def test_add_missed_deal_auto_searches(client) -> None:
+    """POST /jobs/{id}/add-deal records the picked folder, re-discovers the
+    client's deals and auto-searches the run's period(s) for the new deal,
+    returning SlotSelection rows (the "Add a missed deal" action)."""
+    r = client.post("/api/jobs/run", json={
+        "scope": "client", "client": "Angelo Gordon",
+        "period": "2025-01-31", "dry_run": True, "llm": {"enabled": False},
+    })
+    assert r.status_code == 200, r.text
+    job = _wait_job(client, r.json()["job"]["id"])
+    assert job["status"] == "completed"
+
+    pv_root = client.get("/api/config").json()["pv_root"]
+    sep = "\\" if "\\" in pv_root else "/"
+    accell_folder = f"{pv_root}{sep}Angelo Gordon{sep}Accell"
+
+    res = client.post(f"/api/jobs/{job['id']}/add-deal", json={"deal_folder_path": accell_folder})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["client"] == "Angelo Gordon"
+    assert body["deal"] == "Accell", body.get("detail")
+    assert body["slots"], "expected auto-searched slots for the added deal"
+    assert all(s["client"] == "Angelo Gordon" and s["deal"] == "Accell" for s in body["slots"])
+    assert all(s["period"] == "2025-01-31" for s in body["slots"])
+
+
 def test_full_run_job_summary_and_run_browsing(client, completed_run) -> None:
     result = completed_run["result"]
     run_id = completed_run["run_id"]
@@ -469,7 +517,9 @@ def test_review_queue_actions_and_evidence(client, completed_run, gui_env) -> No
     queue = client.get(f"/api/runs/{run_id}/review").json()
     items = queue["items"]
     assert items, "fixture run should produce review items"
-    assert {"id", "kind", "method", "confidence", "evidence", "resolved"} <= set(items[0])
+    assert {"id", "kind", "method", "confidence", "evidence", "resolved", "needs_approval"} <= set(items[0])
+    # the queue now surfaces EVERY extracted value, not only flags/low-confidence
+    assert any(i["kind"] == "value" for i in items), "all extracted values should appear"
 
     # evidence image for an item with a page
     with_page = next(i for i in items if i["has_page_image"])
@@ -501,9 +551,9 @@ def test_review_queue_actions_and_evidence(client, completed_run, gui_env) -> No
     )
     assert again.status_code == 409
 
-    # edit a low-confidence cell -> value lands in the workbook copy
+    # edit an extracted-value cell -> value lands in the workbook copy
     cell_item = next(
-        (i for i in requeued.values() if i["kind"] == "low_confidence" and not i["resolved"] and i["field"]),
+        (i for i in requeued.values() if i["kind"] == "value" and not i["resolved"] and i["field"]),
         None,
     )
     if cell_item is not None:

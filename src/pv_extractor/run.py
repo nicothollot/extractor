@@ -45,6 +45,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pv_extractor.api.schemas import FieldEdits
 
 from pv_extractor.config import Config
 from pv_extractor.extract import cache as result_cache
@@ -61,6 +65,7 @@ from pv_extractor.indexer.periods import period_label
 from pv_extractor.llm.escalate import (
     DealGroup,
     LlmRunSummary,
+    LlmScratchReaper,
     LlmSettings,
     process_deals,
     process_memos,
@@ -77,6 +82,7 @@ from pv_extractor.models import (
     EscalationField,
     EscalationPlan,
     FieldHit,
+    FileRecord,
     FlagSeverity,
     LocateQuery,
     LocateResult,
@@ -86,12 +92,18 @@ from pv_extractor.models import (
     ReviewFlag,
     ScoreBreakdown,
     SchemaField,
+    SourceMode,
     VerifyResult,
     VerifyStatus,
+    WorkbookLayout,
+)
+from pv_extractor.schema.dynamic_schema import (
+    compile_schema_from_workbook,
+    workbook_matches_master,
 )
 from pv_extractor.validate import load_rules
 from pv_extractor.validate.finalize import finalize_asset_after_assistance
-from pv_extractor.write import WorkbookWriter, copy_template, write_audit
+from pv_extractor.write import WorkbookWriter, copy_template, create_custom_workbook, write_audit
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +124,13 @@ class RunControl:
 
     on_event: Callable[[str, dict], None] | None = None
     cancel_event: threading.Event | None = None
+    # Budget pause/resume seam (GUI). budget_pause_cb is invoked once when the
+    # LLM budget is first reached, so the GUI can emit a budget_paused event and
+    # collect the user's raise/remove/cancel decision; budget_sink receives the
+    # live BudgetTracker the moment it is created so the JobManager can resolve a
+    # pause. Both None on the CLI -> the budget stays a hard cap (defer at cap).
+    budget_pause_cb: Callable[[float, float | None], None] | None = None
+    budget_sink: Callable[[object], None] | None = None
 
     def emit(self, event: str, **fields: object) -> None:
         if self.on_event is None:
@@ -146,11 +165,23 @@ class RunSlot:
     doc_type: DocType = DocType.any_client_valuation_doc
     doc_type_spec: DocTypeSpec | None = None  # Smart Search profile; None = builtin doc_type
     firm: str | None = None  # event-grouping label; defaults to client
-    restrict_to_client_sourced: bool = True  # False = allow HL/non-client sources (rank-only)
+    # Source-preference mode (see models.SourceMode). restrict_to_client_sourced
+    # is kept for backward compat; if a caller sets only the bool we map it
+    # (True->client, False->any) when building the per-slot LocateQuery.
+    source_mode: SourceMode = "client"
+    restrict_to_client_sourced: bool = True
 
     @property
     def group(self) -> str:
         return self.firm or self.client
+
+    @property
+    def effective_source_mode(self) -> SourceMode:
+        # source_mode is canonical; fall back to the legacy bool when a caller
+        # only set restrict_to_client_sourced.
+        if self.source_mode != "client":
+            return self.source_mode
+        return "client" if self.restrict_to_client_sourced else "any"
 
 
 @dataclass
@@ -204,6 +235,10 @@ class _WorkItem:
     # the slot's primary (located) document; the rest are recorded extras.
     merge_key: str | None = None
     merge_primary: bool = False
+    # Direct Run: an explicit analyst-picked file (no locator/deal). Peek-verify
+    # rejections (HL letterhead, asset/deal-name mismatch) are meaningless here
+    # and must not raise the MANUAL OVERRIDE flag.
+    direct: bool = False
 
 
 def _group_kw(item: _WorkItem) -> dict[str, str]:
@@ -248,8 +283,11 @@ def _verify_and_extract(
     item: _WorkItem, config: Config, schema_fields: list[SchemaField],
     routing: dict[str, list[str]], force: bool, db_path: Path,
     control: RunControl,
+    extra_extractors=None,
 ) -> _WorkItem:
-    """Thread-pool worker: content verification, cache lookup, extraction."""
+    """Thread-pool worker: content verification, cache lookup, extraction.
+    extra_extractors are profile-specific deterministic band extractors (e.g.
+    GEDP) run alongside the master band extractors."""
     if control.cancelled:
         item.deferred = True
         return item
@@ -292,7 +330,9 @@ def _verify_and_extract(
 
     started = time.perf_counter()
     control.emit("stage", client=item.client, deal=item.deal, stage="read", status="started", **gkw)
-    item.engine = extract_memo(winner_path, config, schema_fields, routing)
+    item.engine = extract_memo(
+        winner_path, config, schema_fields, routing, extra_extractors=extra_extractors
+    )
     item.timings_ms["extract"] = round((time.perf_counter() - started) * 1000, 1)
     control.emit(
         "stage", client=item.client, deal=item.deal, stage="extract", status="done",
@@ -344,6 +384,200 @@ def _extra_work_items(
 
 def _schema_json_path() -> Path:
     return Path(__file__).resolve().parents[2] / "schema" / "master_schema.json"
+
+
+def _schema_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "schema"
+
+
+def resolve_schema_for_template(
+    config: Config,
+    template: str | Path | None,
+    *,
+    field_edits: "FieldEdits | None" = None,
+) -> tuple[list[SchemaField], dict[str, list[str]], WorkbookLayout, bool, str | None]:
+    """Return (schema_fields, band_routing, layout, is_custom, profile) for a run.
+
+    The default master template (or any workbook whose "Index" row-2 headers
+    match the committed master schema byte-for-byte) uses the fast committed
+    schema + deterministic band routing — byte-for-byte today's behavior. Any
+    OTHER workbook is a *custom* reference: its headers are autodetected into a
+    schema, missing identity columns are prepended, deterministic band routing
+    is empty (deterministic extraction has no specs for unknown headers) and the
+    run extracts LLM-first.
+
+    field_edits (analyst column edits from the GUI) are applied last. ANY
+    non-empty edit forces the custom / LLM-first path: the committed master
+    workbook can't cleanly gain/lose columns via copy_template, so an edited
+    master is written to a fresh custom sheet and the added columns are
+    LLM-extracted.
+
+    profile: a deterministic extraction profile (e.g. 'hl_gedp') detected for a
+    custom field set — when present the run runs that profile's deterministic
+    extractors (LLM fills the gaps) instead of being purely LLM-first, and the
+    profile's dtype overrides are applied so the parsers pick the right kind.
+    None for the master template and for unrecognized custom workbooks."""
+    template_path = Path(template) if template else _default_template()
+    if not template or workbook_matches_master(template_path, _schema_dir()):
+        fields, routing, layout, is_custom = (
+            load_schema_fields(), load_band_routing(), WorkbookLayout(), False
+        )
+    else:
+        compiled, layout = compile_schema_from_workbook(template_path)
+        fields, routing, is_custom = compiled, {}, True
+
+    if field_edits is not None and not field_edits.is_empty():
+        fields, layout = _apply_field_edits(fields, layout, field_edits)
+        # An edited workbook is always custom/LLM-first (see docstring).
+        routing, is_custom = {}, True
+
+    profile: str | None = None
+    if is_custom:
+        from pv_extractor.extract import profiles as _profiles
+
+        profile = _profiles.detect_profile(fields, forced=config.extraction.profile)
+        if profile is not None:
+            overrides = _profiles.dtype_overrides_for_profile(profile)
+            for f in fields:
+                ov = overrides.get(f.header)
+                if ov is not None:
+                    f.dtype, f.unit = ov
+    return fields, routing, layout, is_custom, profile
+
+
+def profile_extractors_for(profile: str | None):
+    """The deterministic band extractors for a detected profile (empty list when
+    none). Imported lazily so the profiles package isn't loaded on every run."""
+    if not profile:
+        return []
+    from pv_extractor.extract import profiles as _profiles
+
+    return _profiles.extractors_for_profile(profile)
+
+
+# Bands whose fields are run-identity / QA / threshold metadata — never
+# removable or renameable by an analyst (the writer + pipeline depend on them).
+_PROTECTED_EDIT_BANDS = frozenset({"IDENTIFICATION", "QA", "THRESHOLD FLAGS"})
+
+
+def _apply_field_edits(
+    fields: list[SchemaField],
+    layout: WorkbookLayout,
+    edits: "FieldEdits",
+) -> tuple[list[SchemaField], WorkbookLayout]:
+    """Apply sparse analyst column edits to a compiled schema.
+
+    Removals drop a column (skipped for protected/identity bands); renames
+    change a header (skipped on collision); additions append REFERENCE columns
+    (LLM-extracted). Returns the new field list + a custom WorkbookLayout whose
+    col_index values are contiguous so the writer creates every column."""
+    from pv_extractor.schema.dynamic_schema import _infer_dtype
+
+    surviving: list[SchemaField] = []
+    removed = {h.strip().casefold() for h in edits.removed}
+    for f in fields:
+        if f.header.strip().casefold() in removed and f.band not in _PROTECTED_EDIT_BANDS:
+            continue
+        surviving.append(f.model_copy(deep=True))
+
+    by_header = {f.header.strip().casefold(): f for f in surviving}
+    for rename in edits.renamed:
+        src = rename.from_.strip().casefold()
+        dst = rename.to.strip()
+        field = by_header.get(src)
+        if field is None or field.band in _PROTECTED_EDIT_BANDS:
+            continue
+        if not dst or dst.casefold() in by_header:  # collision -> skip
+            continue
+        del by_header[src]
+        field.header = dst
+        by_header[dst.casefold()] = field
+
+    next_col = max((f.col_index for f in surviving), default=0)
+    for add in edits.added:
+        header = add.header.strip()
+        if not header or header.casefold() in by_header:
+            continue
+        dtype, unit = (add.dtype, None) if add.dtype else _infer_dtype(header, "")
+        next_col += 1
+        new_field = SchemaField(
+            col_index=next_col, band="REFERENCE", header=header,
+            description=header, dtype=dtype, unit=unit,
+        )
+        surviving.append(new_field)
+        by_header[header.casefold()] = new_field
+
+    # Re-pack col_index contiguously and emit a custom layout so the writer
+    # physically creates every (possibly new) column.
+    for i, f in enumerate(surviving, start=1):
+        f.col_index = i
+    new_layout = layout.model_copy(deep=True)
+    new_layout.is_custom = True
+    return surviving, new_layout
+
+
+def _direct_work_item(
+    file_path: str | Path,
+    *,
+    config: Config,
+    client: str,
+    deal: str,
+    period: str,
+    doc_type: DocType,
+) -> _WorkItem:
+    """Build ONE work item for a single explicit document, bypassing the
+    locator/index entirely (Direct Run). The file may live anywhere — a minimal
+    FileRecord is derived from the path in-memory (no DB lookup, no pv_root
+    requirement). The pick is treated as an analyst override (from_override) so
+    it runs even if the peek-verifier would reject it (flagged, never silent)."""
+    # Strip surrounding quotes/whitespace — Windows "Copy as path" wraps the
+    # path in double quotes, which would otherwise become part of the filename
+    # (OSError: Invalid argument).
+    path = Path(str(file_path).strip().strip('"').strip("'").strip())
+    folder = str(path.parent)
+    extension = path.suffix.lower()
+    record = FileRecord(
+        file_name=path.name,
+        file_path=str(path),
+        folder_path=folder,
+        parent_folder=path.parent.name,
+        extension=extension,
+        client=client or None,
+        deal=deal or None,
+    )
+    # source_mode="any": Direct Run is an EXPLICIT analyst pick, so source
+    # preference is irrelevant — and crucially this stops the peek-verifier from
+    # REJECTING HL valuation memos for carrying "Houlihan Lokey" letterhead
+    # (which fires only in "client" mode), which would otherwise stamp every
+    # such run with a noisy MANUAL OVERRIDE flag.
+    query = LocateQuery(
+        client=client or "Direct", deal=deal or path.stem,
+        period=period or "", doc_type=doc_type,
+        as_of_date=_parse_period_as_of(period),
+        source_mode="any",
+    )
+    winner = CandidateFile(record=record, breakdown=ScoreBreakdown())
+    located = LocateResult(
+        status=ResolutionStatus.FOUND, query=query,
+        candidates=[winner], winner=winner,
+        evidence=f"direct run: explicit document {path.name!r}",
+        from_override=True,
+    )
+    return _WorkItem(client=query.client, deal=query.deal, locate_result=located, direct=True)
+
+
+def _parse_period_as_of(period: str | None):
+    """Best-effort as-of date from a Direct Run period string (ISO date or a
+    period label); None when absent/unparseable — Direct Run does not require
+    a period."""
+    if not period:
+        return None
+    try:
+        return date.fromisoformat(period.strip())
+    except ValueError:
+        from pv_extractor.indexer.periods import parse_date_folder
+
+        return parse_date_folder(period.strip())
 
 
 def _metadata_hits(
@@ -491,6 +725,12 @@ def run(
     exclude: set[tuple[str, str]] | None = None,
     slots: list[RunSlot] | None = None,
     restrict_to_client_sourced: bool = True,
+    source_mode: SourceMode | None = None,
+    direct_file: str | Path | None = None,
+    direct_files: list[str | Path] | None = None,
+    direct_client: str | None = None,
+    direct_deal: str | None = None,
+    field_edits: "FieldEdits | None" = None,
 ) -> RunReport:
     """Execute one extraction run. See module docstring for the pipeline.
     llm_settings=None keeps pure Phase-2 behavior (escalation plans are
@@ -531,7 +771,33 @@ def run(
         items: list[_WorkItem] = []
         coverage: list[CoverageEntry] = []
 
-        if slots is None:
+        direct_paths: list[str | Path] = (
+            list(direct_files) if direct_files
+            else ([direct_file] if direct_file is not None else [])
+        )
+
+        if direct_paths:
+            # ---- direct path: explicit document(s), no locator/index ----
+            # One work item per file; per-file failure isolates in the worker
+            # pool; ONE workbook covers the whole batch (the write phase below
+            # already iterates the items list).
+            log_event(logger, "run started", run_id=run_id, scope="direct",
+                      pairs=len(direct_paths), dry_run=dry_run)
+            control.emit("run_started", run_id=run_id, scope="direct",
+                         pairs=len(direct_paths), dry_run=dry_run)
+            for fp in direct_paths:
+                item = _direct_work_item(
+                    fp, config=config,
+                    client=direct_client or "Direct", deal=direct_deal or "",
+                    period=period, doc_type=doc_type,
+                )
+                items.append(item)
+                control.emit(
+                    "stage", client=item.client, deal=item.deal, stage="locate",
+                    status=item.locate_result.status.value,
+                    file_name=item.locate_result.winner.record.file_name if item.locate_result.winner else None,
+                )
+        elif slots is None:
             # ---- run-wide path (legacy; byte-for-byte unchanged) ----
             pairs = _resolve_pairs(conn, scope, client, deal, exclude)
             log_event(logger, "run started", run_id=run_id, scope=scope, period=period,
@@ -540,10 +806,13 @@ def run(
             # ---- locate (main thread: SQLite) ----
             control.emit("run_started", run_id=run_id, scope=scope, period=period,
                          pairs=len(pairs), dry_run=dry_run)
+            run_mode: SourceMode = source_mode if source_mode is not None else (
+                "client" if restrict_to_client_sourced else "any"
+            )
             for pair_client, pair_deal in pairs:
                 query = LocateQuery(
                     client=pair_client, deal=pair_deal, period=period, doc_type=doc_type,
-                    restrict_to_client_sourced=restrict_to_client_sourced,
+                    source_mode=run_mode,
                 )
                 located = locate(conn, config, query)  # ValueError (bad period) aborts before any processing
                 extras = _extra_work_items(conn, config, pair_client, pair_deal, located, doc_type.value, None)
@@ -568,7 +837,7 @@ def run(
             for slot in slots:
                 query = LocateQuery(client=slot.client, deal=slot.deal,
                                     period=slot.period, doc_type=slot.doc_type,
-                                    restrict_to_client_sourced=slot.restrict_to_client_sourced)
+                                    source_mode=slot.effective_source_mode)
                 try:
                     # Unlike the run-wide path, a per-slot ValueError (e.g. a
                     # bad period) is contained: only this slot is marked ERROR
@@ -608,8 +877,14 @@ def run(
         report = RunReport(run_id=run_id, run_dir=None, workbook_path=None, dry_run=dry_run)
         report.started_at = now.isoformat(timespec="seconds")
 
-        schema_fields = load_schema_fields()
-        routing = load_band_routing()
+        schema_fields, routing, layout, is_custom, profile = resolve_schema_for_template(
+            config, template, field_edits=field_edits
+        )
+        if is_custom and not dry_run and not (llm_settings is not None and llm_settings.enabled):
+            raise ValueError(
+                "a custom reference workbook is extracted LLM-first, but LLM assist is "
+                "disabled — enable the LLM (or use the master template) for this run"
+            )
         schema_by_header = {f.header: f for f in schema_fields}
         ruleset = load_rules(config.validation.rules_path)
         # Computed/derived headers (rule 7) are never escalated to the LLM even
@@ -624,8 +899,31 @@ def run(
         combine_deal_documents = bool(
             llm_on and (config.llm.combine_deal_documents or config.llm.one_call_per_deal)
         )
-        force_assist = bool(llm_settings is not None and llm_settings.force_assist)
+        # A custom reference workbook has no deterministic extractors, so the LLM
+        # is the primary extractor for it: escalate every field (force-assist
+        # semantics) and bypass the deterministic result cache. EXCEPTION: a
+        # custom workbook with a recognized deterministic profile (e.g. GEDP)
+        # runs that profile first and uses the normal narrow escalation plan, so
+        # confident deterministic hits are protected and only gaps escalate.
+        force_assist = bool(llm_settings is not None and llm_settings.force_assist) or (
+            is_custom and profile is None and not dry_run
+        )
+        # A recognized custom field set (e.g. GEDP) normally gets deterministic
+        # profile extractors and the LLM fills only the gaps. But when the analyst
+        # forces LLM-assist ("LLM as the primary extractor, no algorithm"), SKIP
+        # the profile so confident deterministic hits don't shadow the LLM — the
+        # LLM extracts every field itself.
+        profile_extractors = [] if force_assist else profile_extractors_for(profile)
         effective_force = force or force_assist
+        # LLM-first flows (custom reference or Direct Run) read the document
+        # natively (direct_document_read), so local-text quote-grounding is
+        # unreliable and was capping every value at ungrounded_confidence_cap
+        # (~0.20) and discarding the model's own confidence. Trust the model
+        # here: the review shows the LLM's self-reported confidence per field.
+        # Work on a COPY so the caller's config object is never mutated.
+        if (is_custom or direct_paths) and not dry_run and config.llm.confidence_selection:
+            config = config.model_copy(deep=True)
+            config.llm.confidence_selection = False
 
         # ---- verify (+extract unless dry-run) in the worker pool ----
         # AMBIGUOUS results are verified too: content verification is what
@@ -644,7 +942,7 @@ def run(
                 futures = {
                     pool.submit(
                         _verify_and_extract, item, config, schema_fields, routing, effective_force,
-                        config.db_path, control,
+                        config.db_path, control, profile_extractors,
                     ): item
                     for item in candidates
                 }
@@ -686,10 +984,22 @@ def run(
         run_dir = Path(config.output_dir) / run_id
         template_path = Path(template) if template else _default_template()
         workbook_path = run_dir / f"master_index_{run_id}.xlsx"
-        copy_template(template_path, workbook_path, config.pv_root)
-        writer = WorkbookWriter(workbook_path, schema_fields, config.pv_root)
+        if is_custom:
+            # The user's reference workbook only DEFINES the columns; we never
+            # mutate it (it is often a wide, pre-populated, merged-cell template
+            # that openpyxl's insert_cols corrupts). Write a fresh clean sheet.
+            create_custom_workbook(workbook_path, schema_fields, layout, config.pv_root)
+        else:
+            copy_template(template_path, workbook_path, config.pv_root)
+        writer = WorkbookWriter(workbook_path, schema_fields, config.pv_root, layout=layout)
         report.run_dir = run_dir
         report.workbook_path = workbook_path
+        # Persist the resolved schema + layout so the GUI review queue (which
+        # edits THIS run's workbook copy) reconstructs the same columns. The
+        # master path leaves no snapshot — review_service falls back to the
+        # committed schema, exactly as before.
+        if is_custom:
+            _write_schema_snapshot(run_dir, schema_fields, layout, config.pv_root)
 
         # Assemble every memo first (and populate the deterministic result
         # cache) so the LLM second pass can run over the whole batch before
@@ -714,6 +1024,7 @@ def run(
                         item, config, schema_by_header, ruleset, routing, writer,
                         run_id=run_id, memo_seq=memo_counter, now=now,
                         force_assist=force_assist, derived_headers=derived_headers,
+                        layout=layout,
                     )
                     # Never persist a force_assist memo: its escalation plan is
                     # intentionally broad and would poison a later normal run.
@@ -753,18 +1064,30 @@ def run(
                 routing_mode=llm_settings.mode,
             )
             report.llm = LlmRunSummary(enabled=True, executed=True, diagnostics=routing_diag)
+            # One reaper per run, shared across both passes (and the rescue wave
+            # below) so the retention window spans them all in completion order.
+            reaper = LlmScratchReaper(
+                run_dir, config.pv_root,
+                enabled=config.llm.scratch_cleanup_enabled,
+                retain=config.llm.scratch_cleanup_retain,
+                keep_data=config.llm.scratch_cleanup_keep_data,
+            )
             if deal_groups:
                 deal_summary = process_deals(
                     deal_groups, config, llm_settings, schema_fields,
                     run_id=run_id, run_dir=run_dir, client=llm_client,
-                    event_sink=_llm_event_sink,
+                    event_sink=_llm_event_sink, reaper=reaper,
+                    on_pause=control.budget_pause_cb, cancel_event=control.cancel_event,
+                    budget_sink=control.budget_sink,
                 )
                 report.llm = _merge_llm_summaries(report.llm, deal_summary)
             if document_memos:
                 doc_summary = process_memos(
                     document_memos, config, llm_settings, schema_fields,
                     run_id=run_id, run_dir=run_dir, client=llm_client,
-                    event_sink=_llm_event_sink,
+                    event_sink=_llm_event_sink, reaper=reaper,
+                    on_pause=control.budget_pause_cb, cancel_event=control.cancel_event,
+                    budget_sink=control.budget_sink,
                 )
                 report.llm = _merge_llm_summaries(report.llm, doc_summary)
             control.emit(
@@ -800,7 +1123,9 @@ def run(
                 rescue_summary = process_memos(
                     rescue_memos, config, llm_settings, schema_fields,
                     run_id=run_id, run_dir=run_dir, client=llm_client,
-                    event_sink=_llm_event_sink,
+                    event_sink=_llm_event_sink, reaper=reaper,
+                    on_pause=control.budget_pause_cb, cancel_event=control.cancel_event,
+                    budget_sink=control.budget_sink,
                 )
                 report.llm = _merge_llm_summaries(report.llm, rescue_summary)
                 final_started = time.perf_counter()
@@ -1406,6 +1731,7 @@ def _assemble_memo(
     now: datetime,
     force_assist: bool = False,
     derived_headers: set[str] | None = None,
+    layout: WorkbookLayout | None = None,
 ) -> MemoResult:
     winner = item.locate_result.winner
     assert winner is not None
@@ -1422,10 +1748,17 @@ def _assemble_memo(
         locator_breakdown=winner.breakdown, verify=item.verify,
         timings_ms=item.timings_ms,
     )
-    # An explicit analyst override ran a file the peek-verifier would have
-    # rejected (HL work product, wrong period/asset). Never silent: flag it so
-    # the row is reviewable, but the chosen file was still extracted.
-    if item.locate_result.from_override and item.verify is not None and item.verify.status is VerifyStatus.REJECTED:
+    # An analyst override from the LOCATOR ran a file the peek-verifier would
+    # have rejected (HL work product, wrong period/asset). Never silent: flag it
+    # so the row is reviewable, but the chosen file was still extracted. Direct
+    # Run is excluded — it is always an explicit single-file pick with no real
+    # deal to cross-check, so a rejection there is meaningless noise.
+    if (
+        not item.direct
+        and item.locate_result.from_override
+        and item.verify is not None
+        and item.verify.status is VerifyStatus.REJECTED
+    ):
         memo.memo_flags.append(
             ReviewFlag(
                 category="locator",
@@ -1457,20 +1790,26 @@ def _assemble_memo(
         row_memo_id = memo_id if index == 1 else f"{memo_id}-A{index}"
         populated = {hit.field for hit in hits if hit.value is not None}
         resolved_asset = asset_name or (item.verify.asset_names[0] if item.verify and item.verify.asset_names else None)
-        metadata = _metadata_hits(
-            schema_by_header,
-            {
-                "\U0001f511 Memo ID": row_memo_id,
-                "Run ID": run_id,
-                "Source Filename": record.file_name,
-                "Extraction Date": now.date().isoformat(),
-                "Valuation Date": as_of.isoformat() if as_of else None,
-                "Reporting Period": reporting,
-                "Fund Manager": item.client,
-                "Portfolio Company": asset_name or resolved_asset or item.deal,
-            },
-            populated,
-        )
+        metadata_values: dict[str, object] = {
+            "\U0001f511 Memo ID": row_memo_id,
+            "Run ID": run_id,
+            "Source Filename": record.file_name,
+            "Extraction Date": now.date().isoformat(),
+            "Valuation Date": as_of.isoformat() if as_of else None,
+            "Reporting Period": reporting,
+            "Fund Manager": item.client,
+            "Portfolio Company": asset_name or resolved_asset or item.deal,
+        }
+        # A custom reference workbook carries plainly-named identity columns
+        # (see dynamic_schema.ADMIN_COLUMNS) rather than the master headers; the
+        # extra keys are harmless on the master path (no such columns exist).
+        if layout is not None and layout.is_custom:
+            metadata_values.update({
+                "Memo ID": row_memo_id,
+                "Client": item.client,
+                "Deal": asset_name or resolved_asset or item.deal,
+            })
+        metadata = _metadata_hits(schema_by_header, metadata_values, populated)
         all_hits = [*metadata, *hits]
         _attach_evidence_source(all_hits, source_id=memo_id, source_file=record.file_path)
 
@@ -1510,13 +1849,28 @@ def _assemble_memo(
 
 
 def _existing_row_memo_ids(writer: WorkbookWriter) -> set[str]:
-    sheet = writer.workbook["Index"]
+    sheet = writer.workbook[writer.layout.sheet_name]
+    memo_col = writer.layout.memo_id_col
     ids: set[str] = set()
-    for row in range(4, sheet.max_row + 1):  # Memo ID is column 1, data starts row 4
-        value = sheet.cell(row=row, column=1).value
+    for row in range(writer.layout.data_start_row, sheet.max_row + 1):
+        value = sheet.cell(row=row, column=memo_col).value
         if value:
             ids.add(str(value))
     return ids
+
+
+def _write_schema_snapshot(
+    run_dir: Path, schema_fields: list[SchemaField], layout: WorkbookLayout, pv_root: str
+) -> None:
+    """Persist the resolved (custom) schema + layout next to the run's workbook
+    so the GUI review queue can reopen the workbook with the right columns."""
+    path = run_dir / "schema_snapshot.json"
+    doc = {
+        "fields": [f.model_dump() for f in schema_fields],
+        "layout": layout.model_dump(),
+    }
+    with guarded_open_write(path, pv_root) as fh:
+        fh.write(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
 
 
 def _write_memo(writer: WorkbookWriter, memo: MemoResult) -> int:

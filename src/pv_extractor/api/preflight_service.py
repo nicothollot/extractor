@@ -27,9 +27,36 @@ from pv_extractor.llm.model_registry import ExtractionPlanMetrics, ModelRegistry
 # in-run estimator uses the real prompt/payload sizes instead.
 _CHARS_PER_PAGE = 2800
 _ASSUMED_ESCALATED_FIELDS = 80
-# Under force_llm_assist the LLM is the primary extractor: most empty
-# extractable fields escalate, so the per-memo schema/output is much larger.
-_ASSUMED_ESCALATED_FIELDS_FORCE_ASSIST = 300
+
+
+_LLM_EXTRACTABLE_COUNT_CACHE: dict[str, int] = {}
+# Bands the LLM never extracts (run identity / QA verdicts / threshold flags) —
+# mirrors run._NON_EXTRACTABLE_BANDS so the force-assist field estimate matches
+# what the planner will actually escalate.
+_NON_EXTRACTABLE_BANDS = frozenset({"IDENTIFICATION", "QA", "THRESHOLD FLAGS"})
+
+
+def _force_assist_field_count(config: Config) -> int:
+    """The real number of LLM-extractable fields in the active schema — the
+    honest stand-in for the old magic 300 under force_llm_assist (the LLM is
+    the primary extractor, so most empty extractable fields escalate). Counts
+    the master schema once and memoizes; degrades to 300 if it can't load."""
+    key = str(config.llm.models_path)
+    if key in _LLM_EXTRACTABLE_COUNT_CACHE:
+        return _LLM_EXTRACTABLE_COUNT_CACHE[key]
+    try:
+        from pv_extractor.extract.engine import load_schema_fields
+
+        fields = load_schema_fields()
+        count = sum(
+            1
+            for f in fields
+            if f.band not in _NON_EXTRACTABLE_BANDS and f.slot_group is None
+        )
+    except Exception:  # noqa: BLE001 — estimate degrades, never fails
+        count = 300
+    _LLM_EXTRACTABLE_COUNT_CACHE[key] = count
+    return count
 
 
 class MemoEstimate(BaseModel):
@@ -123,7 +150,7 @@ def estimate_from_dry_run(
     if job is None:
         raise ValueError(f"unknown job {job_id!r}")
     assumed_fields = (
-        _ASSUMED_ESCALATED_FIELDS_FORCE_ASSIST if force_assist else _ASSUMED_ESCALATED_FIELDS
+        _force_assist_field_count(config) if force_assist else _ASSUMED_ESCALATED_FIELDS
     )
 
     registry = ModelRegistry.load(config.llm.models_path)
@@ -142,7 +169,13 @@ def estimate_from_dry_run(
             "max_pages_per_memo": config.llm.max_pages_per_memo,
             "provider": provider,
             "pricing_source": str(config.llm.models_path),
+            "pricing_last_reviewed": registry.menu.last_reviewed,
             "repair_policy": repair_policy or config.llm.candidate_arbitration.repair_policy,
+            # Current default execution shape — surfaced so the displayed
+            # estimate reflects how the run will actually call the model.
+            "direct_document_read": config.llm.direct_document_read,
+            "file_based_output": config.llm.file_based_output,
+            "field_batch_count": config.llm.field_batch_count,
         },
     )
 

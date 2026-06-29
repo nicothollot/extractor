@@ -34,6 +34,7 @@ from pv_extractor.models import (
     LocateQuery,
     LocateResult,
     ResolutionStatus,
+    SourceMode,
     VerifyResult,
 )
 from pv_extractor.run import _resolve_pairs
@@ -66,6 +67,10 @@ class SlotSelection(BaseModel):
     predicted_period: str = ""
     override_in_effect: bool = False
     detail: str = ""
+    # The deal's discovered folder on the share (deal_folders.folder_paths[0]),
+    # so the GUI file picker can open in the deal folder when swapping/adding a
+    # file instead of the share root. None when the deal has no folder record.
+    deal_folder: str | None = None
     # the auto-selected (post-verify) document, when one was resolved
     file_name: str | None = None
     file_path: str | None = None
@@ -110,6 +115,26 @@ def _iso(value: object) -> str | None:
     return getattr(value, "isoformat", lambda: str(value))()
 
 
+def _abs_deal_folder(config: Config, folder: str | None) -> str | None:
+    """deal_folders stores client-relative paths; the GUI picker needs an
+    absolute path. Join pv_root unless the value is already absolute (UNC,
+    drive-letter, or already under pv_root)."""
+    if not folder:
+        return None
+    norm = folder.replace("\\", "/")
+    root = str(config.pv_root).replace("\\", "/").rstrip("/")
+    is_abs = (
+        norm.startswith("//")  # UNC
+        or norm.startswith("/")  # posix abs
+        or (len(norm) >= 2 and norm[1] == ":")  # drive letter
+        or norm.lower().startswith(root.lower() + "/")
+    )
+    if is_abs:
+        return folder
+    sep = "\\" if "\\" in str(config.pv_root) else "/"
+    return f"{str(config.pv_root).rstrip(sep)}{sep}{folder}"
+
+
 def _candidate_info(cand, verdict: VerifyResult | None, selected_path: str | None) -> CandidateInfo:
     return CandidateInfo(
         file_name=cand.record.file_name,
@@ -134,7 +159,7 @@ def _locate_slot(
     *,
     target: date | None,
     doc_type_spec: DocTypeSpec | None,
-    restrict_to_client_sourced: bool,
+    source_mode: SourceMode = "client",
     doc_type_label: str | None = None,
 ) -> tuple[SlotSelection, LocateResult | None]:
     """Conn-bound phase: the predicted period, the learned-override check and
@@ -152,6 +177,7 @@ def _locate_slot(
         slot_key=f"{client}|{deal}|{period}|{label}",
         period=period, doc_type=label,
         status=ResolutionStatus.NOT_FOUND.value,
+        deal_folder=_abs_deal_folder(config, db.deal_folder_path(conn, client, deal)),
     )
     if target is not None:
         slot.as_of_date = target.isoformat()
@@ -171,7 +197,7 @@ def _locate_slot(
             config,
             LocateQuery(
                 client=client, deal=deal, period=period, doc_type=doc_type,
-                restrict_to_client_sourced=restrict_to_client_sourced,
+                source_mode=source_mode,
             ),
             doc_type_spec=doc_type_spec,
         )
@@ -234,7 +260,7 @@ def slot_selection(
     target: date | None = None,
     enhanced_period_check: bool = False,
     doc_type_spec: DocTypeSpec | None = None,
-    restrict_to_client_sourced: bool = True,
+    source_mode: SourceMode = "client",
     doc_type_label: str | None = None,
 ) -> SlotSelection:
     """Resolve one (client, deal) slot through the SAME pipeline steps a run
@@ -256,7 +282,7 @@ def slot_selection(
     slot, located = _locate_slot(
         conn, config, client, deal, period, doc_type,
         target=target, doc_type_spec=doc_type_spec,
-        restrict_to_client_sourced=restrict_to_client_sourced,
+        source_mode=source_mode,
         doc_type_label=doc_type_label,
     )
     return _verify_slot(
@@ -325,7 +351,7 @@ class _SelectionContext(BaseModel):
     doc_type: str  # preview doc type (resolved value)
     doc_types: list[str]
     periods: list[str]
-    restrict_to_client_sourced: bool
+    source_mode: SourceMode
     client: str | None
     deal: str | None
     enhanced_period_check: bool
@@ -353,7 +379,8 @@ def _selection_context(job, config: Config) -> "_SelectionContext":
         doc_type=eff_doc_types[0],
         doc_types=eff_doc_types,
         periods=eff_periods,
-        restrict_to_client_sourced=bool(params.get("restrict_to_client_sourced", True)),
+        source_mode=params.get("source_mode")
+        or ("client" if bool(params.get("restrict_to_client_sourced", True)) else "any"),
         client=params.get("client") or None,
         deal=params.get("deal") or None,
         enhanced_period_check=bool(
@@ -414,7 +441,7 @@ def build_selection(manager: JobManager, job_id: str, config: Config) -> Selecti
                     slot, located = _locate_slot(
                         conn, config, pair_client, pair_deal, period, dt_resolved,
                         target=slot_target, doc_type_spec=dt_spec,
-                        restrict_to_client_sourced=ctx.restrict_to_client_sourced,
+                        source_mode=ctx.source_mode,
                         doc_type_label=dt_label,
                     )
                     located_slots.append((slot, located, slot_target, pair_client))
@@ -467,7 +494,7 @@ def build_single_slot(
         slot, located = _locate_slot(
             conn, config, client, deal, slot_period, dt_resolved,
             target=slot_target, doc_type_spec=dt_spec,
-            restrict_to_client_sourced=ctx.restrict_to_client_sourced,
+            source_mode=ctx.source_mode,
             doc_type_label=slot_doc_type,
         )
     finally:
@@ -476,3 +503,113 @@ def build_single_slot(
         slot, located, config,
         target=slot_target, enhanced_period_check=ctx.enhanced_period_check, client=client,
     )
+
+
+def _client_for_folder(config: Config, folder_path: str) -> str | None:
+    """The top-level client folder name a path lives under pv_root, or None."""
+    root = str(config.pv_root).replace("\\", "/").rstrip("/")
+    norm = folder_path.replace("\\", "/").rstrip("/")
+    if not norm.lower().startswith(root.lower()):
+        return None
+    rel = norm[len(root):].lstrip("/")
+    first = rel.split("/", 1)[0] if rel else ""
+    return first or None
+
+
+def _rel_to_root(config: Config, path: str) -> str:
+    """Path normalized relative to pv_root (lowercased, forward slashes) so an
+    absolute picked path and a stored pv_root-relative deal_folders path compare.
+    """
+    norm = path.replace("\\", "/").rstrip("/").lower()
+    root = str(config.pv_root).replace("\\", "/").rstrip("/").lower()
+    if norm.startswith(root + "/"):
+        return norm[len(root) + 1:]
+    if norm == root:
+        return ""
+    return norm
+
+
+def _match_added_deal(conn, config: Config, client: str, folder_path: str) -> str | None:
+    """After refresh_deals, find the discovered (named) deal whose folder the
+    analyst picked — exact, ancestor or descendant match, compared relative to
+    pv_root since deal_folders stores client-relative paths. The add_folder
+    correction itself can leave an unnamed ('') pin; we prefer a real deal."""
+    target = _rel_to_root(config, folder_path)
+    for folder in db.deal_folders_for_client(conn, client):
+        if not folder.name:
+            continue
+        for fp in folder.folder_paths:
+            f = _rel_to_root(config, fp)
+            if f == target or target.startswith(f + "/") or f.startswith(target + "/"):
+                return folder.name
+    return None
+
+
+class AddDealResult(BaseModel):
+    client: str
+    deal: str | None
+    slots: list[SlotSelection] = Field(default_factory=list)
+    detail: str = ""
+
+
+def add_deal_slots(
+    manager: JobManager, job_id: str, config: Config, deal_folder_path: str
+) -> AddDealResult:
+    """Add a deal the locator missed (the Confirm-documents "Add a missed deal"
+    action) for an in-flight preflight job. Records the picked folder as a
+    persisted add_folder correction, re-discovers the client's deals so future
+    runs see it too, resolves the new deal name, and auto-searches the run's
+    periods × doc-types for it — returning the resulting SlotSelection rows the
+    UI appends to the table. The launch (scope = all deals for the client) then
+    includes the deal automatically."""
+    from pv_extractor.api import run_slots as _rs
+    from pv_extractor.indexer import deal_learning, deals as deals_module
+
+    job = manager.get(job_id)
+    ctx = _selection_context(job, config)
+    client = ctx.client or _client_for_folder(config, deal_folder_path)
+    if not client:
+        raise ValueError(
+            "could not determine the client for the picked folder — it must live under pv_root"
+        )
+
+    conn = db.open_db(config.db_path, config.pv_root)
+    try:
+        # Persist the correction (deduped) so future scans/runs discover it too.
+        existing = deal_learning.list_corrections(conn, client)
+        seen = {(c["action"], c.get("folder_path"), c["deal"]) for c in existing}
+        if ("add_folder", deal_folder_path, "") not in seen:
+            deal_learning.record_correction(
+                conn, client=client, deal="", action="add_folder", folder_path=deal_folder_path
+            )
+        deals_module.refresh_deals(conn, config, [client], apply_learning=True)
+        deal = _match_added_deal(conn, config, client, deal_folder_path)
+        if not deal:
+            return AddDealResult(
+                client=client, deal=None,
+                detail="The folder was recorded, but no deal could be discovered under it "
+                "(it may hold no recognizable documents). Re-scan the client, then try again.",
+            )
+        resolved_types = {dt: _rs.resolve_doc_type(conn, config, dt) for dt in ctx.doc_types}
+        located_slots: list[tuple[SlotSelection, LocateResult | None, date | None, str]] = []
+        for period in ctx.periods:
+            slot_target = _slot_target(config, client, period)
+            for dt_label in ctx.doc_types:
+                dt_resolved, dt_spec = resolved_types[dt_label]
+                slot, located = _locate_slot(
+                    conn, config, client, deal, period, dt_resolved,
+                    target=slot_target, doc_type_spec=dt_spec,
+                    source_mode=ctx.source_mode, doc_type_label=dt_label,
+                )
+                located_slots.append((slot, located, slot_target, client))
+    finally:
+        conn.close()
+
+    slots = [
+        _verify_slot(
+            slot, located, config,
+            target=slot_target, enhanced_period_check=ctx.enhanced_period_check, client=pair_client,
+        )
+        for slot, located, slot_target, pair_client in located_slots
+    ]
+    return AddDealResult(client=client, deal=deal, slots=slots)

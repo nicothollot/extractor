@@ -15,7 +15,7 @@ export default function ReviewQueue() {
   // No run selected: pick from recent runs.
   if (!runId) {
     return (
-      <Panel className="space-y-4 max-w-4xl">
+      <Panel className="space-y-4 max-w-[1600px]">
         <h1 className="text-xl font-semibold text-ink-900">Review queue</h1>
         <Card>
           <CardHeader title="Pick a run" />
@@ -61,6 +61,9 @@ function QueueForRun({ runId }: { runId: string }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showResolved, setShowResolved] = useStickyState("review.showResolved", false);
   const [categoryFilter, setCategoryFilter] = useStickyState<string>("review.categoryFilter", "");
+  // "needs" = only items awaiting a banker's approval (flags + sub-threshold
+  // values); "all" = every extracted value for cross-checking.
+  const [approvalFilter, setApprovalFilter] = useStickyState<"needs" | "all">("review.approvalFilter", "needs");
   const [editMode, setEditMode] = useState(false);
   const [editValue, setEditValue] = useState("");
   const [editNote, setEditNote] = useState("");
@@ -73,10 +76,20 @@ function QueueForRun({ runId }: { runId: string }) {
 
   const items = useMemo(() => {
     let rows = queue.data?.items ?? [];
-    if (!showResolved) rows = rows.filter((i) => !i.resolved);
+    if (approvalFilter === "needs") {
+      rows = rows.filter((i) => i.needs_approval); // resolved items have needs_approval=false
+    } else if (!showResolved) {
+      rows = rows.filter((i) => !i.resolved);
+    }
     if (categoryFilter) rows = rows.filter((i) => i.category === categoryFilter);
     return rows;
-  }, [queue.data, showResolved, categoryFilter]);
+  }, [queue.data, showResolved, categoryFilter, approvalFilter]);
+
+  const needsApprovalCount = useMemo(
+    () => (queue.data?.items ?? []).filter((i) => i.needs_approval).length,
+    [queue.data],
+  );
+  const totalValues = queue.data?.items?.length ?? 0;
 
   const categories = useMemo(() => {
     const counts = new Map<string, number>();
@@ -147,18 +160,22 @@ function QueueForRun({ runId }: { runId: string }) {
     [items, queue, runId],
   );
 
-  const bulkAccept = async (category: string | null) => {
+  const bulkAccept = async (category: string | null, needsApprovalOnly = false) => {
     setActionError(null);
     try {
-      await post(`/api/runs/${runId}/review/bulk-accept`, category ? { category } : {});
+      const body: Record<string, unknown> = {};
+      if (category) body.category = category;
+      if (needsApprovalOnly) body.needs_approval_only = true;
+      await post(`/api/runs/${runId}/review/bulk-accept`, body);
       queue.reload();
     } catch (e) {
       setActionError((e as Error).message);
     }
   };
 
+  // "pending" = items awaiting a banker's approval (not the full value list).
   const pendingCount = useMemo(
-    () => (queue.data?.items ?? []).filter((i) => !i.resolved).length,
+    () => (queue.data?.items ?? []).filter((i) => i.needs_approval).length,
     [queue.data],
   );
 
@@ -197,13 +214,15 @@ function QueueForRun({ runId }: { runId: string }) {
   }, [selected?.id]);
 
   return (
-    <Panel className="space-y-3 max-w-[1400px]">
+    <Panel className="space-y-3 max-w-[1600px]">
       <div className="flex items-center justify-between">
         <div className="flex items-baseline gap-3">
           <h1 className="text-xl font-semibold text-ink-900">Review queue</h1>
           <span className="font-mono text-[12px] text-ink-500">{runId}</span>
           <span className="text-[12px] text-ink-500">
-            {items.length} open item{items.length === 1 ? "" : "s"}
+            {approvalFilter === "needs"
+              ? `${items.length} need${items.length === 1 ? "s" : ""} approval`
+              : `${items.length} value${items.length === 1 ? "" : "s"}`}
           </span>
         </div>
         <div className="flex items-center gap-2 text-[12px] text-ink-500">
@@ -216,6 +235,22 @@ function QueueForRun({ runId }: { runId: string }) {
       </div>
 
       <div className="flex items-center gap-2 flex-wrap">
+        <div className="inline-flex rounded-md border border-line overflow-hidden text-[12.5px]">
+          <button
+            type="button"
+            className={`px-3 py-1.5 ${approvalFilter === "needs" ? "bg-info-soft text-ink-900 font-medium" : "bg-surface text-ink-600 hover:bg-ink-50"}`}
+            onClick={() => setApprovalFilter("needs")}
+          >
+            Needs approval ({needsApprovalCount})
+          </button>
+          <button
+            type="button"
+            className={`px-3 py-1.5 border-l border-line ${approvalFilter === "all" ? "bg-info-soft text-ink-900 font-medium" : "bg-surface text-ink-600 hover:bg-ink-50"}`}
+            onClick={() => setApprovalFilter("all")}
+          >
+            All values ({totalValues})
+          </button>
+        </div>
         <select className={`${inputCls} w-auto`} value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
           <option value="">all categories</option>
           {categories.map(([cat, n]) => (
@@ -225,7 +260,7 @@ function QueueForRun({ runId }: { runId: string }) {
           ))}
         </select>
         <label className="flex items-center gap-1.5 text-[12.5px] text-ink-600">
-          <input type="checkbox" checked={showResolved} onChange={(e) => setShowResolved(e.target.checked)} /> show resolved
+          <input type="checkbox" checked={showResolved} onChange={(e) => setShowResolved(e.target.checked)} disabled={approvalFilter === "needs"} /> show resolved
         </label>
         {categoryFilter && (
           <Button kind="secondary" onClick={() => bulkAccept(categoryFilter)}>
@@ -236,8 +271,8 @@ function QueueForRun({ runId }: { runId: string }) {
           <Button
             kind="secondary"
             onClick={() => {
-              if (window.confirm(`Accept all ${pendingCount} pending item${pendingCount === 1 ? "" : "s"}? Each acceptance is recorded in the audit files.`)) {
-                bulkAccept(null);
+              if (window.confirm(`Accept all ${pendingCount} item${pendingCount === 1 ? "" : "s"} needing approval? Each acceptance is recorded in the audit files.`)) {
+                bulkAccept(null, true);
               }
             }}
           >
@@ -251,7 +286,14 @@ function QueueForRun({ runId }: { runId: string }) {
       {queue.error && <Card><ErrorState message={queue.error} onRetry={queue.reload} /></Card>}
       {queue.data && items.length === 0 && (
         <Card>
-          <EmptyState title="Queue is clear" hint={showResolved ? "No items at all for this run." : "Everything is resolved — toggle ‘show resolved’ to audit past decisions."} />
+          <EmptyState
+            title={approvalFilter === "needs" ? "Nothing needs approval" : "No values"}
+            hint={
+              approvalFilter === "needs"
+                ? "Every extracted value cleared the auto-approval bar. Switch to ‘All values’ to cross-check them."
+                : "This run produced no extracted values."
+            }
+          />
         </Card>
       )}
 
@@ -287,14 +329,32 @@ function QueueForRun({ runId }: { runId: string }) {
                         {item.field ?? item.category}
                       </span>
                       <span className="flex items-center gap-1.5 shrink-0">
+                        {item.confidence !== null && (
+                          <span className="text-[10.5px] font-mono text-ink-500" title="model confidence">
+                            {(item.confidence * 100).toFixed(0)}%
+                          </span>
+                        )}
                         {item.reviewer_attention && <span title="reviewer attention" className="text-warn">⚑</span>}
-                        {item.resolved && <span className="text-[10px] uppercase text-ok font-semibold">resolved</span>}
+                        {item.resolved ? (
+                          <span className="text-[10px] uppercase text-ok font-semibold">resolved</span>
+                        ) : item.needs_approval ? (
+                          <span className="text-[10px] uppercase text-warn font-semibold">needs approval</span>
+                        ) : (
+                          <span className="text-[10px] uppercase text-ink-400 font-semibold" title="confidence at/above the auto-approval bar">auto</span>
+                        )}
                         <MethodChip method={item.method} />
                       </span>
                     </div>
-                    <p className="text-[11.5px] text-ink-500 truncate mt-0.5">{item.description}</p>
+                    <p className="text-[11.5px] text-ink-500 truncate mt-0.5">
+                      {item.value !== null && (
+                        <span className="font-mono text-ink-700">{String(item.value)}{item.unit ? ` ${item.unit}` : ""}</span>
+                      )}
+                      {item.value !== null && item.description ? " — " : ""}
+                      {item.description}
+                    </p>
                     <p className="text-[11px] text-ink-400 font-mono mt-0.5">
                       {item.row_memo_id} · {item.client} / {item.deal}
+                      {item.page ? ` · p${item.page}` : ""}
                     </p>
                   </motion.button>
                 ))}
@@ -327,8 +387,20 @@ function QueueForRun({ runId }: { runId: string }) {
                     </p>
                   </div>
                   <div className="col-span-2">
-                    <p className="text-[11px] uppercase tracking-wide text-ink-400">Flag</p>
-                    <p className="text-ink-700">{selected.description}</p>
+                    <p className="text-[11px] uppercase tracking-wide text-ink-400">
+                      {selected.kind === "flag" ? "Flag" : "Approval status"}
+                    </p>
+                    {selected.kind === "flag" ? (
+                      <p className="text-ink-700">{selected.description}</p>
+                    ) : (
+                      <p className="text-ink-700">
+                        {selected.resolved
+                          ? "Resolved by reviewer"
+                          : selected.needs_approval
+                            ? "Needs manual approval (below the auto-approval bar)"
+                            : "Auto-approved (confidence at/above the auto-approval bar) — shown for cross-checking"}
+                      </p>
+                    )}
                   </div>
                   <div className="col-span-2">
                     <p className="text-[11px] uppercase tracking-wide text-ink-400">
@@ -421,37 +493,47 @@ function QueueForRun({ runId }: { runId: string }) {
                         </div>
                       </div>
                     ) : (
-                      <div className="flex gap-2">
-                        <Button kind="primary" onClick={() => act(selected, "accept")}>
-                          Accept (a)
-                        </Button>
-                        <Button
-                          kind="secondary"
-                          onClick={() => {
-                            setEditMode(true);
-                            setEditValue(selected.value === null ? "" : String(selected.value));
-                            window.setTimeout(() => editRef.current?.focus(), 50);
-                          }}
-                          disabled={selected.field === null}
-                          title={selected.field === null ? "No linked schema field to edit" : undefined}
-                        >
-                          Edit value (e)
-                        </Button>
-                        <Button
-                          kind="secondary"
-                          onClick={() => setAddValueOpen(true)}
-                          disabled={selected.reader !== "pdf" || selected.source_page_count <= 0}
-                          title={
-                            selected.reader !== "pdf"
-                              ? "Add-from-document is available for PDF sources"
-                              : "Find the value in the document, highlight it, and enter it"
-                          }
-                        >
-                          Add value (v)
-                        </Button>
-                        <Button kind="danger" onClick={() => act(selected, "unresolvable")}>
-                          Unresolvable (u)
-                        </Button>
+                      <div className="space-y-2">
+                        {selected.kind !== "flag" && !selected.needs_approval && (
+                          <p className="text-[12px] text-ink-500">
+                            Auto-approved — no action needed. It is already written to the workbook;
+                            use these only to override a value you find incorrect.
+                          </p>
+                        )}
+                        <div className="flex gap-2">
+                          {(selected.kind === "flag" || selected.needs_approval) && (
+                            <Button kind="primary" onClick={() => act(selected, "accept")}>
+                              Accept (a)
+                            </Button>
+                          )}
+                          <Button
+                            kind="secondary"
+                            onClick={() => {
+                              setEditMode(true);
+                              setEditValue(selected.value === null ? "" : String(selected.value));
+                              window.setTimeout(() => editRef.current?.focus(), 50);
+                            }}
+                            disabled={selected.field === null}
+                            title={selected.field === null ? "No linked schema field to edit" : undefined}
+                          >
+                            Edit value (e)
+                          </Button>
+                          <Button
+                            kind="secondary"
+                            onClick={() => setAddValueOpen(true)}
+                            disabled={selected.reader !== "pdf" || selected.source_page_count <= 0}
+                            title={
+                              selected.reader !== "pdf"
+                                ? "Add-from-document is available for PDF sources"
+                                : "Find the value in the document, highlight it, and enter it"
+                            }
+                          >
+                            Add value (v)
+                          </Button>
+                          <Button kind="danger" onClick={() => act(selected, "unresolvable")}>
+                            Unresolvable (u)
+                          </Button>
+                        </div>
                       </div>
                     )}
                   </div>

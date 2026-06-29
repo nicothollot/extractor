@@ -79,3 +79,16 @@ def put_cached(conn: sqlite3.Connection, key: str, schema_ver: str, result: Memo
         ),
     )
     conn.commit()
+
+
+def forget_by_sha256(conn: sqlite3.Connection, shas: list[str]) -> int:
+    """Drop every cached extraction for the given file sha256s (so a future run
+    re-extracts instead of reusing the result). Returns rows removed."""
+    removed = 0
+    for sha in shas:
+        if not sha:
+            continue
+        cur = conn.execute("DELETE FROM extraction_cache WHERE file_sha256 = ?", (sha,))
+        removed += cur.rowcount or 0
+    conn.commit()
+    return removed

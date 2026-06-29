@@ -7,6 +7,7 @@ from pv_extractor.write.workbook import (
     HeaderDriftError,
     WorkbookWriter,
     copy_template,
+    create_custom_workbook,
 )
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "HeaderDriftError",
     "WorkbookWriter",
     "copy_template",
+    "create_custom_workbook",
     "write_audit",
 ]

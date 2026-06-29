@@ -41,6 +41,11 @@ export const put = <T>(path: string, body: unknown) =>
   request<T>(path, { method: "PUT", body: JSON.stringify(body) });
 export const del = <T>(path: string) => request<T>(path, { method: "DELETE" });
 
+/** Resolve a run paused at its LLM budget cap. raise -> lift the cap to
+    amount_usd and resume; remove -> uncap and resume; cancel -> stop the run. */
+export const setBudget = (jobId: string, action: "raise" | "remove" | "cancel", amount_usd?: number) =>
+  post(`/api/jobs/${jobId}/budget`, { action, amount_usd: amount_usd ?? null });
+
 /* ---------- shared types (mirroring api/schemas.py + services) ---------- */
 
 export interface JobInfo {
@@ -184,7 +189,7 @@ export interface MemoIssue {
 
 export interface ReviewItem {
   id: string;
-  kind: "flag" | "low_confidence";
+  kind: "flag" | "low_confidence" | "value";
   run_id: string;
   memo_id: string;
   row_memo_id: string;
@@ -217,6 +222,7 @@ export interface ReviewItem {
   description: string;
   severity: string;
   reviewer_attention: boolean;
+  needs_approval: boolean;
   qa_fail_reasons: string[];
   conflicts: Record<string, unknown>[];
   resolved: boolean;
@@ -227,6 +233,8 @@ export interface ReviewQueueResponse {
   items: ReviewItem[];
   memo_issues: MemoIssue[];
   confidence_threshold: number;
+  auto_approve_enabled: boolean;
+  auto_approve_confidence: number;
 }
 
 export interface PageWords {
@@ -334,6 +342,60 @@ export interface PreflightEstimate {
   assumptions: Record<string, unknown>;
 }
 
+export interface TemplateField {
+  header: string;
+  dtype: string;
+  band: string;
+}
+
+export interface TemplateInspect {
+  ready: boolean;
+  is_custom: boolean;
+  sheet_name: string;
+  sheets: string[];
+  header_row: number;
+  description_row_detected: boolean;
+  field_count: number;
+  fields: TemplateField[];
+  prepended_admin: string[];
+  messages: string[];
+}
+
+/** Autodetect a candidate reference workbook's worksheet + fields so the
+    wizard can show what will be populated and whether it's ready. */
+export const inspectTemplate = (path: string, sheet?: string | null) =>
+  post<TemplateInspect>("/api/templates/inspect", { path, sheet: sheet ?? null });
+
+/** Sparse analyst edits to a reference workbook's field set, sent on launch.
+    Any non-empty edit switches the run to the custom / LLM-first path. */
+export interface FieldEdits {
+  added: { header: string; dtype?: string | null }[];
+  renamed: { from: string; to: string }[];
+  removed: string[];
+}
+
+export const emptyFieldEdits = (): FieldEdits => ({ added: [], renamed: [], removed: [] });
+
+export const fieldEditsEmpty = (e: FieldEdits): boolean =>
+  e.added.length === 0 && e.renamed.length === 0 && e.removed.length === 0;
+
+export interface RunForFile {
+  run_id: string;
+  memo_id: string | null;
+  finished_at: string | null;
+  has_workbook: boolean;
+}
+
+/** Prior runs that already extracted this exact document (Direct Run prompt). */
+export const findRunsForFile = (path: string) =>
+  get<{ runs: RunForFile[] }>(`/api/runs/find-by-file?path=${encodeURIComponent(path)}`);
+
+/** Delete a run from history (output dir) + forget its cached extractions. */
+export const deleteRun = (runId: string) =>
+  del<{ run_id: string; cache_entries_forgotten: number }>(
+    `/api/runs/${encodeURIComponent(runId)}`,
+  );
+
 export interface LocateCandidate {
   record: { file_path: string; file_name: string; source_class: string; modified_time: string | null };
   breakdown: Record<string, number | string | string[]>;
@@ -371,6 +433,7 @@ export interface SelectionSlot {
   predicted_period: string;
   override_in_effect: boolean;
   detail: string;
+  deal_folder?: string | null;  // the deal's folder on the share, for the picker's initial dir
   file_name: string | null;
   file_path: string | null;
   last_modified: string | null;
@@ -401,6 +464,14 @@ export interface SelectionResponse {
   slot_count?: number;
 }
 
+/* Result of adding a deal the locator missed (Confirm-documents). */
+export interface AddDealResult {
+  client: string;
+  deal: string | null;
+  slots: SelectionSlot[];
+  detail: string;
+}
+
 /* ---------- multi-search (Phase C) ---------- */
 
 /* The llm option block shared by the single-firm /jobs/run request and the
@@ -426,6 +497,7 @@ export interface MultiSearchFirm {
   doc_types: string[]; // builtin DocType values and/or Smart Search profile slugs; [] -> config default
   llm_assist: boolean;
   enhanced_period_check: boolean;
+  source_mode: "client" | "any" | "hl";
   deal_search_model: string | null;
   added_folders: string[];
   removed_deals: string[];
@@ -521,7 +593,7 @@ export interface ConfigResponse {
   claude_code: { command: string; command_args: string[]; auto_update_on_start: boolean; default_timeout_seconds: number; allow_cli_usage: boolean };
   codex_cli: { command: string; command_args: string[]; default_timeout_seconds: number; model: string | null; reasoning_effort: string; debug_capture_raw_response: boolean };
   first_run: { install_missing_deps: boolean };
-  gui: { host: string; port: number; open_browser: boolean; evidence_dpi: number; frontend_dist: string | null };
+  gui: { host: string; port: number; open_browser: boolean; evidence_dpi: number; frontend_dist: string | null; default_reference_workbook: string | null };
   llm: Record<string, unknown> & {
     enabled: boolean;
     provider: string;
@@ -534,6 +606,15 @@ export interface ConfigResponse {
     manual_effort: string;
     allow_fable: boolean;
     budget_usd: number;
+    confidence_selection?: boolean;
+    auto_approve_enabled?: boolean;
+    auto_approve_confidence?: number;
+    scratch_cleanup_enabled?: boolean;
+    scratch_cleanup_retain?: number;
+    scratch_cleanup_keep_data?: boolean;
+    workers?: number;
+    field_batch_count?: number;
+    max_concurrent_agents?: number;
     auto: Record<string, string>;
   };
   extraction: { confidence_threshold: number };
@@ -669,6 +750,8 @@ export const evidenceUrl = (runId: string, memoId: string, page: number, bbox: n
   return `/api/runs/${runId}/evidence/${memoId}?${params}`;
 };
 
-/** Rendered page image of an arbitrary candidate file (Confirm documents). */
-export const candidatePreviewUrl = (filePath: string, page = 1) =>
-  `/api/locator/preview?file_path=${encodeURIComponent(filePath)}&page=${page}`;
+/** Rendered page image of an arbitrary candidate file (Confirm documents).
+ *  An optional dpi (clamped server-side) gives a crisp magnifier lens. */
+export const candidatePreviewUrl = (filePath: string, page = 1, dpi?: number) =>
+  `/api/locator/preview?file_path=${encodeURIComponent(filePath)}&page=${page}` +
+  (dpi ? `&dpi=${dpi}` : "");

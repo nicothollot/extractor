@@ -15,7 +15,7 @@ export default function Dashboard() {
   const latest = runs.data?.runs[0];
 
   return (
-    <Panel className="space-y-4 max-w-6xl">
+    <Panel className="space-y-4 max-w-[1600px]">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-ink-900">Dashboard</h1>
         <div className="flex gap-2">

@@ -259,8 +259,10 @@ def verify_candidate(
     if title and title not in asset_names:
         asset_names.append(title)
 
-    restrict = query.restrict_to_client_sourced if query is not None else True
-    if hl_hits and not exception_hits and restrict:
+    # Reject HL work product only in "client" mode. "any" and "hl" both allow
+    # HL letterhead (in "hl" we actively want it).
+    source_mode = query.source_mode if query is not None else "client"
+    if hl_hits and not exception_hits and source_mode == "client":
         evidence.extend(hl_matched[:3])
         return VerifyResult(
             status=VerifyStatus.REJECTED,

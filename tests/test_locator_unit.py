@@ -207,6 +207,29 @@ def test_client_deal_below_threshold_scores_zero(config: Config) -> None:
     assert bd.client_deal_method == "none"
 
 
+def test_source_mode_gates_source_class_score(config: Config) -> None:
+    """source_mode flips the source-class component: 'client' bonuses client +
+    penalizes report/analysis; 'any' is neutral; 'hl' mirrors 'client'."""
+    w = config.locator.weights
+    client_doc = "Angelo Gordon\\Accell\\1.31.2025\\Client\\Accell Valuation Memo.pdf"
+    hl_doc = "Angelo Gordon\\Accell\\1.31.2025\\Analysis\\Accell 1.31.2025 v1.pdf"
+
+    def comp(rel: str, mode: str) -> float:
+        ctx = make_ctx(config)
+        ctx = ctx.model_copy(update={"source_mode": mode})
+        return score_candidate(make_record(config, rel), ctx).source_class_score
+
+    # client mode (default behavior)
+    assert comp(client_doc, "client") == w.source_class_client_bonus
+    assert comp(hl_doc, "client") == w.source_class_report_penalty
+    # any mode: source-class is neutral for both
+    assert comp(client_doc, "any") == 0.0
+    assert comp(hl_doc, "any") == 0.0
+    # hl mode mirrors client: HL preferred, client penalized
+    assert comp(hl_doc, "hl") == w.source_class_client_bonus
+    assert comp(client_doc, "hl") == w.source_class_report_penalty
+
+
 def test_period_folder_exact(config: Config) -> None:
     bd = scored(config, "Angelo Gordon\\Accell\\1.31.2025\\Client\\Accell Valuation Memo.pdf").breakdown
     assert bd.period_score == config.locator.weights.period_folder_exact

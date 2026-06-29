@@ -60,6 +60,10 @@ def make_config(tmp_path: Path) -> Config:
     # in the prompt). direct_document_read (the production default) replaces that
     # with a copy-the-file + Read-it call and is validated separately.
     config.llm.direct_document_read = False
+    # These tests exercise the quote-grounding / arbitration / ungrounded-cap
+    # machinery, so pin confidence_selection ON (the shipped default is now OFF —
+    # trust the model — because native PDF reading makes grounding unreliable).
+    config.llm.confidence_selection = True
     (tmp_path / "output").mkdir(parents=True, exist_ok=True)
     return config
 
@@ -321,9 +325,11 @@ def test_overwrite_below_threshold_keeps_old_value_as_conflict(tmp_path):
     assert len(plan.attempts) == 1  # resolved at tier 0, no retry
 
 
-def test_ungrounded_value_is_ineligible_by_default(tmp_path):
-    """Default arbitration requires grounded evidence: an ungrounded value is
-    retained as an unresolved review item rather than filling the field."""
+def test_ungrounded_value_is_surfaced_by_default(tmp_path):
+    """By default (surface_ungrounded_values=True) an ungrounded value FILLS the
+    empty field as a low-confidence, flagged hit for review rather than being
+    silently dropped — the require_grounded_evidence arbitration gate is relaxed
+    for the surfacing path so the value is no longer rejected before it surfaces."""
     config = make_config(tmp_path)
     memo = make_memo(tmp_path, hits=[], plan_fields=[escalation_field("Fund Name", "required_empty")])
     fake = FakeClaudeCodeClient(
@@ -331,8 +337,28 @@ def test_ungrounded_value_is_ineligible_by_default(tmp_path):
     )
     run_escalation(config, [memo], fake)
 
-    assert next((h for h in memo.assets[0].hits if h.field == "Fund Name"), None) is None
-    assert any(d.startswith("LLM_UNRESOLVED: Fund Name") for d in flags_of(memo))
+    hit = next((h for h in memo.assets[0].hits if h.field == "Fund Name"), None)
+    assert hit is not None and hit.value == "Fake Fund"
+    assert hit.confidence <= config.llm.ungrounded_confidence_cap  # capped: not machine-verified
+    assert any(d.startswith("UNGROUNDED_LLM_VALUE: Fund Name") for d in flags_of(memo))
+
+
+def test_confidence_selection_off_accepts_at_model_confidence(tmp_path):
+    """With llm.confidence_selection=False the run TRUSTS the model: an ungrounded
+    value is accepted at the model's OWN confidence (no 0.20 ungrounded cap) and no
+    UNGROUNDED review flag is raised."""
+    config = make_config(tmp_path)
+    config.llm.confidence_selection = False
+    memo = make_memo(tmp_path, hits=[], plan_fields=[escalation_field("Fund Name", "required_empty")])
+    fake = FakeClaudeCodeClient(
+        {"Fund Name": field_result("Fake Fund", page=1, quote="Fund Name: Fake Fund LP")}
+    )
+    run_escalation(config, [memo], fake)
+
+    hit = next((h for h in memo.assets[0].hits if h.field == "Fund Name"), None)
+    assert hit is not None and hit.value == "Fake Fund"
+    assert hit.confidence > config.llm.ungrounded_confidence_cap  # NOT capped at 0.20
+    assert not any(d.startswith("UNGROUNDED_LLM_VALUE") for d in flags_of(memo))  # trusted, not flagged
 
 
 def test_ungrounded_value_discarded_when_surfacing_disabled(tmp_path):
@@ -382,7 +408,10 @@ def test_malformed_json_does_not_trigger_routine_retry(tmp_path):
     run_escalation(config, [memo], fake)
 
     plan = memo.escalation
-    assert plan.attempts[0].error and "non-JSON" in plan.attempts[0].error
+    # File-based output: a malformed answer file is reported as an "answer file ...
+    # not valid JSON" error and is NOT routinely retried by escalate (the scripted
+    # "ok" stays unconsumed; in-session repair is the client's job, not escalate's).
+    assert plan.attempts[0].error and "answer file" in plan.attempts[0].error
     assert len(plan.attempts) == 1
     assert next((h for h in memo.assets[0].hits if h.field == "Fund Name"), None) is None
     assert plan.status == "llm_failed"
@@ -582,6 +611,9 @@ def test_full_pipeline_scanned_memo_escalates_merges_and_ledgers(phase2_env):
     # to travel as images even though they OCR cleanly (the text-downgrade path
     # has its own test below).
     config.llm.prefer_ocr_text_over_image = False
+    # This test asserts the ungrounded-cap + UNGROUNDED flag behavior, so pin
+    # confidence_selection ON (shipped default is now OFF — trust the model).
+    config.llm.confidence_selection = True
     fake = FakeClaudeCodeClient({
         "Gross IRR %": field_result(12.5, unit="percent", page=1, quote="Gross IRR: 12.5%"),
         # fabricated quote: must be rejected by quote-grounding
@@ -610,11 +642,12 @@ def test_full_pipeline_scanned_memo_escalates_merges_and_ledgers(phase2_env):
     assert irr.evidence == "Gross IRR: 12.5%"
     assert "Gross IRR %" in plan.merged_fields
 
-    # fabricated quote: value discarded, unresolved review item raised
+    # fabricated quote: the ungrounded LLM value never overwrites the deterministic
+    # OCR value — it rides along as a conflict + an UNGROUNDED_LLM_VALUE review flag.
     moic = next(h for h in memo.assets[0].hits if h.field == "MOIC")
-    assert moic.method != "llm:claude:opus:high" or moic.value != 9.9
+    assert moic.value != 9.9  # deterministic value retained, not the fabricated one
     assert any(
-        f.description.startswith("LLM_UNRESOLVED: MOIC") and f.reviewer_attention
+        f.description.startswith("UNGROUNDED_LLM_VALUE: MOIC") and f.reviewer_attention
         for f in memo.assets[0].flags
     )
 

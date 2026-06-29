@@ -83,12 +83,15 @@ def render_page(
     return png_path
 
 
-def render_file_page(config: Config, file_path: str, page_number: int) -> Path:
+def render_file_page(
+    config: Config, file_path: str, page_number: int, dpi: int | None = None
+) -> Path:
     """Render one page of an ARBITRARY (read-only) PDF to a cached PNG —
     used by the New Run 'Confirm documents' candidate preview, which has no
     run/audit record to key off. The source must be a PDF under pv_root (the
     only place candidates come from); rendering is read-only and cached under
-    output_dir/gui/preview keyed on (path, mtime, size, page, dpi)."""
+    output_dir/gui/preview keyed on (path, mtime, size, page, dpi). An optional
+    higher `dpi` is requested by the GUI for a crisp magnifier lens."""
     from pv_extractor.io_guard import is_under_pv_root
 
     if not is_under_pv_root(file_path, config.pv_root):
@@ -101,7 +104,9 @@ def render_file_page(config: Config, file_path: str, page_number: int) -> Path:
     except OSError as exc:
         raise EvidenceError(f"could not stat source: {exc}") from exc
 
-    dpi = config.gui.evidence_dpi
+    # Clamp a caller-supplied dpi to a sane range so the lens can't request a
+    # ruinous render.
+    dpi = max(72, min(int(dpi), 400)) if dpi else config.gui.evidence_dpi
     key = hashlib.sha1(f"{ident}|{page_number}|{dpi}".encode("utf-8")).hexdigest()[:20]
     png_path = Path(config.output_dir) / "gui" / "preview" / f"p{page_number}_{key}.png"
     if png_path.exists():

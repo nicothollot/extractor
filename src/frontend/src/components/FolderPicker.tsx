@@ -24,20 +24,37 @@ export function FolderPicker({
   title,
   initial,
   onSelect,
+  onSelectMany,
   onClose,
   pickFiles = false,
+  multiple = false,
 }: {
   title: string;
   initial: string;
   onSelect: (path: string) => void;
+  onSelectMany?: (paths: string[]) => void;
   onClose: () => void;
   pickFiles?: boolean;
+  /** Multi-file selection (pickFiles only): clicking toggles files; the footer
+      commits the whole set via onSelectMany. Single-select behavior (onSelect)
+      is unchanged when multiple is falsy. */
+  multiple?: boolean;
 }) {
+  const multi = multiple && pickFiles;
   const [listing, setListing] = useState<FsList | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pathInput, setPathInput] = useState(initial);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [checked, setChecked] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+
+  const toggle = (path: string) =>
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
 
   const load = async (path: string, fallbackToRoots = false) => {
     setBusy(true);
@@ -139,22 +156,29 @@ export function FolderPicker({
             </button>
           ))}
           {pickFiles &&
-            listing?.files.map((f) => (
-              <button
-                key={f.path}
-                className={`w-full text-left px-4 py-1.5 text-[12.5px] hover:bg-surface flex items-center gap-2 ${
-                  selectedFile === f.path ? "bg-info-soft text-ink-900" : "text-ink-700"
-                }`}
-                onDoubleClick={() => onSelect(f.path)}
-                onClick={() => {
-                  setSelectedFile(f.path);
-                  setPathInput(f.path);
-                }}
-              >
-                <span className="text-ink-400">📄</span>
-                <span className="truncate">{f.name}</span>
-              </button>
-            ))}
+            listing?.files.map((f) => {
+              const on = multi ? checked.has(f.path) : selectedFile === f.path;
+              return (
+                <button
+                  key={f.path}
+                  className={`w-full text-left px-4 py-1.5 text-[12.5px] hover:bg-surface flex items-center gap-2 ${
+                    on ? "bg-info-soft text-ink-900" : "text-ink-700"
+                  }`}
+                  onDoubleClick={() => !multi && onSelect(f.path)}
+                  onClick={() => {
+                    if (multi) {
+                      toggle(f.path);
+                    } else {
+                      setSelectedFile(f.path);
+                      setPathInput(f.path);
+                    }
+                  }}
+                >
+                  <span className="text-ink-400">{multi ? (on ? "☑" : "☐") : "📄"}</span>
+                  <span className="truncate">{f.name}</span>
+                </button>
+              );
+            })}
         </div>
 
         <div className="px-4 py-3 border-t border-line flex items-center justify-between gap-3">
@@ -165,13 +189,27 @@ export function FolderPicker({
             <Button kind="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button kind="primary" onClick={() => selectTarget && onSelect(selectTarget)} disabled={!canSelect}>
-              {pickFiles ? "Select this file" : "Select this folder"}
-            </Button>
+            {multi ? (
+              <Button
+                kind="primary"
+                onClick={() => onSelectMany?.([...checked])}
+                disabled={checked.size === 0}
+              >
+                Add {checked.size} file{checked.size === 1 ? "" : "s"}
+              </Button>
+            ) : (
+              <Button kind="primary" onClick={() => selectTarget && onSelect(selectTarget)} disabled={!canSelect}>
+                {pickFiles ? "Select this file" : "Select this folder"}
+              </Button>
+            )}
           </div>
         </div>
         <p className="px-4 pb-2 text-[10.5px] text-ink-400">
-          {pickFiles ? "single click = select · double click = open folder / pick file" : "single click = select · double click = open"}
+          {multi
+            ? "click to check/uncheck files · double click a folder to open · then Add"
+            : pickFiles
+            ? "single click = select · double click = open folder / pick file"
+            : "single click = select · double click = open"}
         </p>
       </div>
     </div>

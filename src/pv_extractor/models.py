@@ -10,8 +10,19 @@ from __future__ import annotations
 
 import enum
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+# Source-preference mode (replaces the old restrict_to_client_sourced bool):
+#   "client" — only client-provided docs extract: HL report/analysis folders are
+#              penalized and the peek-verifier REJECTS HL work product (default;
+#              CLAUDE.md rule 2).
+#   "any"    — no source preference: doc-type keywords still rank, nothing is
+#              excluded for being HL/non-client; HL letterhead is not rejected.
+#   "hl"     — mirror of "client": HL report/analysis folders are PREFERRED and
+#              client-sourced folders penalized; HL letterhead is never rejected.
+SourceMode = Literal["client", "any", "hl"]
 
 
 class DocType(str, enum.Enum):
@@ -75,6 +86,28 @@ class SchemaField(BaseModel):
     slot_group: str | None = None  # TC | TX | CS
     slot_number: int | None = None  # 1-based slot within the group
     required: bool = False
+
+
+class WorkbookLayout(BaseModel):
+    """Physical layout of an output workbook's data sheet.
+
+    The legacy master template is a fixed three-header-row sheet ("Index",
+    header row 2, descriptions row 3, data from row 4, Memo ID in column 1).
+    A user-supplied *custom* reference workbook can have any sheet name, a
+    single header row at any position, and arbitrary columns — its schema is
+    autodetected at run time and the writer adapts to this layout instead of
+    the hardcoded master constants. `prepended_admin` are the identity columns
+    (Memo ID, Run ID, ...) that were not present in the user's sheet and that
+    the writer physically inserts at the FRONT before any write, so the
+    pipeline's identity/metadata always has somewhere to land."""
+
+    sheet_name: str = "Index"
+    header_row: int = 2
+    data_start_row: int = 4
+    memo_id_col: int = 1
+    is_custom: bool = False
+    prepended_admin: list[str] = Field(default_factory=list)
+    sheets: list[str] = Field(default_factory=list)  # all sheet names (inspect UI)
 
 
 class VersionSignal(BaseModel):
@@ -222,6 +255,7 @@ class MultiSearchFirmSpec(BaseModel):
     doc_types: list[str] = Field(default_factory=list)  # builtin enums and/or profile slugs
     llm_assist: bool = False
     enhanced_period_check: bool = False
+    source_mode: SourceMode = "client"  # per-firm source preference (see SourceMode)
     deal_search_model: str | None = None
     added_folders: list[str] = Field(default_factory=list)
     removed_deals: list[str] = Field(default_factory=list)
@@ -247,12 +281,20 @@ class LocateQuery(BaseModel):
     doc_type: DocType = DocType.any_client_valuation_doc
     doc_type_profile: str | None = None  # DocTypeSpec slug; None = use the builtin doc_type enum exactly as today
     as_of_date: date | None = None  # resolved from `period` + client period_style
-    # When True (default): HL's own work product is rejected by the peek-verifier
-    # and report/analysis folders are penalized in scoring (CLAUDE.md rule 2).
-    # When False ("don't restrict to client-sourced"): those guards are OFF —
-    # doc-type keywords still RANK matching files, but nothing is excluded for
-    # being HL/non-client (client, HL, anything is a candidate).
+    # Source-preference mode (see SourceMode). `restrict_to_client_sourced` is
+    # the legacy boolean kept for backward compatibility: a caller that passes
+    # only the bool maps True->"client" / False->"any"; otherwise source_mode
+    # wins and the bool is kept consistent (True iff source_mode == "client").
+    source_mode: SourceMode = "client"
     restrict_to_client_sourced: bool = True
+
+    @model_validator(mode="after")
+    def _reconcile_source_mode(self) -> "LocateQuery":
+        set_fields = self.model_fields_set
+        if "source_mode" not in set_fields and "restrict_to_client_sourced" in set_fields:
+            object.__setattr__(self, "source_mode", "client" if self.restrict_to_client_sourced else "any")
+        object.__setattr__(self, "restrict_to_client_sourced", self.source_mode == "client")
+        return self
 
 
 class ScoreBreakdown(BaseModel):

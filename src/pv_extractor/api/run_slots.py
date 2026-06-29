@@ -16,7 +16,7 @@ from __future__ import annotations
 import sqlite3
 
 from pv_extractor.config import Config
-from pv_extractor.models import DocType, DocTypeSpec
+from pv_extractor.models import DocType, DocTypeSpec, SourceMode
 from pv_extractor.run import RunSlot, _resolve_pairs
 from pv_extractor.search.doc_type_spec import resolve_spec
 
@@ -99,7 +99,7 @@ def build_run_slots(
     doc_types: list[str] | None,
     period: str,
     periods: list[str] | None,
-    restrict_to_client_sourced: bool = True,
+    source_mode: SourceMode = "client",
 ) -> list[RunSlot]:
     """One RunSlot per (in-scope pair × doc type × period). firm=None so the run
     emits a flat (un-laned) progress stream and writes one workbook."""
@@ -118,7 +118,7 @@ def build_run_slots(
                         doc_type=slot_doc_type,
                         doc_type_spec=spec,
                         firm=None,
-                        restrict_to_client_sourced=restrict_to_client_sourced,
+                        source_mode=source_mode,
                     )
                 )
     return slots

@@ -117,6 +117,27 @@ def test_no_valuation_value_is_hard_fail(schema_by_header, ruleset, routing_tabl
     assert any(f.severity is FlagSeverity.hard_fail and "no valuation value" in f.description for f in result.flags)
 
 
+def test_custom_schema_skips_no_valuation_value_fail(ruleset, routing_table, default_config) -> None:
+    """A custom reference workbook (e.g. GEDP) has none of the master valuation
+    headers, so the 'no valuation value' hard-fail must NOT fire — it would fail
+    every custom run regardless of what was extracted."""
+    custom = {
+        h: SchemaField(col_index=i + 1, band="REFERENCE", header=h, description="", dtype="number")
+        for i, h in enumerate(["EV - LOW", "EV - HIGH", "MVE - LOW", "MVE - HIGH"])
+    }
+    hits = [
+        FieldHit(field="EV - LOW", col_index=1, band="REFERENCE", value=896.2, confidence=0.8),
+        FieldHit(field="EV - HIGH", col_index=2, band="REFERENCE", value=1041.9, confidence=0.8),
+    ]
+    result = validate_asset(
+        hits=hits, extraction_flags=[], schema_by_header=custom,
+        config=default_config, ruleset=ruleset, routing_table=routing_table,
+        as_of_date=AS_OF, verify=None, prior_row=None,
+    )
+    assert not any(f.code == "no_valuation_value" for f in result.flags)
+    assert result.qa_status is not QaStatus.qa_fail
+
+
 def test_asof_mismatch_is_hard_fail(schema_by_header, ruleset, routing_table, default_config) -> None:
     verify = VerifyResult(asof_date=date(2025, 12, 31))
     result = _validate(

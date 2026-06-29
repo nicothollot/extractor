@@ -31,9 +31,13 @@ reviewer_attention — values are never invented.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
+import shutil
 import sqlite3
+import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field as dataclass_field, replace
@@ -41,9 +45,9 @@ from pathlib import Path
 
 from pv_extractor.config import Config
 from pv_extractor.extract.targeting import _page_score, build_band_lexicons
-from pv_extractor.io_guard import guarded_open_write
+from pv_extractor.io_guard import guarded_open_write, is_under_pv_root
 from pv_extractor.llm import cache as llm_cache
-from pv_extractor.llm.arbitration import Candidate, arbitrate_field
+from pv_extractor.llm.arbitration import Candidate, CandidateDecision, arbitrate_field
 from pv_extractor.llm.claude_code_client import ClaudeCodeClient
 from pv_extractor.llm.codex_cli_client import CodexCliClient
 from pv_extractor.llm.costs import (
@@ -300,10 +304,14 @@ def _activity_base(
 
 
 def quote_grounding(
-    quote: str, page: int | None, payload: MemoPayload, fuzzy_threshold: int
+    quote: str,
+    page: int | None,
+    payload: MemoPayload,
+    fuzzy_threshold: int,
+    text_fuzzy_threshold: int | None = None,
 ) -> str:
     """Backward-compatible status wrapper around structured grounding."""
-    return ground_quote(quote, page, payload, fuzzy_threshold).status
+    return ground_quote(quote, page, payload, fuzzy_threshold, text_fuzzy_threshold).status
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +416,8 @@ def _merge_field(
                 raw_candidate.get("page") if isinstance(raw_candidate.get("page"), int) else None
             )
             candidate_grounding = ground_quote(
-                candidate_quote, candidate_page, payload, config.llm.quote_match_threshold
+                candidate_quote, candidate_page, payload, config.llm.quote_match_threshold,
+                config.llm.text_quote_match_threshold,
             )
             candidates.append(
                 Candidate.from_result(
@@ -506,7 +515,10 @@ def _merge_field(
 
     quote = str(result.get("verbatim_quote") or result.get("evidence_quote") or "")
     page = result.get("page") if isinstance(result.get("page"), int) else None
-    grounding = ground_quote(quote, page, payload, config.llm.quote_match_threshold)
+    grounding = ground_quote(
+        quote, page, payload, config.llm.quote_match_threshold,
+        config.llm.text_quote_match_threshold,
+    )
     if grounding.status == "ungrounded" and not config.llm.surface_ungrounded_values:
         _flag_first_asset(
             memo,
@@ -538,31 +550,58 @@ def _merge_field(
             str(raw_confidence),
             config.llm.confidence_scores.get(str(result.get("confidence_label")), 0.35),
         )
-    decision = arbitrate_field(
+    candidate = Candidate.from_result(
         header,
-        [
-            Candidate.from_result(
-                header,
-                {
-                    **result,
-                    "value": value,
-                    "model_confidence": confidence,
-                    "quote": quote,
-                    "document_id": result.get("document_id") or "D01",
-                },
-                provider=selection.entry.provider,
-                model=selection.entry.alias,
-                effort=selection.effort,
-                prompt_version=config.llm.planner.prompt_version,
-                grounding_status=grounding.status,
-                source="primary",
-            )
-        ],
-        config=config.llm.candidate_arbitration,
-        schema_field=schema_field,
-        target_as_of=memo.as_of_date,
-        document_ids=None,
+        {
+            **result,
+            "value": value,
+            "model_confidence": confidence,
+            "quote": quote,
+            "document_id": result.get("document_id") or "D01",
+        },
+        provider=selection.entry.provider,
+        model=selection.entry.alias,
+        effort=selection.effort,
+        prompt_version=config.llm.planner.prompt_version,
+        grounding_status=grounding.status,
+        source="primary",
     )
+    if config.llm.confidence_selection:
+        # When surfacing ungrounded values is enabled, an ungrounded candidate must
+        # NOT be hard-rejected by arbitration's require_grounded_evidence gate — that
+        # gate (with the value-surfacing fall-through above) was silently discarding
+        # every value whose quote we couldn't match (~75% of correct values when the
+        # model reads the PDF natively and reflows its quote). Relax the gate for this
+        # one ungrounded candidate; the value still flows to the ungrounded-surfacing
+        # path below (capped confidence + UNGROUNDED flag), never overwriting a
+        # confident deterministic value.
+        arb_config = config.llm.candidate_arbitration
+        if config.llm.surface_ungrounded_values and grounding.status == "ungrounded":
+            arb_config = arb_config.model_copy(update={"require_grounded_evidence": False})
+        decision = arbitrate_field(
+            header,
+            [candidate],
+            config=arb_config,
+            schema_field=schema_field,
+            target_as_of=memo.as_of_date,
+            document_ids=None,
+        )
+    else:
+        # Confidence selection OFF: trust the model. Accept the candidate at its
+        # OWN self-reported confidence — no arbitration rejection, no ungrounded
+        # cap below. (A confident deterministic value is still protected by the
+        # _qualifying_assets gate above.)
+        decision = CandidateDecision(
+            field=header,
+            selected=candidate,
+            eligible=[candidate],
+            decision="accepted_trusting_model",
+            decision_reason="confidence_selection disabled — accepted at model confidence",
+            selected_candidate_id=candidate.candidate_id or None,
+            raw_model_confidence=confidence,
+            calibrated_confidence=confidence,
+            final_confidence=confidence,
+        )
     plan.diagnostics.setdefault("confidence_decisions", {})[header] = {
         "selected_candidate_id": decision.selected_candidate_id,
         "raw_model_confidence": decision.raw_model_confidence,
@@ -587,7 +626,9 @@ def _merge_field(
         plan.merge_log.append(f"{header}: {decision.decision} — {decision.decision_reason}")
         return "rejected:arbitration"
     confidence = decision.final_confidence
-    if grounding.status == "ungrounded":  # shown for review, not machine-verified -> low confidence
+    # Ungrounded values are capped + held-as-conflict ONLY when confidence selection
+    # is on; with it off we keep the model's confidence and let the value fill.
+    if config.llm.confidence_selection and grounding.status == "ungrounded":  # not machine-verified -> low confidence
         confidence = min(confidence, config.llm.ungrounded_confidence_cap)
         if existing is not None and existing.value is not None:
             # An unverified value must NEVER overwrite an existing (even
@@ -673,7 +714,9 @@ def _merge_field(
         plan.merge_log.append(f"{header}: filled missing field via {method} [{asset.row_memo_id}]")
         asset.hits.append(hit)
 
-    if grounding.status == "ungrounded":
+    if grounding.status == "ungrounded" and config.llm.confidence_selection:
+        # With confidence selection OFF the analyst has chosen to trust the model,
+        # so the ungrounded warning is suppressed (it would flag every value).
         asset.flags.append(
             ReviewFlag(
                 category="llm",
@@ -683,7 +726,7 @@ def _merge_field(
                 severity=FlagSeverity.warning, reviewer_attention=True, field=header,
             )
         )
-    elif grounding.status == "unverifiable":
+    elif grounding.status == "unverifiable" and config.llm.confidence_selection:
         asset.flags.append(
             ReviewFlag(
                 category="llm",
@@ -1273,7 +1316,7 @@ def _run_tier(
         )
         return attempt, None
     try:
-        decode_structured_response(result.structured, fields)
+        decoded = decode_structured_response(result.structured, fields)
     except StructuredResponseError as exc:
         attempt.error = f"structured output failed accounting validation: {exc}"
         attempt.retry_status = "retryable"
@@ -1291,6 +1334,13 @@ def _run_tier(
             stdout_sha256=result.stdout_sha256,
         )
         return attempt, None
+
+    # Human-readable companion to the model's raw answer file: one row PER FIELD
+    # (workbook header + extracted value + page + quote + confidence), pretty
+    # printed, so an analyst can eyeball exactly what the model returned without
+    # decoding field_ids or the compact schema files. Best-effort — never fails
+    # the call.
+    _write_readable_extraction(payload.directory, slug, decoded, fields, config)
 
     cache_store_key = key
     if schema_version == 1:
@@ -1342,6 +1392,19 @@ def _call_provider(
     config: Config,
     event_sink: Callable[[dict[str, object]], None] | None = None,
 ):
+    # File-based output (default): the model WRITES answers.json with the Write
+    # tool and we read+validate the file (with same-session repair on a bad
+    # file), instead of the --json-schema StructuredOutput tool. Provider-neutral
+    # via the extract_json_file seam; providers without it fall back below.
+    if config.llm.file_based_output and hasattr(client, "extract_json_file"):
+        kwargs = dict(
+            job_id=job_id, prompt=prompt, schema_path=schema_path,
+            model=selection.entry.cli_model_arg() or None, effort=selection.effort,
+            cwd=payload.directory, timeout=config.llm.timeout_seconds,
+        )
+        if _supports_kw(client.extract_json_file, "event_sink"):
+            kwargs["event_sink"] = event_sink
+        return client.extract_json_file(**kwargs)
     if hasattr(client, "extract_structured"):
         kwargs = dict(
             job_id=job_id, prompt=prompt, schema=schema, images=image_paths,
@@ -1369,6 +1432,11 @@ def _should_fallback_legacy(error: str | None) -> bool:
     if not error:
         return False
     text = error.lower()
+    # File-based output already repairs a bad answer file in-session; its
+    # "answer file ... failed schema validation" is NOT the provider rejecting the
+    # sparse --json-schema, so it must not trigger the legacy-schema fallback.
+    if text.lstrip().startswith("answer file"):
+        return False
     return "schema" in text and any(
         needle in text for needle in ("unsupported", "invalid", "failed schema validation", "not accepted")
     )
@@ -1390,6 +1458,49 @@ def _flatten_response(structured: dict, fields: list[SchemaField]) -> dict[str, 
     return decode_structured_response(structured, fields)
 
 
+def _write_readable_extraction(
+    directory: Path,
+    slug: str,
+    decoded: dict[str, dict],
+    fields: list[SchemaField],
+    config: Config,
+) -> None:
+    """Write `extracted_<slug>.json` — a pretty, one-row-per-field view of what the
+    model returned, keyed by the human workbook HEADER (not the cryptic field_id).
+    Found values come first, then not_found. Best-effort: any failure is swallowed
+    so it never breaks a successful extraction."""
+    try:
+        band_by_header = {f.header: f.band for f in fields}
+        rows: list[dict] = []
+        for header, obj in decoded.items():
+            quote = str(obj.get("verbatim_quote") or obj.get("quote") or "")
+            rows.append(
+                {
+                    "field": header,
+                    "band": band_by_header.get(header),
+                    "not_found": bool(obj.get("not_found")),
+                    "value": obj.get("value"),
+                    "unit": obj.get("unit"),
+                    "document_id": obj.get("document_id"),
+                    "page": obj.get("page"),
+                    "model_confidence": obj.get("model_confidence", obj.get("confidence")),
+                    "quote": quote[: config.extraction.max_evidence_chars],
+                }
+            )
+        rows.sort(key=lambda r: (r["not_found"], r["band"] or "", r["field"]))
+        found = sum(1 for r in rows if not r["not_found"])
+        payload = {
+            "summary": {"fields_total": len(rows), "fields_with_value": found,
+                        "fields_not_found": len(rows) - found},
+            "fields": rows,
+        }
+        path = directory / f"extracted_{slug}.json"
+        with guarded_open_write(path, config.pv_root) as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+    except Exception:  # noqa: BLE001 - a readable-dump failure must never break a run
+        logger.debug("could not write readable extraction dump", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # per-memo job
 # ---------------------------------------------------------------------------
@@ -1409,6 +1520,7 @@ def _escalate_memo(
     run_dir: Path,
     deal_files: list[tuple[str, str]] | None = None,
     event_sink: LlmActivitySink | None = None,
+    reaper: "LlmScratchReaper | None" = None,
 ) -> None:
     plan = memo.escalation
     assert plan is not None and plan.fields
@@ -1544,8 +1656,9 @@ def _escalate_memo(
                     memo,
                     ReviewFlag(
                         category="llm",
-                        description=f"LLM_DEFERRED: run budget reached before "
-                        f"{memo.memo_id} task {task.record.task_id} — fields left for a later run",
+                        description=f"LLM_DEFERRED: budget cap reached (CLI) or run cancelled at "
+                        f"budget pause before {memo.memo_id} task {task.record.task_id} — "
+                        f"fields left for a later run",
                         severity=FlagSeverity.warning, reviewer_attention=True,
                     ),
                 )
@@ -1589,6 +1702,7 @@ def _escalate_memo(
                             result.get("page") if isinstance(result.get("page"), int) else None,
                             payload,
                             config.llm.quote_match_threshold,
+                            config.llm.text_quote_match_threshold,
                         )
                         if grounding.status == "grounded":
                             attempt.fields_grounded += 1
@@ -1677,6 +1791,112 @@ def _escalate_memo(
         attempts=len(plan.attempts), merged=len(plan.merged_fields),
         not_extractable=len(plan.not_extractable),
     )
+    # This memo's merged hits are now on the in-memory MemoResult; the on-disk
+    # working dir is throwaway scratch. Let the reaper prune older dirs (bounded
+    # by the retention window) so peak disk stays flat on large runs.
+    if reaper is not None:
+        reaper.on_memo_done(payload.directory)
+
+
+# ---------------------------------------------------------------------------
+# per-memo scratch cleanup (bound peak disk on large runs)
+# ---------------------------------------------------------------------------
+
+
+class LlmScratchReaper:
+    """Prunes per-memo LLM working dirs (output_dir/<run_id>/llm/<memo_id>/) as a
+    run progresses, keeping peak disk bounded on large runs. One instance per run,
+    shared (thread-safe) across process_deals/process_memos and the rescue pass so
+    the retention window spans all passes in completion order.
+
+    `on_memo_done` is called from worker threads the moment a memo's escalation
+    finishes; it records the dir and, once more than `retain` dirs have finished,
+    prunes the oldest. Pruning keeps the small data JSONs (extracted_*/answers_*/
+    manifest.json) when `keep_data` is set and deletes the heavy scratch (page
+    renders, copied source docs, the .claude/ session dir, prompts, schemas);
+    otherwise the whole dir goes. Every deletion is best-effort and confined to
+    output_dir/<run_id>/llm/ (never pv_root)."""
+
+    # Files preserved when keep_data is True — the only artifacts under a memo dir
+    # that are real data (raw model output + provenance) rather than reproducible
+    # scratch. Matched by exact name or by these JSON prefixes.
+    _KEEP_EXACT = frozenset({"manifest.json"})
+    _KEEP_PREFIXES = ("extracted_", "answers_")
+
+    def __init__(
+        self,
+        run_dir: Path,
+        pv_root: str,
+        *,
+        enabled: bool,
+        retain: int,
+        keep_data: bool,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.retain = max(0, int(retain))
+        self.keep_data = bool(keep_data)
+        self.pv_root = pv_root
+        try:
+            self._llm_root = (Path(run_dir) / "llm").resolve()
+        except OSError:
+            self._llm_root = Path(run_dir) / "llm"
+        self._lock = threading.Lock()
+        self._queue: deque[Path] = deque()
+
+    def on_memo_done(self, memo_dir: Path) -> None:
+        """Record a finished memo dir; prune the oldest once past the window."""
+        if not self.enabled:
+            return
+        to_prune: list[Path] = []
+        with self._lock:
+            self._queue.append(Path(memo_dir))
+            while len(self._queue) > self.retain:
+                to_prune.append(self._queue.popleft())
+        for path in to_prune:
+            self._prune(path)
+
+    def _keep(self, name: str) -> bool:
+        return name in self._KEEP_EXACT or (
+            name.endswith(".json") and name.startswith(self._KEEP_PREFIXES)
+        )
+
+    def _contained(self, memo_dir: Path) -> bool:
+        """Refuse to delete anything outside output_dir/<run_id>/llm/ or under
+        pv_root — defense in depth around an rmtree."""
+        try:
+            resolved = memo_dir.resolve()
+        except OSError:
+            return False
+        if self._llm_root not in resolved.parents:
+            return False
+        if is_under_pv_root(str(resolved), self.pv_root):
+            return False
+        return True
+
+    def _prune(self, memo_dir: Path) -> None:
+        if not self._contained(memo_dir):
+            logger.debug("scratch cleanup skipped (containment guard): %s", memo_dir)
+            return
+        try:
+            if not memo_dir.is_dir():
+                return
+            if not self.keep_data:
+                shutil.rmtree(memo_dir, ignore_errors=True)
+                logger.debug("scratch cleanup removed memo dir %s", memo_dir.name)
+                return
+            for entry in memo_dir.iterdir():
+                if entry.is_file() and self._keep(entry.name):
+                    continue
+                try:
+                    if entry.is_dir():
+                        shutil.rmtree(entry, ignore_errors=True)
+                    else:
+                        entry.unlink()
+                except OSError:
+                    logger.debug("scratch cleanup could not remove %s", entry)
+            logger.debug("scratch cleanup thinned memo dir %s", memo_dir.name)
+        except OSError:
+            logger.debug("scratch cleanup failed for %s", memo_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -1695,6 +1915,10 @@ def process_memos(
     client: ClaudeCodeClient | None = None,
     registry: ModelRegistry | None = None,
     event_sink: LlmActivitySink | None = None,
+    reaper: "LlmScratchReaper | None" = None,
+    on_pause=None,
+    cancel_event: "threading.Event | None" = None,
+    budget_sink=None,
 ) -> LlmRunSummary:
     """Execute the Phase-3 second pass for one run. Mutates the MemoResults
     in place (merged hits, plan attempts/status, flags) and returns the
@@ -1717,7 +1941,10 @@ def process_memos(
         summary.detail = "no memos required escalation"
         return summary
 
-    setup = _setup_escalation(config, settings, schema_fields, run_dir, client=client, registry=registry)
+    setup = _setup_escalation(
+        config, settings, schema_fields, run_dir, client=client, registry=registry,
+        on_pause=on_pause, cancel_event=cancel_event, budget_sink=budget_sink,
+    )
     if isinstance(setup, str):
         summary.detail = setup
         _fail_all(eligible, setup)
@@ -1734,7 +1961,7 @@ def process_memos(
                 _escalate_memo, memo, config=config, settings=settings,
                 schema_by_header=schema_by_header, client=client, registry=registry,
                 budget=budget, ledger=ledger, run_id=run_id, run_dir=run_dir,
-                event_sink=event_sink,
+                event_sink=event_sink, reaper=reaper,
             ): memo
             for memo in eligible
         }
@@ -1793,6 +2020,10 @@ def process_deals(
     client: ClaudeCodeClient | None = None,
     registry: ModelRegistry | None = None,
     event_sink: LlmActivitySink | None = None,
+    reaper: "LlmScratchReaper | None" = None,
+    on_pause=None,
+    cancel_event: "threading.Event | None" = None,
+    budget_sink=None,
 ) -> LlmRunSummary:
     """Combined-deal second pass: one provider call per deal-period over
     the combined payload of all its documents. Mirrors process_memos (shared
@@ -1815,7 +2046,10 @@ def process_deals(
         summary.detail = "no deals required escalation"
         return summary
 
-    setup = _setup_escalation(config, settings, schema_fields, run_dir, client=client, registry=registry)
+    setup = _setup_escalation(
+        config, settings, schema_fields, run_dir, client=client, registry=registry,
+        on_pause=on_pause, cancel_event=cancel_event, budget_sink=budget_sink,
+    )
     if isinstance(setup, str):
         summary.detail = setup
         _fail_all([g.primary for g in eligible], setup)
@@ -1833,7 +2067,7 @@ def process_deals(
                 schema_by_header=schema_by_header, client=client, registry=registry,
                 budget=budget, ledger=ledger, run_id=run_id, run_dir=run_dir,
                 deal_files=group.files,
-                event_sink=event_sink,
+                event_sink=event_sink, reaper=reaper,
             ): group
             for group in eligible
         }
@@ -1882,6 +2116,9 @@ def _setup_escalation(
     *,
     client: ClaudeCodeClient | None,
     registry: ModelRegistry | None,
+    on_pause=None,
+    cancel_event: "threading.Event | None" = None,
+    budget_sink=None,
 ) -> tuple[ModelRegistry, object, CostLedger, BudgetTracker, dict[str, SchemaField]] | str:
     """Shared LLM-pass setup: load model routing, locate/auth the local
     provider CLI, and build the cost ledger / budget tracker / header index.
@@ -1911,7 +2148,9 @@ def _setup_escalation(
         client.update()
     registry.refresh_cli_status(client)
     ledger = CostLedger(run_dir / "llm" / LEDGER_FILENAME, config.pv_root)
-    budget = BudgetTracker(settings.budget_usd)
+    budget = BudgetTracker(settings.budget_usd, on_pause=on_pause, cancel_event=cancel_event)
+    if budget_sink is not None:
+        budget_sink(budget)
     schema_by_header = {f.header: f for f in schema_fields}
     return registry, client, ledger, budget, schema_by_header
 

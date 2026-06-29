@@ -26,7 +26,13 @@ from pv_extractor.api import runs_service
 from pv_extractor.config import Config
 from pv_extractor.extract.engine import load_schema_fields
 from pv_extractor.io_guard import guarded_open_write
-from pv_extractor.models import EvidenceMatchMethod, EvidenceRef, FlagSeverity, SchemaField
+from pv_extractor.models import (
+    EvidenceMatchMethod,
+    EvidenceRef,
+    FlagSeverity,
+    SchemaField,
+    WorkbookLayout,
+)
 from pv_extractor.validate.flags import normalize_flag_text
 from pv_extractor.write.workbook import WorkbookWriter
 
@@ -68,6 +74,10 @@ class ReviewItem(BaseModel):
     description: str = ""
     severity: str = ""
     reviewer_attention: bool = False
+    # True = awaits a banker's manual sign-off (a reviewer-attention flag, or a
+    # value below the auto-approval confidence bar / auto-approval disabled).
+    # False = auto-approved (shown for cross-checking, no action required).
+    needs_approval: bool = False
     # Deprecated migration shim. Memo-level QA reasons now live in MemoIssue
     # records returned beside the queue instead of being copied onto field cards.
     qa_fail_reasons: list[str] = Field(default_factory=list)
@@ -198,8 +208,20 @@ def _hit_by_field(asset: dict) -> dict[str, dict]:
     return {hit["field"]: hit for hit in asset.get("hits", [])}
 
 
+def _value_needs_approval(confidence: float | None, *, auto_enabled: bool, auto_confidence: float) -> bool:
+    """A surfaced value awaits manual approval when auto-approval is off, or when
+    its confidence is below the auto-approval bar (None confidence never clears)."""
+    if not auto_enabled:
+        return True
+    if confidence is None:
+        return True
+    return float(confidence) < auto_confidence
+
+
 def build_review(run_dir: Path, config: Config) -> tuple[list[ReviewItem], list[MemoIssue]]:
     threshold = config.extraction.confidence_threshold
+    auto_enabled = bool(config.llm.auto_approve_enabled)
+    auto_confidence = float(config.llm.auto_approve_confidence)
     items: list[ReviewItem] = []
     memo_issue_groups: dict[tuple[str, str], dict] = {}
     for audit in runs_service.load_audits(run_dir):
@@ -278,6 +300,7 @@ def build_review(run_dir: Path, config: Config) -> tuple[list[ReviewItem], list[
                         description=description,
                         severity=severity,
                         reviewer_attention=reviewer_attention,
+                        needs_approval=reviewer_attention and action is None,
                         qa_fail_reasons=[],
                         conflicts=(hit.get("conflicts") or []) if hit else [],
                         resolved=action is not None,
@@ -285,14 +308,19 @@ def build_review(run_dir: Path, config: Config) -> tuple[list[ReviewItem], list[
                         **base,
                     )
                 )
+            # EVERY extracted value (not just low-confidence ones) becomes a card
+            # so a banker can cross-check the full memo. Metadata (run identity) is
+            # not an extracted value. Fields already represented by a flag card are
+            # skipped (the flag card carries the cell). Auto-approval decides which
+            # cards are "needs approval" vs pre-approved.
             for hit in asset.get("hits", []):
-                if hit.get("method") in ("metadata", "computed"):
+                if hit.get("method") == "metadata":
                     continue
-                confidence = hit.get("confidence") or 0.0
-                if confidence >= threshold or hit.get("value") is None:
+                if hit.get("value") is None:
                     continue
                 if hit["field"] in flagged_fields:
                     continue  # the flag row already carries this cell
+                confidence = hit.get("confidence")
                 item_id = f"{row_id}::cell::{_digest([row_id, hit['field']])}"
                 action = actions.get(item_id)
                 legacy_id = f"{row_id}::cell::{hit['field']}"
@@ -301,29 +329,37 @@ def build_review(run_dir: Path, config: Config) -> tuple[list[ReviewItem], list[
                 evidence_ref = _evidence_ref_from_hit(audit, hit)
                 evidence_refs = _distinct_evidence_refs([evidence_ref])
                 grounding_status, grounding_reason = _grounding(evidence_ref)
+                quote = (evidence_ref.quote if evidence_ref else hit.get("evidence", "")) or ""
+                conf_text = "n/a" if confidence is None else f"{float(confidence):.2f}"
+                # The list subtitle: prefer the model's quote (where it was found /
+                # its reasoning) so a banker can cross-check at a glance.
+                description = quote.strip() or f"extracted value · confidence {conf_text}"
                 items.append(
                     ReviewItem(
-                        id=item_id, kind="low_confidence", row_memo_id=row_id,
+                        id=item_id, kind="value", row_memo_id=row_id,
                         asset_name=asset.get("asset_name"), qa_status=asset.get("qa_status", ""),
                         field=hit["field"], band=hit.get("band"),
                         value=hit.get("value"), raw_text=hit.get("raw_text", ""),
                         unit=hit.get("unit"),
                         method=_method_chip(hit.get("method"), page_classes, hit.get("page")),
                         confidence=confidence,
-                        evidence=evidence_ref.quote if evidence_ref else hit.get("evidence", ""),
+                        evidence=quote,
                         evidence_ref=evidence_ref,
                         evidence_refs=evidence_refs,
                         grounding_status=grounding_status,
                         grounding_reason=grounding_reason,
-                        issue_code="low_confidence",
-                        issue_descriptions=[f"confidence {confidence:.2f} below threshold {threshold:.2f}"],
+                        issue_code="extracted",
+                        issue_descriptions=[f"extracted value · confidence {conf_text}"],
                         reviewer_comment=(action or {}).get("note") if action else None,
                         page=evidence_ref.display_page if evidence_ref else hit.get("page"),
                         bbox=list(evidence_ref.bbox) if evidence_ref and evidence_ref.bbox else hit.get("bbox"),
                         has_page_image=bool(renderable and (evidence_ref.display_page if evidence_ref else hit.get("page"))),
-                        category="low_confidence",
-                        description=f"confidence {confidence:.2f} below threshold {threshold:.2f}",
-                        severity="warning",
+                        category="extracted",
+                        description=description,
+                        severity="info",
+                        needs_approval=action is None and _value_needs_approval(
+                            confidence, auto_enabled=auto_enabled, auto_confidence=auto_confidence
+                        ),
                         qa_fail_reasons=[],
                         conflicts=hit.get("conflicts") or [],
                         resolved=action is not None,
@@ -380,6 +416,19 @@ class ReviewError(RuntimeError):
 
 def _schema_by_header() -> dict[str, SchemaField]:
     return {f.header: f for f in load_schema_fields()}
+
+
+def _run_schema(run_dir: Path) -> tuple[list[SchemaField], WorkbookLayout | None]:
+    """The schema + layout this run actually wrote with. A custom-reference run
+    persisted a ``schema_snapshot.json`` next to its workbook; the master path
+    leaves none, so fall back to the committed master schema (master layout)."""
+    snapshot = run_dir / "schema_snapshot.json"
+    if snapshot.is_file():
+        doc = json.loads(snapshot.read_text(encoding="utf-8"))
+        fields = [SchemaField.model_validate(f) for f in doc["fields"]]
+        layout = WorkbookLayout.model_validate(doc["layout"]) if doc.get("layout") else None
+        return fields, layout
+    return load_schema_fields(), None
 
 
 def _append_audit_action(
@@ -450,11 +499,13 @@ def apply_action(
     manual_hit: dict | None = None
 
     with _writer_lock:
-        writer = WorkbookWriter(wb_path, load_schema_fields(), config.pv_root)
+        run_fields, run_layout = _run_schema(run_dir)
+        schema_by_header = {f.header: f for f in run_fields}
+        writer = WorkbookWriter(wb_path, run_fields, config.pv_root, layout=run_layout)
         if action == "edit":
             if item.field is None:
                 raise ReviewError("cannot edit an item with no linked field")
-            schema_field = _schema_by_header().get(item.field)
+            schema_field = schema_by_header.get(item.field)
             if schema_field is None:
                 raise ReviewError(f"unknown schema field {item.field!r}")
             writer.update_cell(item.row_memo_id, schema_field.col_index, value)
@@ -464,7 +515,7 @@ def apply_action(
             header = item.field or field
             if header is None:
                 raise ReviewError("add_value requires a target field")
-            schema_field = _schema_by_header().get(header)
+            schema_field = schema_by_header.get(header)
             if schema_field is None:
                 raise ReviewError(f"unknown schema field {header!r}")
             writer.update_cell(item.row_memo_id, schema_field.col_index, value)

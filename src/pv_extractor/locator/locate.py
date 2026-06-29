@@ -227,6 +227,7 @@ def locate(
         doc_type=query.doc_type,
         cfg=cfg,
         doc_type_spec=doc_type_spec,
+        source_mode=query.source_mode,
         restrict_to_client_sourced=query.restrict_to_client_sourced,
     )
     cands = [CandidateFile(record=rec, breakdown=score_candidate(rec, ctx)) for rec in records]

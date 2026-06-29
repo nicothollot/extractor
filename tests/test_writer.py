@@ -58,14 +58,20 @@ def test_header_drift_template_aborts(project_root: Path, tmp_path: Path) -> Non
         WorkbookWriter(drifted, _schema_fields(project_root), pv_root=str(tmp_path / "fake_pv"))
 
 
-def test_header_drift_aborts_full_run(phase2_env, project_root: Path, tmp_path: Path) -> None:
+def test_non_master_template_is_custom_and_needs_llm(
+    phase2_env, project_root: Path, tmp_path: Path
+) -> None:
+    """A workbook whose headers no longer match the committed master schema is
+    now treated as a CUSTOM reference (extracted LLM-first), not a hard abort.
+    With LLM assist disabled the run refuses with a clear ValueError rather
+    than the legacy HeaderDriftError."""
     drifted = tmp_path / "drifted.xlsx"
     copy_template(REFERENCE_TEMPLATE, drifted, pv_root=phase2_env.pv_root)
     workbook = openpyxl.load_workbook(drifted)
     workbook["Index"].cell(row=2, column=1).value = "Memo Identifier"
     workbook.save(drifted)
 
-    with pytest.raises(HeaderDriftError):
+    with pytest.raises(ValueError, match="custom reference workbook"):
         run(
             phase2_env, scope="deal", client="Angelo Gordon", deal="Accell",
             period="2025-01-31", template=drifted, now=datetime(2026, 6, 12, 9, 0, 0),

@@ -13,14 +13,55 @@ structured fields per memo into a master Excel index.
   pass for low-confidence / missing fields and OCR-hostile pages, with
   aggressive cost controls. The deterministic engine stays primary.
 
-**New here / setting up a clone?** See **`INSTALL.md`** for step-by-step setup
-on WSL and native Windows (including how to point `pv_root` at the real share
-`\\hlhz\dfs\nyfva\PV`). See `CLAUDE.md` for the hard rules and module map and
-`ARCHITECTURE.md` for the current-state map. Quick setup:
+> **Beta release.** The setup scripts below provision everything (including the
+> right Python) into a project-local virtualenv — they do not change your
+> system Python.
 
-    python scripts/bootstrap.py --with-gui   # .venv + deps + GUI bundle (drop --with-gui if you have no Node)
-    .venv/bin/pv-extractor doctor            # claude CLI, auth, model menu, schema artifacts
-    .venv/bin/pv-extractor gui               # local analyst GUI on 127.0.0.1
+## Setup (one click)
+
+You need this repo and an internet connection. **You do NOT need to install
+Python yourself** — setup fetches an isolated Python **3.12** if you don't
+already have one (3.13/3.14 won't work yet: some native dependencies have no
+wheels for them). Everything installs into a project-local `.venv`.
+
+> **Pick the setup that matches where the repo lives.** If the repo is inside
+> **WSL** (`\\wsl.localhost\...` / `~/...`), set it up **from a WSL terminal**
+> with `./scripts/setup.sh` — the Windows `setup.bat` cannot run against a WSL
+> path (`cmd.exe` rejects UNC working directories). If the repo is on a
+> **Windows drive** (`C:\...`), use `setup.bat`. Don't cross them.
+
+### Windows (PowerShell)
+
+1. Clone/download this repo.
+2. **Double-click `setup.bat`** — or in PowerShell from the repo root:
+   `powershell -ExecutionPolicy Bypass -File scripts\setup.ps1`
+3. When it finishes, **double-click `Start PV Extractor.bat`** — the local GUI
+   opens in your browser.
+
+### WSL / Linux / macOS
+
+```bash
+./scripts/setup.sh             # finds/fetches Python 3.12, builds .venv, installs deps
+.venv/bin/pv-extractor gui     # local analyst GUI on http://127.0.0.1
+```
+
+### What setup does
+- Finds a Python **3.12** on your PATH; if none, installs an isolated 3.12 via
+  [uv](https://docs.astral.sh/uv/) (your system Python is left alone).
+- Creates `.venv` and installs the package + dependencies (editable).
+- Seeds `config.yaml` from `config.example.yaml` on first run — **edit it** to
+  point `pv_root` at your documents share (e.g. `\\hlhz\dfs\nyfva\PV`) and
+  `output_dir` at a local writable folder.
+- The web GUI bundle ships prebuilt, so **Node.js is not required** unless you
+  change frontend code.
+
+After setup, `pv-extractor doctor` checks the Claude Code CLI / auth / model
+menu / schema artifacts. The LLM second pass is **optional** — the deterministic
+engine runs without it; run `claude auth login` once to enable it.
+
+See **`INSTALL.md`** for the manual/step-by-step path and prerequisites,
+`CLAUDE.md` for the hard rules and module map, and `ARCHITECTURE.md` for the
+current-state map.
 
 ## Phase 3 — Claude Code fallback
 
@@ -33,31 +74,51 @@ environment). Instead, the app launches **hidden local Claude Code sessions**:
     claude auth login        # once, in any terminal
 
 After that one-time login the extractor reuses your local Claude Code
-session via non-interactive print-mode calls
-(`claude -p --output-format json --json-schema ... --model ... --effort ...`).
+session via non-interactive print-mode calls (`claude -p … --model … --effort …`).
 Think "the app opens hidden Claude Code terminals", not "the app calls an
 API". `pv-extractor doctor` tells you if anything is missing.
+
+By default the model **reads the source documents itself** (they're copied
+into the call's working directory and the model opens them with its Read tool)
+and **writes its answer to a JSON file** (`answers.json`) that the app then
+reads and validates — a missing/malformed file is repaired by reprompting in
+the *same* session. (Toggle `llm.file_based_output` off to fall back to the
+older inline-schema StructuredOutput call.)
 
 ### What gets escalated, and what gets sent
 
 A field only reaches Claude Code after the deterministic + local-OCR pass
 scored it below `extraction.confidence_threshold` (default 0.75) or left a
-required field empty. Per memo, **one** Claude Code call per router tier
-carries *all* escalated fields in a band-grouped strict JSON schema, and the
-payload contains **pages, not documents**: the escalated fields' candidate
-pages (from the Phase-2 page→band map) plus pages 1–3.
+required field empty. By default the LLM pass makes **one call per deal/period
+over all that deal's documents combined** (`llm.combine_deal_documents`),
+requesting the whole escalated field set at once.
 
-- TEXT pages travel as extracted text, tables serialized as markdown pipe
-  tables.
-- SCANNED / IMAGE_TABLE pages travel as PNG page images (≤1080 px long edge).
-- Every answer must carry `{value, unit, page, verbatim_quote, confidence,
-  not_found}`; the quote is machine-verified against the cited page — a quote
-  that doesn't appear discards the value and raises `UNGROUNDED_LLM_VALUE`.
-- A Claude Code value **never** overwrites a deterministic value with
-  confidence ≥ threshold. Every merge/overwrite/rejection is recorded in the
-  memo's audit record (`output/<run_id>/audit/<memo_id>.json`).
-- Fields that fail every pass are flagged `NOT_EXTRACTABLE` with reviewer
+- Each answer carries `{value, unit, page, verbatim_quote, confidence,
+  not_found}`. The quote is checked against the cited page; on a clean match
+  the value is grounded. A value whose quote can't be matched (common when the
+  model lightly rewords text it read off a scanned page) is **surfaced as a
+  low-confidence, flagged `UNGROUNDED_LLM_VALUE` for review** rather than
+  silently dropped (`llm.surface_ungrounded_values`).
+- `llm.confidence_selection` (Settings → LLM routing) governs this gating. On:
+  values are quote-grounded and arbitration-gated, ungrounded ones capped low +
+  flagged. Off: **trust the model** — every value is accepted at the model's own
+  confidence (no cap, no grounding gate).
+- A Claude Code value **never** overwrites a confident deterministic value.
+  Every merge/overwrite/rejection is recorded in the memo's audit record
+  (`output/<run_id>/audit/<memo_id>.json`), and a human-readable
+  `extracted_*.json` (one row per field) is written next to each call's payload.
+- Fields that genuinely fail are flagged `NOT_EXTRACTABLE` with reviewer
   attention — values are never invented.
+
+### Review queue & auto-approval
+
+The GUI review queue shows **every extracted value** (not just flagged ones),
+each with its value, confidence, the model's quote, and the source page
+auto-rendered. A **Needs approval | All values** switch filters the list. With
+`llm.auto_approve_enabled` on (default), values at or above
+`llm.auto_approve_confidence` (default 80%) are auto-approved and the rest —
+plus any flagged item — land in *Needs approval* for a banker to sign off. Both
+settings are editable in **Settings → LLM routing**.
 
 ### Model menu, AUTO/MANUAL routing
 

@@ -4,9 +4,9 @@ import { CostMeter } from "../components/charts";
 import { LlmActivityView } from "../components/LlmActivityView";
 import { LogTail } from "../components/LogTail";
 import { ProgressLanes, buildLanes } from "../components/ProgressLanes";
-import { Button, Card, CardHeader, Panel, StatusChip } from "../components/ui";
+import { Button, Card, CardHeader, Field, inputCls, Panel, StatusChip } from "../components/ui";
 import { HLSpinner } from "../components/branding";
-import { RunResult, post } from "../lib/api";
+import { RunResult, post, setBudget } from "../lib/api";
 import { fmtDuration, useJobEvents } from "../lib/hooks";
 
 export default function RunProgress() {
@@ -22,6 +22,30 @@ export default function RunProgress() {
     }
     return spent;
   }, [events]);
+
+  // Budget pause state + live ceiling, folded over the event log so a browser
+  // reconnect reconstructs a paused run (events are persisted + replayed).
+  const budgetState = useMemo(() => {
+    const reqBudget = ((job?.params as Record<string, unknown> | undefined)?.llm as
+      | Record<string, unknown>
+      | undefined)?.budget_usd;
+    let ceiling: number | null = typeof reqBudget === "number" ? reqBudget : null;
+    let paused: { committed: number; budget: number | null } | null = null;
+    for (const e of events) {
+      if (e.type === "budget_paused") {
+        paused = {
+          committed: Number(e.payload.committed_usd ?? 0),
+          budget: typeof e.payload.budget_usd === "number" ? e.payload.budget_usd : null,
+        };
+      } else if (e.type === "budget_updated") {
+        ceiling = typeof e.payload.budget_usd === "number" ? e.payload.budget_usd : null;
+        paused = null;
+      } else if (e.type === "budget_resumed" || e.type === "done") {
+        paused = null;
+      }
+    }
+    return { ceiling, paused };
+  }, [events, job?.params]);
 
   const dryRun = Boolean((job?.params as Record<string, unknown> | undefined)?.dry_run);
   // Overall progress + rough ETA, folded from the event stream. "Done" for a
@@ -66,12 +90,36 @@ export default function RunProgress() {
 
   const params = job?.params as Record<string, unknown> | undefined;
   const llmParams = (params?.llm ?? {}) as Record<string, unknown>;
-  const budget = typeof llmParams.budget_usd === "number" ? llmParams.budget_usd : 25;
+  const budget = budgetState.ceiling; // null = no cap (unlimited)
   const active = job ? ["queued", "running", "cancelling"].includes(job.status) : true;
   const result = job?.result as RunResult | null;
   const llmEnabled = llmParams.enabled !== false;
   const llmDiag = (result?.diagnostics?.llm ?? {}) as Record<string, unknown>;
   const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
+  const [raiseAmt, setRaiseAmt] = useState("");
+  const [resolving, setResolving] = useState(false);
+  const paused = active ? budgetState.paused : null;
+
+  // Prefill the raise field with a sensible bump (2× the current cap) when a
+  // pause first appears.
+  useEffect(() => {
+    if (paused && !raiseAmt) {
+      const base = paused.budget ?? paused.committed;
+      setRaiseAmt(String(Math.max(base * 2, paused.committed + 1).toFixed(2)));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paused]);
+
+  const resolveBudget = async (action: "raise" | "remove" | "cancel") => {
+    if (!job) return;
+    setResolving(true);
+    try {
+      await setBudget(job.id, action, action === "raise" ? Number(raiseAmt) : undefined);
+      setRaiseAmt("");
+    } finally {
+      setResolving(false);
+    }
+  };
   const diagnosticText = useMemo(
     () =>
       JSON.stringify(
@@ -114,7 +162,7 @@ export default function RunProgress() {
   }, [finishedRun, autoReview]);
 
   return (
-    <Panel className="space-y-4 max-w-6xl">
+    <Panel className="space-y-4 max-w-[1600px]">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           {active && <HLSpinner size={28} />}
@@ -220,7 +268,7 @@ export default function RunProgress() {
 
       <div className="grid grid-cols-2 gap-4">
         <Card>
-          <CardHeader title="Cost meter" sub={llmEnabled ? "live spend vs hard budget cap" : "LLM fallback disabled for this run"} />
+          <CardHeader title="Cost meter" sub={llmEnabled ? "live spend vs budget cap (pauses at the cap)" : "LLM fallback disabled for this run"} />
           <div className="px-4 pb-4">
             {llmEnabled ? <CostMeter spent={cost} budget={budget} source={cost > 0 ? "ledger" : null} /> : (
               <p className="text-[12px] text-ink-400 py-3">Pure Phase-2 run — escalation plans land in the audit records.</p>
@@ -276,6 +324,60 @@ export default function RunProgress() {
           <LogTail events={events} />
         </div>
       </Card>
+
+      {paused && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <Card className="w-[480px] p-5 space-y-4">
+            <div className="flex items-center gap-3">
+              <HLSpinner size={22} />
+              <h2 className="text-[15px] font-semibold text-ink-900">Budget cap reached</h2>
+            </div>
+            <p className="text-[13px] text-ink-600">
+              The run is paused. It has spent{" "}
+              <span className="font-mono">${paused.committed.toFixed(4)}</span>
+              {paused.budget !== null && (
+                <>
+                  {" "}of its <span className="font-mono">${paused.budget.toFixed(2)}</span> cap
+                </>
+              )}
+              . Raise the cap to continue, remove it entirely, or cancel — agents resume as soon as
+              you raise or remove the cap.
+            </p>
+            <Field label="New budget cap (USD)">
+              <input
+                className={inputCls}
+                value={raiseAmt}
+                inputMode="decimal"
+                autoFocus
+                onChange={(e) => setRaiseAmt(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && Number(raiseAmt) > paused.committed) resolveBudget("raise");
+                }}
+              />
+            </Field>
+            {raiseAmt !== "" && Number(raiseAmt) <= paused.committed && (
+              <p className="text-[12px] text-danger">
+                The new cap must be above the current spend (${paused.committed.toFixed(4)}).
+              </p>
+            )}
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button kind="ghost" disabled={resolving} onClick={() => resolveBudget("cancel")}>
+                Cancel run
+              </Button>
+              <Button kind="secondary" disabled={resolving} onClick={() => resolveBudget("remove")}>
+                Remove cap
+              </Button>
+              <Button
+                kind="primary"
+                disabled={resolving || !(Number(raiseAmt) > paused.committed)}
+                onClick={() => resolveBudget("raise")}
+              >
+                {resolving ? "Resuming…" : "Raise & continue"}
+              </Button>
+            </div>
+          </Card>
+        </div>
+      )}
     </Panel>
   );
 }

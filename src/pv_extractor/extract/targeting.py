@@ -178,7 +178,8 @@ def build_page_band_map(
     for band in lexicons:
         scores = band_scores.get(band, {})
         top = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
-        selected = {number for number, _ in top[: cfg.top_k_pages_per_band]}
+        top_k = cfg.top_k_pages_per_band_overrides.get(band, cfg.top_k_pages_per_band)
+        selected = {number for number, _ in top[:top_k]}
         selected.update(summary)
         out[band] = sorted(selected)
     return out

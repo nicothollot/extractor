@@ -4,4 +4,4 @@ EXTRACTOR_VERSION participates in the memo result cache key — bump it on any
 change that can alter extraction output, so stale cache entries self-expire.
 """
 
-EXTRACTOR_VERSION = "2.2.0"
+EXTRACTOR_VERSION = "2.3.0"

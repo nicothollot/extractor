@@ -23,6 +23,7 @@ gui:
   open_browser: true             # `pv-extractor gui` opens the default browser
   evidence_dpi: 144              # review-queue page render resolution
   frontend_dist:                 # built frontend dir (default: <repo>/src/frontend/dist)
+  default_reference_workbook:    # preferred reference workbook; "Use local default" + empty-state prefill use it (null = system master)
 
 claude_code:
   command: claude                # executable name or full path
@@ -65,7 +66,7 @@ deal_discovery:
   enabled: true                  # false = legacy behavior (deal = first folder under the client)
   min_confidence: 0.0            # drop deals scoring below this (0 = keep all, ranked by confidence)
   review_confidence: 0.45        # below this a deal is flagged low-confidence in CLI/GUI
-  display_min_confidence: 0.70   # GUI only: hide discovered deals below this (storage keeps all; raise/lower in Settings)
+  display_min_confidence: 0.6    # GUI only: hide discovered deals below this (storage keeps all; raise/lower in Settings)
   shared_bucket_enabled: true            # one neutral folder holding memos for many DIFFERENT investments -> one deal per cluster
   shared_bucket_min_clusters: 2          # min distinct asset clusters to treat a folder as a shared bucket
   shared_bucket_name_match_threshold: 85 # rapidfuzz floor to assign a file to a cluster-deal
@@ -294,11 +295,14 @@ locator:
 extraction:
   workers: 4                       # thread pool size; it's a network share, don't hammer it
   top_k_pages_per_band: 4          # each band extractor sees its top-K pages...
+  top_k_pages_per_band_overrides:  # per-band top-K override (band -> K); others use the default
+    REFERENCE: 24                  # the HL/GEDP profile band spans many sections of a long memo
   summary_pages: 3                 # ...plus pages 1..N (summary pages) always
   confidence_threshold: 0.75       # below this a field lands in the Phase-3 EscalationPlan
   vocab_fuzzy_threshold: 90        # controlled-vocab mapping floor; below = empty + flag
   max_evidence_chars: 200          # verbatim evidence snippet cap
   cache_enabled: true              # sha256+schema+extractor version result cache
+  profile:                         # deterministic profile for custom workbooks; null = auto-detect by header signature (e.g. hl_gedp)
 
   ocr:
     enabled: true
@@ -324,7 +328,30 @@ extraction:
     prose_factor: 0.85
     ambiguity_penalty: 0.60        # applied when conflicting candidates were found
 
-  band_anchor_overrides: {}        # extra per-band anchor terms merged with schema-seeded lexicons
+  band_anchor_overrides:           # extra per-band anchor terms merged with schema-seeded lexicons
+    # HL valuation-memo section anchors so the GEDP profile's REFERENCE band
+    # targets the right pages (harmless for non-HL custom workbooks: they don't match).
+    REFERENCE:
+      - summary valuation conclusions
+      - valuation trends
+      - valuation summary
+      - discounted cash flow analysis
+      - reverse option pricing model
+      - representative levels
+      - key terms
+      - invested capital
+      - issue date
+      - structured return
+      - equity allocation methodology
+      - implied moic
+      - concluded value
+      - equity volatility
+      - time to liquidity
+      - selected discount rate
+      - net revenue
+      - adjusted ebitda
+      - enterprise value
+      - equity value
 
 # --- Phase 2: peek-verifier (D3) ---
 peek_verify:
@@ -417,15 +444,44 @@ llm:
   transient_retries: 2             # retry a call this many times on a transient WSL/connection bridge error
   stream_partial_messages: true    # stream the model's thinking + answer token deltas to the live activity view
   always_enable_thinking: true     # force extended thinking on for every model/effort (budget still scales with effort)
-  timeout_seconds: 600             # per primary provider request (a single call
-                                   # over a large field set can take many minutes)
+  timeout_seconds: 0               # per provider extraction call. 0 (default) = NO
+                                   # wall-clock kill: wait for the CLI to finish on
+                                   # its own so a near-complete call is never cut
+                                   # off; it only fails when the CLI itself errors/
+                                   # exits (a live heartbeat shows progress). Set a
+                                   # positive value to restore a hard ceiling.
   max_pages_per_memo: 20           # per-document payload page cap before provider transport
-  combine_deal_documents: false    # legacy override forcing whole-deal payload shape; normal routing
-                                   #   should use routing_mode/model profiles instead.
+  combine_deal_documents: true     # ONE call per deal/period over ALL its documents combined (the model
+                                   #   analyzes the whole deal-period at once). false = per-document calls.
   one_call_per_deal: false         # deprecated legacy spelling; use combine_deal_documents
   max_pages_per_deal: 40           # total page cap for the combined per-deal payload (across its docs)
   image_max_long_edge: 1080        # SCANNED/IMAGE_TABLE pages render to PNG at most this long edge
-  quote_match_threshold: 85        # fuzzy quote-grounding floor for OCR'd pages
+  quote_match_threshold: 85        # fuzzy quote-grounding floor for OCR'd / image pages
+  text_quote_match_threshold: 85   # fuzzy quote-grounding floor for native TEXT pages (was a hardcoded 98,
+                                   #   which silently rejected ~75% of correct values the model lightly
+                                   #   reworded; 85 grounds close paraphrases, still catches real mismatches)
+  file_based_output: true          # model WRITES its answer to answers.json (Write tool) instead of the
+                                   #   --json-schema StructuredOutput tool; we read+validate that file and
+                                   #   reprompt IN THE SAME session on a bad/missing file (see repair rounds)
+  answer_file_repair_rounds: 2     # max same-session reprompts to fix a missing/malformed/invalid answers.json
+  scratch_cleanup_enabled: true    # prune per-memo llm/<memo_id>/ working dirs DURING the run to bound peak disk
+                                   #   (copied source PDFs, page renders, .claude/ session, prompts, schemas).
+                                   #   Authoritative data (workbook + audit/*.json) is written later and unaffected.
+  scratch_cleanup_retain: 50       # keep the N most-recently-finished memo dirs fully intact for debugging;
+                                   #   older ones are pruned. 0 = prune every dir as soon as it finishes.
+  scratch_cleanup_keep_data: true  # keep extracted_*.json / answers_*.json / manifest.json (delete only the heavy
+                                   #   scratch); false = full delete of the memo dir (no raw LLM output kept)
+  confidence_selection: false      # true = quote-ground + arbitration-gate LLM values (ungrounded ones capped
+                                   #   at ungrounded_confidence_cap + flagged). false (default) = TRUST the model:
+                                   #   accept every value at the model's own confidence, no cap, no UNGROUNDED
+                                   #   flags (a confident deterministic value is still never overwritten). Default
+                                   #   off because native PDF reading makes local-text quote grounding unreliable
+                                   #   and stamps most values at the ~0.20 cap.
+  auto_approve_enabled: true       # review queue: auto-APPROVE values at/above auto_approve_confidence;
+                                   #   everything below (plus reviewer-attention flags) is "needs approval".
+                                   #   false = every extracted value needs manual approval. The queue always
+                                   #   SHOWS all values either way — this only sets which await a banker.
+  auto_approve_confidence: 0.80    # confidence bar (0..1) for auto-approval; e.g. 0.80 = >=80% auto-approved
   band_batched: true               # legacy compatibility knob; normal path ignores small field batches
   single_call_max_pages: 0         # disabled: do not collapse into whole-document/all-field calls
   retry_not_found: false           # false = a field the model marks not_found is RESOLVED (no expensive

@@ -10,6 +10,7 @@ import { StatusChip } from "./components/ui";
 import { HLLogo } from "./components/branding";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import Dashboard from "./screens/Dashboard";
+import DirectRun from "./screens/DirectRun";
 import Guide from "./screens/Guide";
 import NewRun from "./screens/NewRun";
 import OutputBrowser from "./screens/OutputBrowser";
@@ -20,6 +21,7 @@ import Settings from "./screens/Settings";
 const NAV = [
   { to: "/dashboard", label: "Dashboard" },
   { to: "/new-run", label: "New Run" },
+  { to: "/direct-run", label: "Direct Run" },
   { to: "/review", label: "Review Queue" },
   { to: "/output", label: "Output Browser" },
   { to: "/guide", label: "Guide" },
@@ -95,6 +97,7 @@ function RoutedContent() {
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/new-run" element={<NewRun />} />
+        <Route path="/direct-run" element={<DirectRun />} />
         <Route path="/jobs/:jobId/progress" element={<RunProgress />} />
         <Route path="/review" element={<ReviewQueue />} />
         <Route path="/review/:runId" element={<ReviewQueue />} />

@@ -3,7 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { useStickyState } from "../lib/uiState";
 import { DataTable } from "../components/DataTable";
 import { Button, Card, CardHeader, EmptyState, ErrorState, Panel, SkeletonRows, StatusChip } from "../components/ui";
-import { IndexRow, RunResult } from "../lib/api";
+import { deleteRun, IndexRow, RunResult } from "../lib/api";
 import { fmtUsd, useLoad } from "../lib/hooks";
 
 type FlagRow = Record<string, string | number | null>;
@@ -68,7 +68,7 @@ export default function OutputBrowser() {
 
   if (!runId) {
     return (
-      <Panel className="space-y-4 max-w-5xl">
+      <Panel className="space-y-4 max-w-[1600px]">
         <h1 className="text-xl font-semibold text-ink-900">Output browser</h1>
         <Card>
           <CardHeader title="Pick a run" sub="click a run for a quick preview, then open it" />
@@ -94,7 +94,18 @@ export default function OutputBrowser() {
                 </button>
                 {expanded === r.run_id && (
                   <div className="px-6 pb-4 pt-1 bg-ink-50/60">
-                    <RunPreviewCard r={r} onOpen={() => navigate(`/output/${r.run_id}`)} />
+                    <RunPreviewCard
+                      r={r}
+                      onOpen={() => navigate(`/output/${r.run_id}`)}
+                      onDelete={async () => {
+                        if (!window.confirm(
+                          `Delete ${r.run_id} from history? This removes its output and lets the same documents re-extract on a future run.`,
+                        )) return;
+                        await deleteRun(r.run_id);
+                        setExpanded(null);
+                        runs.reload();
+                      }}
+                    />
                   </div>
                 )}
               </li>
@@ -107,7 +118,7 @@ export default function OutputBrowser() {
   return <RunOutput runId={runId} />;
 }
 
-function RunPreviewCard({ r, onOpen }: { r: RunResult; onOpen: () => void }) {
+function RunPreviewCard({ r, onOpen, onDelete }: { r: RunResult; onOpen: () => void; onDelete: () => void }) {
   return (
     <Card className="px-4 py-3 space-y-2">
       <div className="grid grid-cols-2 md:grid-cols-3 gap-x-6 gap-y-1 text-[12.5px] text-ink-700">
@@ -138,6 +149,9 @@ function RunPreviewCard({ r, onOpen }: { r: RunResult; onOpen: () => void }) {
         <Button kind="primary" onClick={onOpen}>
           Open run →
         </Button>
+        <Button kind="ghost" onClick={onDelete}>
+          Delete from history
+        </Button>
       </div>
     </Card>
   );
@@ -160,7 +174,7 @@ function RunOutput({ runId }: { runId: string }) {
   const d = detail.data;
 
   return (
-    <Panel className="space-y-4 max-w-6xl">
+    <Panel className="space-y-4 max-w-[1600px]">
       <div className="flex items-center justify-between">
         <div className="flex items-baseline gap-3">
           <h1 className="text-xl font-semibold text-ink-900">Output</h1>

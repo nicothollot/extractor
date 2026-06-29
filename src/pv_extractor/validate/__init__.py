@@ -94,7 +94,13 @@ def validate_asset(
 
     # --- hard failures ---
     populated = {hit.field for hit in all_hits if hit.value is not None}
-    if not populated & set(_VALUATION_VALUE_HEADERS):
+    # This hard-fail only applies to the MASTER schema, whose value headers are
+    # below. A CUSTOM reference workbook (e.g. GEDP: "EV - LOW", "MVE - LOW", …)
+    # does not contain these headers at all, so the check is meaningless there —
+    # skip it rather than fail every custom run. Only enforce when at least one
+    # of the headers is actually part of this run's schema.
+    valuation_headers = set(_VALUATION_VALUE_HEADERS) & set(schema_by_header)
+    if valuation_headers and not (populated & valuation_headers):
         flags.append(
             ReviewFlag(
                 category="qa",

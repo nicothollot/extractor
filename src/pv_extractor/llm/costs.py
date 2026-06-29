@@ -43,37 +43,103 @@ def estimate_usage(
 
 
 class BudgetExceeded(Exception):
-    """Raised by reserve() when a job would push spend past the cap."""
+    """Raised by reserve() when a job is abandoned at the budget cap.
+
+    Two situations raise it: (a) NON-interactive runs (CLI — no pause callback)
+    hit the cap and defer, exactly as before; (b) an interactive (GUI) run that
+    is PAUSED at the cap and the user then CANCELS — the parked reserve() wakes
+    and raises so the memo defers and the run ends cleanly."""
 
 
 class BudgetTracker:
-    """Thread-safe projected-spend tracker for one run."""
+    """Thread-safe projected-spend tracker for one run.
 
-    def __init__(self, budget_usd: float) -> None:
+    Interactive (GUI) runs PAUSE at the cap: reserve() blocks on a condition
+    until the user raises the cap, removes it, or cancels — parked provider
+    agents then resume. Non-interactive runs (CLI, no on_pause callback) keep
+    the original hard-cap behavior: reserve() raises BudgetExceeded immediately
+    so the memo defers (LLM_DEFERRED). budget_usd=None means no cap (unlimited).
+    """
+
+    def __init__(
+        self,
+        budget_usd: float | None,
+        *,
+        on_pause=None,
+        cancel_event: "threading.Event | None" = None,
+    ) -> None:
         self.budget_usd = budget_usd
         self._committed = 0.0
-        self._lock = threading.Lock()
+        self._cond = threading.Condition()
+        self._on_pause = on_pause  # called once when the first thread parks
+        self._cancel_event = cancel_event
+        self._paused = False
+        self._cancelled = False
 
     @property
     def committed_usd(self) -> float:
-        with self._lock:
+        with self._cond:
             return round(self._committed, 6)
 
+    @property
+    def interactive(self) -> bool:
+        return self._on_pause is not None
+
+    def _cancel_requested_locked(self) -> bool:
+        return self._cancelled or (self._cancel_event is not None and self._cancel_event.is_set())
+
+    def _fits_locked(self, estimate_usd: float) -> bool:
+        return self.budget_usd is None or self._committed + estimate_usd <= self.budget_usd
+
     def reserve(self, estimate_usd: float) -> None:
-        """Commit a job's projected cost; BudgetExceeded if it would pass
-        the cap (the job must then be deferred, never submitted)."""
-        with self._lock:
-            if self._committed + estimate_usd > self.budget_usd:
-                raise BudgetExceeded(
-                    f"projected spend ${self._committed + estimate_usd:.4f} exceeds "
-                    f"budget ${self.budget_usd:.2f}"
-                )
-            self._committed += estimate_usd
+        """Commit a job's projected cost. If it would pass the cap: a
+        non-interactive run raises BudgetExceeded (defer); an interactive run
+        parks until raise/remove/cancel. A cancel (own flag or the run's
+        cancel_event) raises BudgetExceeded so the memo defers."""
+        with self._cond:
+            while True:
+                if self._cancel_requested_locked():
+                    raise BudgetExceeded("run cancelled at budget pause")
+                if self._fits_locked(estimate_usd):
+                    self._committed += estimate_usd
+                    return
+                if not self.interactive:
+                    raise BudgetExceeded(
+                        f"projected spend ${self._committed + estimate_usd:.4f} exceeds "
+                        f"budget ${self.budget_usd:.2f}"
+                    )
+                # Interactive: pause and wait for the user. Only the FIRST thread
+                # to park fires the pause callback (the latch); the rest wait.
+                if not self._paused:
+                    self._paused = True
+                    if self._on_pause is not None:
+                        self._on_pause(round(self._committed, 6), self.budget_usd)
+                self._cond.wait()
+
+    def raise_budget(self, new_total_usd: float) -> None:
+        """Lift the cap to a new total and wake parked agents."""
+        with self._cond:
+            self.budget_usd = float(new_total_usd)
+            self._paused = False
+            self._cond.notify_all()
+
+    def remove_cap(self) -> None:
+        """Remove the cap entirely (unlimited) and wake parked agents."""
+        with self._cond:
+            self.budget_usd = None
+            self._paused = False
+            self._cond.notify_all()
+
+    def cancel(self) -> None:
+        """Wake parked agents so their reserve() raises BudgetExceeded."""
+        with self._cond:
+            self._cancelled = True
+            self._cond.notify_all()
 
     def settle(self, estimate_usd: float, actual_usd: float) -> None:
         """Replace a reservation with the settled (actual or final-estimate)
         cost once the call finished."""
-        with self._lock:
+        with self._cond:
             self._committed += actual_usd - estimate_usd
 
 

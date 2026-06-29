@@ -202,27 +202,28 @@ class FakeClaudeCodeClient:
         return True
 
     # --- extraction ----------------------------------------------------
-    def extract_json(
-        self,
-        *,
-        job_id: str,
-        prompt: str,
-        schema_path: Path,
-        model: str,
-        effort: str,
-        cwd: Path,
-        allow_read_tool: bool = True,
-        timeout: int | None = None,
+    def _canned_result(
+        self, *, job_id: str, prompt: str, schema_path: Path, model: str, effort: str,
+        cwd: Path, timeout: int | None, call_kind: str,
     ) -> ClaudeCodeResult:
+        """Shared canned outcome for extract_json / extract_json_file. The fake
+        replaces the whole client, so it returns the structured result directly
+        (no subprocess, no real answers.json file); call_kind is recorded so a
+        test can assert the file-based seam was taken."""
         self.calls.append(
             {"job_id": job_id, "model": model, "effort": effort,
-             "prompt_chars": len(prompt), "cwd": str(cwd), "schema_path": str(schema_path)}
+             "prompt_chars": len(prompt), "cwd": str(cwd), "schema_path": str(schema_path),
+             "call_kind": call_kind}
         )
         behavior = self.behaviors.pop(0) if self.behaviors else "ok"
         if behavior == "malformed":
+            error = (
+                f"answer file answers.json is not valid JSON: Expecting value: line 1 column 1 (char 0)"
+                if call_kind == "file"
+                else "non-JSON stdout: Expecting value: line 1 column 1 (char 0)"
+            )
             return ClaudeCodeResult(
-                job_id=job_id, ok=False, exit_code=0, duration_seconds=0.1,
-                error="non-JSON stdout: Expecting value: line 1 column 1 (char 0)",
+                job_id=job_id, ok=False, exit_code=0, duration_seconds=0.1, error=error,
             )
         if behavior == "exit":
             return ClaudeCodeResult(
@@ -250,4 +251,40 @@ class FakeClaudeCodeClient:
             session_id=f"sess-fake-{len(self.calls):03d}",
             structured=structured,
             usage=self.usage, total_cost_usd=self.total_cost_usd,
+        )
+
+    def extract_json(
+        self,
+        *,
+        job_id: str,
+        prompt: str,
+        schema_path: Path,
+        model: str,
+        effort: str,
+        cwd: Path,
+        allow_read_tool: bool = True,
+        timeout: int | None = None,
+    ) -> ClaudeCodeResult:
+        return self._canned_result(
+            job_id=job_id, prompt=prompt, schema_path=schema_path, model=model,
+            effort=effort, cwd=cwd, timeout=timeout, call_kind="json",
+        )
+
+    def extract_json_file(
+        self,
+        *,
+        job_id: str,
+        prompt: str,
+        schema_path: Path,
+        model: str,
+        effort: str,
+        cwd: Path,
+        timeout: int | None = None,
+        event_sink=None,
+    ) -> ClaudeCodeResult:
+        """File-based-output seam: the real client has the model WRITE answers.json
+        and reads it back; the fake returns the same canned structured payload."""
+        return self._canned_result(
+            job_id=job_id, prompt=prompt, schema_path=schema_path, model=model,
+            effort=effort, cwd=cwd, timeout=timeout, call_kind="file",
         )

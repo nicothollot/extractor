@@ -109,9 +109,11 @@ export function Sparkline({
   );
 }
 
-/** Determinate cost meter against the hard budget cap. */
-export function CostMeter({ spent, budget, source }: { spent: number; budget: number; source: string | null }) {
-  const fraction = budget > 0 ? Math.min(1, spent / budget) : 0;
+/** Determinate cost meter against the budget cap. budget=null means no cap
+    (unlimited) — the meter shows spend only and never fills toward a ceiling. */
+export function CostMeter({ spent, budget, source }: { spent: number; budget: number | null; source: string | null }) {
+  const unlimited = budget === null;
+  const fraction = !unlimited && budget > 0 ? Math.min(1, spent / budget) : 0;
   const tone = fraction < 0.7 ? "var(--hl-success)" : fraction < 0.95 ? "var(--hl-warning)" : "var(--hl-error)";
   const reduced = useReducedMotion();
   return (
@@ -122,7 +124,7 @@ export function CostMeter({ spent, budget, source }: { spent: number; budget: nu
           {source && <span className="uppercase text-[10px] tracking-wide text-ink-400">({source})</span>}
         </span>
         <span className="font-mono">
-          ${spent.toFixed(4)} / ${budget.toFixed(2)}
+          ${spent.toFixed(4)} / {unlimited ? "∞" : `$${budget.toFixed(2)}`}
         </span>
       </div>
       <div className="h-2 bg-ink-100 rounded overflow-hidden">

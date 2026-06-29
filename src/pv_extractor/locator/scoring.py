@@ -24,6 +24,7 @@ from pv_extractor.models import (
     PeriodStyleKind,
     ScoreBreakdown,
     SourceClass,
+    SourceMode,
 )
 from pv_extractor.normalize import has_do_not_use_marker, normalize_text
 
@@ -50,9 +51,12 @@ class ScoreContext(BaseModel):
     # negative components (see _doctype_spec_component). None => behavior is
     # byte-for-byte identical to the legacy builtin-enum path.
     doc_type_spec: DocTypeSpec | None = None
-    # When False, the report/analysis (HL work product) source-class penalty is
-    # OFF — those files still rank on their other components but are not pushed
-    # down for being HL-sourced. Default True = CLAUDE.md rule 2 behavior.
+    # Source-preference mode (see models.SourceMode). "client" (default) keeps
+    # CLAUDE.md rule 2 behavior (client bonus, report/analysis penalty); "any"
+    # makes the source-class component neutral; "hl" mirrors "client" (prefer HL
+    # report/analysis, penalize client-sourced). `restrict_to_client_sourced` is
+    # retained for compatibility (True iff source_mode == "client").
+    source_mode: SourceMode = "client"
     restrict_to_client_sourced: bool = True
 
 
@@ -209,13 +213,25 @@ def score_candidate(rec: FileRecord, ctx: ScoreContext) -> ScoreBreakdown:
         matched_negative = _keyword_hits(rec.normalized_file_name, ctx.cfg.negative_keywords)
         negative_score = weights.negative_keyword if matched_negative else 0.0
 
-    if rec.source_class is SourceClass.client:
-        source_class_score = weights.source_class_client_bonus
-    elif rec.source_class in (SourceClass.report, SourceClass.analysis) and ctx.restrict_to_client_sourced:
-        # HL work product is NOT a valid extraction source (CLAUDE.md rule 2),
-        # unless the run opted out of client-source restriction.
-        source_class_score = weights.source_class_report_penalty
-    else:
+    is_hl_folder = rec.source_class in (SourceClass.report, SourceClass.analysis)
+    if ctx.source_mode == "hl":
+        # Mirror of "client": prefer HL work product (report/analysis folders),
+        # penalize client-sourced docs.
+        if is_hl_folder:
+            source_class_score = weights.source_class_client_bonus
+        elif rec.source_class is SourceClass.client:
+            source_class_score = weights.source_class_report_penalty
+        else:
+            source_class_score = 0.0
+    elif ctx.source_mode == "client":
+        if rec.source_class is SourceClass.client:
+            source_class_score = weights.source_class_client_bonus
+        elif is_hl_folder:
+            # HL work product is NOT a valid extraction source (CLAUDE.md rule 2).
+            source_class_score = weights.source_class_report_penalty
+        else:
+            source_class_score = 0.0
+    else:  # "any" — no source preference; doc-type keywords still rank.
         source_class_score = 0.0
 
     extension_score = weights.extension_prior.get(rec.extension, 0.0)

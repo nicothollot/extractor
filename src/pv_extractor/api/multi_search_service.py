@@ -164,6 +164,7 @@ def expand_slots(
                         doc_type=doc_type,
                         doc_type_spec=spec,
                         firm=firm.client,
+                        source_mode=firm.source_mode,
                     )
                 )
     return slots
@@ -222,6 +223,7 @@ def build_multi_selection(
                     target=target,
                     enhanced_period_check=firm.enhanced_period_check,
                     doc_type_spec=spec,
+                    source_mode=firm.source_mode,
                 )
                 payload = selection.model_dump()
                 payload["doc_type_slug"] = slug

@@ -47,13 +47,22 @@ comments preserved), and setup/doctor flows.
    folders) is NOT a valid extraction source; the locator penalizes it heavily
    and the peek-verifier REJECTS files carrying HL letterhead/disclaimer
    language. This is the DEFAULT and prevents *accidental* use of HL work
-   product. Two explicit, logged opt-outs exist: a per-run
-   `restrict_to_client_sourced=False` (`LocateQuery`/`RunSlot`/`RunRequest`, the
-   New Run "Restrict to client-sourced documents" toggle) turns BOTH guards off
-   so the doc-type still ranks but nothing is excluded for being HL-sourced; and
-   an explicit `LocateResult.from_override` manual pick runs even a REJECTED file
-   (the verdict still rides along and the row gets a `MANUAL OVERRIDE` flag —
-   never silent).
+   product. The behavior is a three-valued `source_mode`
+   (`models.SourceMode`, threaded through `LocateQuery`/`ScoreContext`/`RunSlot`/
+   `RunRequest`/`MultiSearchFirm`/selection_service; the New Run + per-firm
+   "Document source" selector): **`client`** (default) — the guards above;
+   **`any`** — no source preference, doc-type keywords still rank but nothing is
+   excluded for being HL-sourced and HL letterhead is not rejected; **`hl`** —
+   the MIRROR of `client`, HL report/analysis folders are PREFERRED and
+   client-sourced docs penalized (for extracting HL's own analysis). The legacy
+   boolean `restrict_to_client_sourced` is still accepted at model boundaries
+   and maps `True->client` / `False->any` (kept consistent: `True` iff
+   `source_mode=="client"`). The peek-verifier rejects HL work product ONLY in
+   `client` mode — and the `/locator/verify-file` swap preview now passes the
+   run's `source_mode` through (a prior bug always rejected HL product there
+   regardless of the toggle). An explicit `LocateResult.from_override` manual
+   pick still runs even a REJECTED file (the verdict rides along and the row
+   gets a `MANUAL OVERRIDE` flag — never silent).
 3. **Three-header-row workbook.** `reference/master_index_v4.xlsx` sheet "Index":
    row 1 = band name (appears at the band's first column; carry it forward),
    row 2 = field header, row 3 = description (controlled vocab + extraction
@@ -149,6 +158,20 @@ comments preserved), and setup/doctor flows.
                          batch, events carry a firm 'group' lane (None = no group)
       schema/compile_schema.py   workbook rows 1-3 -> schema/master_schema.json
                                  + schema/band_routing.json (methodology -> bands)
+      schema/dynamic_schema.py   compile_schema_from_workbook(): ANY reference
+                                 workbook -> (SchemaField list, WorkbookLayout) by
+                                 autodetecting the worksheet/header row/optional
+                                 description row; missing identity columns
+                                 (Memo ID, Run ID, Source Filename, Extraction
+                                 Date, Valuation Date, Client, Deal) are PREPENDED
+                                 at the front. workbook_matches_master() routes a
+                                 workbook to the deterministic master path when
+                                 its row-2 headers match the committed schema
+                                 exactly; everything else is a CUSTOM reference,
+                                 extracted LLM-first (band extractors only know
+                                 the master fields). models.WorkbookLayout carries
+                                 sheet/header_row/data_start_row/memo_id_col/
+                                 is_custom/prepended_admin
       indexer/           SQLite file index: db.py (FTS5 + deal_folders table +
                          index_meta kv table [per-root last-scan baseline] +
                          Phase-G tables deal_finder_feedback / doc_type_profiles
@@ -270,7 +293,26 @@ comments preserved), and setup/doctor flows.
                          makes the CLI JSON.parse the path and exit 1); inline
                          also needs no cwd/path translation across the WSL bridge;
                          non-zero exits record the CLI's stderr in the result
-                         error (never a bare "exit N")
+                         error (never a bare "exit N").
+                         FILE-BASED OUTPUT (default, llm.file_based_output):
+                         extract_json_file() runs the SAME `claude -p` transport
+                         (_run_print shared with extract_json) but DROPS
+                         --json-schema and instead grants --allowedTools Read
+                         Write Edit + --permission-mode acceptEdits and appends an
+                         output-format instruction telling the model to WRITE its
+                         schema_version=5 answer to `answers.json` in the call cwd
+                         (build_answer_file_instruction). The client then reads +
+                         validates that file (_read_answer_file, normalizing the
+                         optional v5 keys); a missing/malformed/invalid file is
+                         REPAIRED by reprompting IN THE SAME session
+                         (`--resume <session_id>` with a corrective instruction),
+                         up to llm.answer_file_repair_rounds, before failing with
+                         an "answer file ..." error (which never triggers the
+                         legacy-schema fallback). This removes the Windows ~32 KB
+                         inline-schema cap, so the whole field set goes in ONE
+                         call. extract_json (the --json-schema StructuredOutput
+                         path) is retained for deal-discovery + Smart-Search
+                         intent and for providers without extract_json_file
         model_registry.py  loads config/models.yaml (aliases/ids, editable
                          pricing, latest_alias/pinned/requires_explicit_enable);
                          AUTO/MANUAL routing -> tier ladder (sonnet -> opus;
@@ -321,7 +363,13 @@ comments preserved), and setup/doctor flows.
       write/             D6: workbook.py (template COPY, header-drift abort,
                          append by col index, Review Flags dedupe on
                          (memo_id, description), Run Log; Phase-4 entry points:
-                         update_cell by Memo ID + col index, resolve_flag),
+                         update_cell by Memo ID + col index, resolve_flag;
+                         LAYOUT-DRIVEN: WorkbookWriter(...,layout=WorkbookLayout)
+                         — default None = master 3-row layout, every existing
+                         caller unchanged; a custom layout inserts the prepended
+                         identity columns, rewrites the header row by schema col
+                         index, and creates Review Flags/Run Log sheets if
+                         missing, so assert_headers passes by construction),
                          audit.py (per-memo provenance JSON:
                          output_dir/<run_id>/audit/<memo_id>.json; the GUI
                          appends review_actions entries to the same files)
@@ -358,6 +406,9 @@ comments preserved), and setup/doctor flows.
                          present (flat when absent); Settings scan UI gained a
                          Single | Multi multi-firm scan switch feeding the
                          existing {clients:[...]} scan body. Screens: Dashboard,
+                         Direct Run (DirectRun.tsx: pick ONE document + a
+                         reference workbook via TemplatePicker, no locator; launches
+                         /jobs/run with direct_file),
                          New Run
                          wizard (7 steps Scope→Template→AI/model→Preflight→Confirm
                          documents→Launch→Review; THREE folder-discovery modes:
@@ -376,7 +427,13 @@ comments preserved), and setup/doctor flows.
                          Run Progress (lanes/cost meter/log tail/cancel; auto-
                          routes a finished non-dry run into Review), Review Queue
                          (j/k/a/e/u keyboard, evidence image + full-document
-                         viewer, per-category bulk accept + accept-all-pending),
+                         viewer, per-category bulk accept + accept-all-pending;
+                         shows EVERY extracted value — not just flags — each with
+                         its value/confidence/quote/page and the source page auto-
+                         rendered; a Needs-approval | All-values switch where
+                         "needs approval" = reviewer-attention flags + values below
+                         the auto-approval bar [llm.auto_approve_enabled /
+                         auto_approve_confidence], the rest auto-approved),
                          Output Browser (run-list digests + expandable preview;
                          per-run in-depth summary + filterable Index-rows preview),
                          Guide (analyst walkthrough), Settings (locations with
@@ -578,6 +635,35 @@ with firm-grouped events and a `scope="multi"` run summary
 (`multi_search={firm_count, slot_count, firms}`). The New Run wizard's
 Single | Multi switch and the Settings multi-firm scan drive `/multi-search/*`.
 
+## Direct Run & dynamic reference workbooks in one paragraph
+
+The output **reference workbook can be anything**, not just the fixed master
+index. `run.resolve_schema_for_template(config, template)` picks the schema per
+run: a workbook whose "Index" row-2 headers match the committed master schema
+byte-for-byte uses the committed schema + deterministic band routing (today's
+behavior, byte-identical); ANY other workbook is a CUSTOM reference compiled on
+the fly by `schema/dynamic_schema.compile_schema_from_workbook` — it autodetects
+the worksheet (most-populated header row), the header row, and an optional
+description row beneath, turns each column into a `REFERENCE`-band field
+(dtype inferred from the header), and PREPENDS the identity columns the pipeline
+emits (Memo ID first, then Run ID/Source Filename/Extraction Date/Valuation
+Date/Client/Deal) that aren't already present. Because the deterministic band
+extractors only know the master fields, a custom run is **LLM-first**: it forces
+escalate-all (force_assist semantics) and REQUIRES the LLM enabled (clear
+ValueError otherwise), and it persists `<run_dir>/schema_snapshot.json` so the
+review queue (`review_service`) reopens the workbook with the right columns. The
+writer is layout-driven (`WorkbookLayout`); for a custom sheet it physically
+inserts the prepended columns and creates the Review Flags / Run Log sheets if
+missing. **Direct Run** (`run(..., direct_file=…, direct_client=…,
+direct_deal=…)`, `RunRequest.direct_file`, the GUI **Direct Run** tab) extracts
+ONE explicit document with NO locator/deal-selection/index: it builds a single
+work item from a minimal in-memory `FileRecord` over the path, wrapped in a
+`from_override` `LocateResult` (so a peek-REJECTED file still runs, flagged), and
+proceeds through the normal verify→extract→validate→[LLM]→write path; the file
+need not be under `pv_root` or indexed. `POST /api/templates/inspect` autodetects
+a candidate workbook for the GUI (`TemplatePicker`): detected sheet, fields,
+prepended identity columns, master-vs-custom, and a Ready ✓ / Not ready banner.
+
 ## Extraction in one paragraph
 
 The engine summarizes pages (text + image-geometry metrics -> TEXT / SCANNED /
@@ -604,13 +690,49 @@ mismatch, corrupt file) into qa_pass / qa_pass_with_flags / qa_fail.
 The deterministic engine still runs first (fast/local: grounding, comps/cap
 tables, derived fields). `llm.provider` selects the local structured-extraction
 provider (`claude` or temporary `codex`), and merged hits are labelled
-`llm:<provider>:<model>:<effort>`. Optional `llm.combine_deal_documents` groups a
-deal-period's documents into one combined payload using the same merge key as
-the multi-doc row collapse; it sends only escalated fields, does not imply
-force_assist, and does not bypass the LLM response cache. Deprecated
-`llm.one_call_per_deal` is still loaded for compatibility, maps to
-`combine_deal_documents` only when the new key is absent, and warns.
-`max_pages_per_deal` bounds the combined payload.
+`llm:<provider>:<model>:<effort>`. `llm.combine_deal_documents` (now DEFAULT ON)
+groups a deal-period's documents into one combined payload using the same merge
+key as the multi-doc row collapse — ONE provider call per deal/period over all
+its documents; it sends only escalated fields, does not imply force_assist, and
+does not bypass the LLM response cache. Deprecated `llm.one_call_per_deal` is
+still loaded for compatibility, maps to `combine_deal_documents` only when the
+new key is absent, and warns. `max_pages_per_deal` bounds the combined payload.
+
+FILE-BASED OUTPUT (DEFAULT, `llm.file_based_output`): for the `claude` provider
+the call no longer uses the `--json-schema` StructuredOutput tool. Instead the
+model is granted Read+Write+Edit (with `--permission-mode acceptEdits`) and
+instructed to WRITE its schema_version=5 answer to `answers.json` in the call's
+working directory (the same directory `direct_document_read` copied the source
+documents into); the algorithm reads + validates that file. A
+missing/malformed/invalid file is reprompted IN THE SAME provider session
+(`--resume`) up to `llm.answer_file_repair_rounds` before the call fails. This
+removes the Windows ~32 KB inline-schema cap, so with `field_batch_count=1`
+(also the default) the WHOLE escalatable field set is requested in ONE call. The
+quote-grounding floor for native TEXT pages is now `llm.text_quote_match_threshold`
+(default 85, was a hardcoded 98 that silently rejected ~75% of correct values
+the model lightly reworded), and an ungrounded-but-parseable value is no longer
+hard-rejected by arbitration when `surface_ungrounded_values` is on (the
+require_grounded_evidence gate is relaxed for that candidate) — it fills the
+field at `ungrounded_confidence_cap` with an UNGROUNDED_LLM_VALUE review flag
+instead of being discarded. `codex` and any provider without `extract_json_file`
+fall back to the `--json-schema` path. The model's raw answer lands at
+`output_dir/<run_id>/llm/<memo_id>/answers_<job_id>.json` (a UNIQUE per-call name
+so concurrent field batches don't clobber each other; `schema_<slug>.json` next
+to it is the INPUT response schema, not the output). After each successful call
+the engine also writes a human-readable `extracted_<slug>.json` — one row PER
+FIELD keyed by the workbook HEADER (value, unit, page, document_id, quote,
+model_confidence, not_found), found values first, with a summary count — so an
+analyst can eyeball exactly what the model returned without decoding field_ids.
+
+CONFIDENCE SELECTION (`llm.confidence_selection`, default ON, GUI Settings → LLM
+routing toggle): when ON, LLM values are quote-grounded and arbitration-gated
+(ungrounded ones capped at `ungrounded_confidence_cap` + flagged). When OFF the
+run TRUSTS the model — every extracted value is accepted at the model's OWN
+self-reported confidence (no ungrounded cap, no arbitration rejection, no
+UNGROUNDED flags); a confident deterministic value is still never overwritten
+(the `_qualifying_assets` gate holds). Turn it off when the grounding heuristic
+mis-scores the model and stamps everything at the cap (e.g. 0.20 across the
+board).
 
 Default per-memo path (`combine_deal_documents=false`): each memo whose EscalationPlan
 has fields goes through the
@@ -654,7 +776,27 @@ single_call_max_pages, retry_not_found, surface_ungrounded_values,
 ungrounded_confidence_cap, prefer_ocr_text_over_image, ocr_text_min_confidence,
 band_relevance_floor, max_fields_per_call, no_evidence_effort,
 stream_partial_messages, always_enable_thinking, direct_document_read,
-field_batch_count, max_concurrent_agents. field_batch_count splits a document's
+field_batch_count, max_concurrent_agents, file_based_output,
+answer_file_repair_rounds, text_quote_match_threshold,
+scratch_cleanup_enabled, scratch_cleanup_retain, scratch_cleanup_keep_data.
+scratch_cleanup_* (default ON, retain 50, keep_data True) auto-prune the
+per-memo LLM working dirs (output_dir/<run_id>/llm/<memo_id>/ — copied source
+PDFs, page renders, the .claude/ session dir, prompts, schemas) DURING the run
+to bound peak disk on large (e.g. 10,000-memo) runs: as each memo's escalation
+finishes, dirs older than the retention window are pruned by a run-scoped,
+thread-safe `LlmScratchReaper` shared across process_deals/process_memos and the
+rescue wave. keep_data=True keeps the small data JSONs (extracted_*.json /
+answers_*.json / manifest.json) and deletes only the heavy scratch; False is a
+full rmtree. Pruning is best-effort and confined to output_dir/<run_id>/llm/
+(never pv_root); the authoritative extracted data is untouched (it lives in the
+workbook + audit/<memo_id>.json, written after escalation). file_based_output
+(default true) routes the `claude` provider through extract_json_file (model
+WRITES answers.json; see the client + LLM-fallback sections) with up to
+answer_file_repair_rounds same-session repair reprompts; text_quote_match_threshold
+(default 85) is the native-TEXT-page quote-grounding floor (image/OCR pages keep
+quote_match_threshold). With the inline-schema cap gone under file_based_output,
+field_batch_count defaults to 1 (whole field set in one call).
+field_batch_count splits a document's
 escalated fields into N near-equal batches in the planner (plan_assistance_tasks
 — one AssistanceTask/call per batch, last batch absorbs the remainder; 1 = the
 single-call default), and max_concurrent_agents runs those batches CONCURRENTLY
@@ -758,7 +900,14 @@ it). All long operations are jobs persisted in `output_dir/gui/jobs.sqlite`
 GUI-launched runs leave a `run_summary.json` in the run dir for the
 dashboard, and CLI runs are summarized from audits + the cost ledger. The
 review queue edits ONLY the run's own workbook copy via the writer seam and
-appends every action to the memo's audit JSON. Optional stretch (not built):
+appends every action to the memo's audit JSON. `review_service.build_review`
+now emits one card per EXTRACTED VALUE (kind `value`, every non-metadata hit with
+a value) in addition to flag cards, each carrying its value/confidence/quote/page;
+`needs_approval` is set when a card is a reviewer-attention flag or — per
+`llm.auto_approve_enabled` / `auto_approve_confidence` — a value below the
+auto-approval bar (these two keys are GUI-editable in Settings → LLM routing and
+ride on `/config` like the other `llm.*` settings; bulk-accept gained
+`needs_approval_only`). Optional stretch (not built):
 PyInstaller onefile of `pv_extractor.cli:app` with `src/frontend/dist` and
 `schema/` as added data — document, don't block on it.
 

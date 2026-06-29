@@ -183,7 +183,27 @@ pv-extractor/
 - **`cli.py`** — typer CLI: `locate | run | ingest-xlsx | scan | deals | models |
   costs | doctor | gui | …`. The only place (with `scripts/`) allowed to
   `print()`/use rich.
-- **`run.py`** — the orchestrator described in §3.
+- **`run.py`** — the orchestrator described in §3. Seams:
+  `resolve_schema_for_template(config, template, field_edits=…)` picks the schema
+  per run and returns `(fields, routing, layout, is_custom, profile)` — the
+  master template uses the committed schema + deterministic band routing
+  (unchanged); any other workbook is dynamically compiled (`dynamic_schema`) and
+  extracted LLM-first (a custom run forces escalate-all and requires the LLM
+  enabled; it persists a `schema_snapshot.json` so the review queue can reopen
+  the workbook with the right columns). **Field edits**: an optional
+  `FieldEdits` (added / renamed / removed columns) is applied by
+  `_apply_field_edits` after compile; ANY non-empty edit forces the custom /
+  LLM-first path (protected IDENTIFICATION/QA/THRESHOLD columns can't be removed).
+  **Profile**: when a custom field set is recognized (e.g. GEDP — see
+  `extract/profiles/`), `profile` is set, its dtype overrides are applied, and the
+  run runs that profile's deterministic extractors first (LLM fills only the
+  gaps — no force-assist). **Direct Run**: `run(..., direct_files=[…],
+  direct_client=…, direct_deal=…)` builds ONE work item PER explicit file path
+  (`direct_file` is the legacy single-file form) with no index/locator (each a
+  synthetic `from_override` `LocateResult` over a minimal `FileRecord`,
+  `merge_key=None` so each file is its own row), all into ONE workbook via the
+  normal verify→extract→validate→[LLM]→write path; empty list = exactly today's
+  behavior.
 
 ### `schema/` — schema compiler
 - **`compile_schema.py`** — reads rows 1–3 of `reference/master_index_v4.xlsx`
@@ -191,6 +211,20 @@ pv-extractor/
   columns) + `schema/band_routing.json` (methodology → bands). Recompiling must
   produce **byte-identical** JSON (drift test). The workbook structure is never
   hand-mirrored in code.
+- **`dynamic_schema.py`** — compiles a schema from an ARBITRARY user-supplied
+  reference workbook. `compile_schema_from_workbook(path)` autodetects the
+  worksheet (most-populated header row), the header row, and an optional
+  description row directly beneath; each detected column becomes a `REFERENCE`-
+  band `SchemaField` (dtype inferred via the master numeric/date cues). Required
+  identity columns the pipeline emits (Memo ID, Run ID, Source Filename,
+  Extraction Date, Valuation Date, Client, Deal) that are NOT already present are
+  **prepended** as the first columns; everything else shifts right. Returns
+  `(fields, WorkbookLayout)`. `workbook_matches_master(path, schema_dir)` routes a
+  workbook back to the fast deterministic master path when its "Index" row-2
+  headers match the committed schema exactly; everything else is *custom* and
+  extracted LLM-first (the deterministic band extractors only know the master
+  fields). `models.WorkbookLayout` carries `sheet_name`/`header_row`/
+  `data_start_row`/`memo_id_col`/`is_custom`/`prepended_admin`/`sheets`.
 
 ### `indexer/` — SQLite file index + deal discovery
 - **`db.py`** — SQLite schema (FTS5 search + `files` + `deal_folders` tables).
@@ -305,9 +339,22 @@ pv-extractor/
 - **`confidence.py`** — multiplicative `FieldHit` confidence
   (label × parse × page-class × table/prose × ambiguity), config-tunable.
 - **`targeting.py`** — per-band anchor lexicons → top-K pages/band; persists the
-  page→band map.
+  page→band map. `extraction.top_k_pages_per_band_overrides` raises K for a
+  specific band (e.g. `REFERENCE: 24` for the profile band, which spans many
+  sections of a long memo).
 - **`engine.py`** — per-memo pipeline: read, classify, OCR, target,
   methodology-routed band extraction, multi-asset scoping, derived computation.
+  `extract_memo(..., extra_extractors=…)` appends profile band extractors
+  (e.g. GEDP) to `ALL_EXTRACTORS` so they run on band-targeted pages too.
+- **`profiles/`** — deterministic extraction profiles for known document formats
+  that arrive as CUSTOM reference workbooks. `detect_profile(fields, forced=…)`
+  selects a profile by header-set signature (or `extraction.profile`);
+  `hl_gedp.py` is the HL valuation-memo / GEDP profile — a VERTICAL-SCAN
+  extractor (these memos render label-on-one-line, value-on-the-next, which the
+  table/prose band machinery misses) over the Summary Conclusions / Valuation
+  Trends+Summary / Representative Levels / DCF / Reverse-OPM / Key-Terms sections,
+  plus a header signature, dtype overrides, and a single "methodology family not
+  present" flag. The profile runs first; the LLM fills the gaps.
 - **`cache.py`** — `extraction_cache` table (sha256 + schema ver +
   `EXTRACTOR_VERSION`).
 - **`readers/`** — `pdf.py` (pymupdf text/tables + pdfplumber fallback,
@@ -328,10 +375,18 @@ pv-extractor/
   `qa_pass_with_flags` / `qa_fail`).
 
 ### `write/` — workbook writer + audit
-- **`workbook.py`** — operates on a COPY of the template; asserts row-2 headers
-  against the schema (hard abort on drift); appends by **column index**, never by
-  header lookup; deduped Review Flags on `(memo_id, description)`; Run Log.
-  Phase-4 entry points: `update_cell` (by Memo ID + col index), `resolve_flag`.
+- **`workbook.py`** — operates on a COPY of the template; appends by **column
+  index**, never by header lookup; deduped Review Flags on `(memo_id,
+  description)`; Run Log. Phase-4 entry points: `update_cell` (by Memo ID + col
+  index), `resolve_flag`. The writer is **layout-driven**: `WorkbookWriter` takes
+  an optional `WorkbookLayout` (defaults to the master 3-row layout — sheet
+  "Index", header row 2, data row 4, Memo ID col 1, so every existing caller is
+  unchanged). For a **custom** reference (`layout.is_custom`) it first inserts the
+  prepended identity columns at the front, (re)writes the whole header row by
+  schema column index, and creates the Review Flags / Run Log sheets if missing —
+  so `assert_headers` (still a hard-abort drift guard) is satisfied by
+  construction. `find_index_row`/`_next_index_row`/`find_prior_row` all read the
+  layout's sheet/rows/Memo-ID column.
 - **`audit.py`** — per-memo provenance JSON at
   `output_dir/<run_id>/audit/<memo_id>.json`. The GUI appends `review_actions`
   to the same files.
@@ -344,6 +399,15 @@ pv-extractor/
   `cache.py` (`llm_cache` table), `costs.py` (token estimator, JSONL ledger,
   `BudgetTracker`), `escalate.py` (worker queue, quote-grounding, merge policy),
   `deal_discovery.py` (opt-in Claude Code assist for deal discovery).
+  **Budget pause/resume**: `BudgetTracker(budget_usd, on_pause=…, cancel_event=…)`
+  — an interactive (GUI) run PAUSES at the cap (`reserve()` blocks on a
+  `Condition`, fires `on_pause` once) until the user raises the cap
+  (`raise_budget`), removes it (`remove_cap`, `budget_usd=None` = unlimited), or
+  cancels (`cancel()` / the run's `cancel_event` wakes parked agents → defer). A
+  non-interactive run (CLI, no `on_pause`) keeps the original hard-cap defer
+  behavior. `run.RunControl` carries `budget_sink` (hands the live tracker to the
+  JobManager) and `budget_pause_cb`; threaded through `process_deals`/
+  `process_memos` → `_setup_escalation`.
 
 ### `api/` — Phase-4 FastAPI backend (see §6 for endpoints)
 - `app.py` (factory, static frontend + SPA fallback; `index.html` served
@@ -357,22 +421,33 @@ pv-extractor/
   {memo}` endpoint [page geometry + selectable word boxes for the Add-Value
   highlighter], jobs+WS, locator, the
   `/jobs/{id}/selection`, `/jobs/{id}/selection/slot` [single-slot re-resolve
-  after a swap] and `/runs/{id}/index-rows` endpoints). Services:
+  after a swap], `/jobs/{id}/add-deal` [add a deal the locator missed: records
+  the picked folder as a persisted deal-discovery correction, re-discovers the
+  client's deals, and auto-searches the run's periods × doc-types for it] and
+  `/runs/{id}/index-rows` endpoints). Services:
   `runs_service` (+`index_rows_mirror`; run summary now carries `started_at`/
   `finished_at` — from the `RunReport` for GUI runs, derived from the run-id
   timestamp + newest audit/workbook mtime for CLI runs), `review_service`
-  (ReviewItem carries `reader` + `source_page_count` for the full-document
-  viewer, `qa_fail_reasons` [the asset's hard-fail reasons, attached to every
-  item of a failed memo], and an `add_value` action that writes a value with
-  page/bbox/quote provenance — a `method="manual"` hit is upserted into the
-  audit so the cell reads back with its `EvidenceRef`), `evidence_service`
+  (builds one card per FLAG plus one per EXTRACTED VALUE — `kind="value"`, every
+  non-metadata hit with a value, carrying value/confidence/quote/page so a banker
+  can cross-check the whole memo; `needs_approval` is true for reviewer-attention
+  flags and for values below the auto-approval bar [`llm.auto_approve_enabled` /
+  `auto_approve_confidence`], false = auto-approved; the GUI's
+  Needs-approval | All-values switch filters on it, and bulk-accept honors
+  `needs_approval_only`. ReviewItem also carries `reader` + `source_page_count`
+  for the full-document viewer, `qa_fail_reasons` [the asset's hard-fail reasons,
+  attached to every item of a failed memo], and an `add_value` action that writes
+  a value with page/bbox/quote provenance — a `method="manual"` hit is upserted
+  into the audit so the cell reads back with its `EvidenceRef`), `evidence_service`
   (renders pristine pages; legacy bbox render input is validated/clamped;
   `page_words()` returns PDF-point word boxes for manual drawing and overlays),
   `preflight_service` (`_pdf_page_count` memoized by file identity),
   `selection_service`
   (builds the Confirm-documents table by re-running locate()+peek-verifier per
   in-scope slot; `SlotSelection` gained `misfiled`/`detected_period`/
-  `detected_as_of`, and `slot_selection(..., *, target=None,
+  `detected_as_of` and `deal_folder` [the deal's discovered folder, so the GUI
+  picker opens there on swap/add]; `add_deal_slots()` powers the add-a-missed-deal
+  endpoint, and `slot_selection(..., *, target=None,
   enhanced_period_check=False, doc_type_spec=None)` flags a slot whose best
   doc's in-file as-of (`VerifyResult.asof_date`) disagrees with the target as
   MISFILED with the document's true `detected_period` — off by default =
@@ -408,9 +483,13 @@ pv-extractor/
   and the prewritten Title-Cased doc-type catalog seeded into `doc_type_profiles`
   (Quarterly Report, Annual Report, Houlihan Valuation, Investor Presentation,
   Fund Report, Capital Account Statement, Financial Statements, Board Materials).
-  `RunRequest.restrict_to_client_sourced` (default true; New Run toggle) flows to
-  `LocateQuery`/`ScoreContext` to switch the HL-work REJECT + report/analysis
-  penalty off ("rank only, never exclude").
+  `RunRequest.source_mode` (`client`|`any`|`hl`, default `client`; New Run +
+  per-firm "Document source" selector) flows to `LocateQuery`/`ScoreContext`/
+  `RunSlot`/selection_service: `client` keeps the HL-work REJECT + report/analysis
+  penalty, `any` is "rank only, never exclude", `hl` mirrors `client` to PREFER
+  HL work product. The legacy boolean `restrict_to_client_sourced` is still
+  accepted and maps `True->client`/`False->any`. The `/locator/verify-file` swap
+  preview now passes `source_mode` through so its verdict matches the run.
 
 ### `system/` — self-checks
 - `claude_code.py` (startup self-checks → `startup_checks.jsonl`), `doctor.py`
@@ -428,9 +507,17 @@ operations are **jobs** persisted in `output_dir/gui/jobs.sqlite` (events
 replayable — reopening the browser reattaches to a running job).
 
 **Screens** (`src/frontend/src/screens/`): Dashboard, **NewRun** (the 7-step
-wizard, see §7), RunProgress (lanes / cost meter / log tail / cancel; a
-completed non-dry run flows into the review queue automatically, with an
-opt-out), ReviewQueue (j/k/a/e/u keyboard, evidence image, bulk accept, plus a
+wizard, see §7), **DirectRun** (a pure multi-file batch extractor — build a LIST
+of documents via a multi-select Browse and/or a paste-paths box [add/remove], pick
+a reference workbook [master or custom, via `TemplatePicker`, with the editable
+field list], optional batch Client/Deal labels, choose model settings, launch via
+`/jobs/run` with `direct_files`; skips the locator / deal selection entirely,
+ONE workbook for the batch, routes into RunProgress→Review), RunProgress (lanes /
+cost meter / log tail / cancel; a paused-at-budget run shows a modal to raise /
+remove the cap / cancel [folded from `budget_paused`/`budget_updated`/
+`budget_resumed` events, reconstructed on reconnect]; the cost meter renders an
+unlimited cap as ∞; a completed non-dry run flows into the review queue
+automatically, with an opt-out), ReviewQueue (j/k/a/e/u keyboard, evidence image, bulk accept, plus a
 **full-document viewer** that pages the whole source PDF materializing only the
 current page), OutputBrowser (run list with an inline digest + expandable
 preview card per run; the per-run page is an in-depth summary + a filterable
@@ -441,13 +528,23 @@ indexes" to adopt a found DB — the index is one gitignored SQLite file, point
 machines at the same path to share it], selective per-client index scan with
 live progress, a **Claude Code source picker** [Detect installs → radio-select
 Windows-native vs WSL/Linux claude, persisted to `claude_code.command` +
-`command_args`], raw config editor, **Learned locator overrides** admin panel).
+`command_args`], a **Default reference workbook** card [`gui.default_reference_workbook`
+— the workbook New Run/Direct Run prefill and the "Use local default" button
+target], raw config editor, **Learned locator overrides** admin panel). The LLM
+routing card now exposes **`llm.workers`** ("Parallel documents") — the real
+across-document concurrency knob (`max_concurrent_agents` only splits one
+document's field batches and needs `field_batch_count > 1` to matter).
 The standalone **Locator Review** screen was removed — see §4/§7.
 
 **Shared components** (`src/frontend/src/components/`): `DataTable` (sortable +
 opt-in spreadsheet-style filtering: a global free-text box and per-column filter
 inputs), `ProgressLanes`, `LogTail`, `ModelPricingTable`, `Stepper`,
-`FolderPicker` (folder mode + opt-in `pickFiles` file mode), `charts`, `ui`
+`FolderPicker` (folder mode + opt-in `pickFiles` file mode), `TemplatePicker`
+(reference-workbook input + Browse + live `/templates/inspect` panel: detected
+worksheet, autodetected fields, prepended identity columns, and a Ready ✓ / Not
+ready banner; hosts `EditableFieldList` when given `onFieldEdits` — add/rename/
+remove fields, identity columns locked — used by both DirectRun and the wizard's
+Template step), `EditableFieldList` (the editable field-set widget), `charts`, `ui`
 (Button/Card/Field/Panel/StatusChip/Toggle/inputCls), `branding`
 (`HLLogo`/`HLMark`/`HLSpinner`/`HLLoading` — official HL logo SVGs from
 `src/assets/`, unmodified; `HLSpinner` orbits a Sapphire arc around the static
@@ -513,9 +610,27 @@ Segoe UI primary with self-hosted Inter fallback). Tailwind maps onto it in
   `config/models.yaml`; corroborates/gap-fills, never removes). Both single- and
   multi-firm scans send these from the Settings scan UI's Smart | LLM-Assisted
   toggle (the old separate post-scan per-firm assist queue was retired).
+- Templates: `GET /templates` (master + previous outputs; `default_template`
+  resolves to `gui.default_reference_workbook` when set, else the master —
+  `master_template`/`configured_default` ride alongside), `POST
+  /templates/inspect` (autodetect a candidate reference workbook → detected
+  sheet/sheets, header row, fields[] with inferred dtype, prepended identity
+  columns, `is_custom`, `ready`, messages — powers `TemplatePicker`, whose
+  "Use local default" button points at the resolved default and whose last-used
+  path is remembered in localStorage across reloads). The detected fields are
+  EDITABLE in the GUI (`EditableFieldList`): add (text box + Enter), rename, or
+  remove fields (identity columns locked); the edits ride on the launch payload
+  as `field_edits` and switch the run to the custom / LLM-first path.
 - Runs & review: `/jobs/run` (POST; `dry_run:true` = preflight; `exclude` drops
-  slots), `/jobs/{id}/preflight`, `/jobs/{id}/selection` (the Confirm-documents
-  table: per-slot auto-selection + candidates + override flag), `/jobs/{id}` +
+  slots; `direct_files` [+ legacy `direct_file`] + optional `direct_client`/
+  `direct_deal` = Direct Run, a batch of explicit files into ONE workbook, no
+  locator; `field_edits` = analyst column edits), `/jobs/{id}/preflight`,
+  `/jobs/{id}/selection` (the Confirm-documents table: per-slot auto-selection +
+  candidates + override flag), `/jobs/{id}/add-deal` (POST — add a deal the
+  locator missed), `/jobs/{id}/budget` (POST `{action: raise|remove|cancel,
+  amount_usd?}` — resolve a run paused at its LLM budget cap; emits
+  `budget_paused` / `budget_updated` / `budget_resumed` events the GUI folds into
+  a pause modal + live cost-meter ceiling), `/jobs/{id}` +
   WebSocket, review queue + evidence (`/runs/{id}/evidence/{memo}?page=`,
   bbox optional → also drives the full-document viewer), `/runs/{id}/index-rows`
   (this run's key Index columns + QA status).
@@ -523,8 +638,10 @@ Segoe UI primary with self-hosted Inter fallback). Tailwind maps onto it in
   (GET/DELETE), `/locator/verify-file` (POST — peek-verify an analyst-chosen
   file before recording it as an override), `/locator/open-folder`,
   `/locator/open-file` (POST — open a pv_root document in its OS default app for
-  inspection), `/locator/preview` (GET `?file_path=&page=` — render a candidate
-  page to PNG for the Confirm-documents preview, PDF + pv_root only).
+  inspection), `/locator/preview` (GET `?file_path=&page=&dpi=` — render a
+  candidate page to PNG for the Confirm-documents preview, PDF + pv_root only;
+  the optional `dpi` [clamped 72..400] feeds the `DocPagePreview` zoom +
+  magnifier lens with a crisp render).
 - Config/models: `/models`, `/models/{alias}/pricing` (PUT), `/config`
   (GET/PUT; editable: `pv_root`, `output_dir`, `db_path`, `claude_code.*`,
   `first_run.*`, `gui.*`, `llm.*`, `extraction.confidence_threshold`,
@@ -769,9 +886,21 @@ Three actions, all through existing seams (nothing written under `pv_root`):
   `RunRequest.exclude` (a list of `{client, deal}`); `run()` drops those pairs in
   `_resolve_pairs` — the `exclude` seam is `None`/empty for every CLI caller.
 - **Add a missed file** → a file picker (`FolderPicker` `pickFiles` mode +
-  `/fs/list?files=true`) → `POST /api/locator/verify-file` peek-verifies the
-  chosen file against the slot and surfaces a warning if it would be rejected /
-  is not indexed → `POST /api/locator/override` records it.
+  `/fs/list?files=true`, opened in the slot's `deal_folder` so a swap inside a
+  deal starts there, not the share root) → `POST /api/locator/verify-file`
+  (now carrying the run's `source_mode` so the verdict matches the run)
+  peek-verifies the chosen file and warns if it would be rejected / is not
+  indexed → `POST /api/locator/override` records it.
+- **Add a missed deal** → a folder picker opened at the client folder →
+  `POST /api/jobs/{id}/add-deal {deal_folder_path}`: the folder is recorded as a
+  persisted deal-discovery correction (so future scans/runs see it), the client's
+  deals are re-discovered, and the run's periods × doc-types are auto-searched for
+  the new deal; the returned `SlotSelection` rows are merged into the table and
+  carry an "↻ auto-search files" button to re-run. The launch (scope = all deals
+  for the client) then includes the deal automatically.
+- **Preview** (per candidate) → `DocPagePreview` renders the page via
+  `/api/locator/preview` with page navigation, zoom in/out + reset (scroll/pan),
+  and a magnifying-glass lens (a higher-DPI crop following the cursor).
 - **Add multiple (multi-doc merge)** → an investment whose data is split across
   several files. "＋ Add multiple" turns the candidate rows into checkboxes; the
   analyst ticks the documents and confirms → `POST /api/locator/source-docs`
@@ -844,7 +973,8 @@ locally authenticated `codex exec` command, passes the prompt on stdin, uses
 structured-output files when the installed CLI advertises them, and reports cost
 as unavailable unless a matching configured price table exists.
 
-**Combine deal documents (optional, `llm.combine_deal_documents`).** The
+**Combine deal documents (`llm.combine_deal_documents`, now DEFAULT ON).** One
+provider call per deal/period over ALL its documents combined. The
 deterministic engine still runs first (fast, local: grounding evidence,
 positional comps/cap tables, derived fields). When enabled, `run._build_deal_groups`
 groups the assembled `(item, memo)` pairs exactly like the multi-doc merge
@@ -859,7 +989,56 @@ is still loaded for compatibility, maps to `combine_deal_documents` only when
 the new key is absent, and warns. `max_pages_per_deal` bounds the combined
 payload.
 
-The **per-memo** path (`combine_deal_documents: false`, the default): each memo
+**File-based output (`llm.file_based_output`, DEFAULT ON, `claude` provider).**
+`_call_provider` routes to `ClaudeCodeClient.extract_json_file`: the call drops
+`--json-schema`, grants `--allowedTools Read Write Edit` + `--permission-mode
+acceptEdits`, and appends `build_answer_file_instruction()` telling the model to
+WRITE its schema_version=5 answer to `answers.json` in the call cwd. The client
+reads + validates that file (`_read_answer_file`, which normalizes the optional
+v5 envelope keys); a missing/malformed/invalid file is repaired by reprompting
+in the SAME session (`--resume <session_id>`) up to `llm.answer_file_repair_rounds`,
+then fails with an `"answer file ..."` error (which is excluded from the
+legacy-schema fallback). Because nothing is passed inline, the Windows ~32 KB
+schema cap no longer applies, so `field_batch_count` defaults to 1 (whole field
+set in one call). The transport (`_run_print`) is shared with the legacy
+`extract_json` path, which is retained for deal-discovery, Smart-Search intent,
+and providers without `extract_json_file` (e.g. `codex`). The raw model answer is
+written to `<run>/llm/<memo_id>/answers_<job_id>.json` (unique per call so
+concurrent batches never clobber); the engine also emits a human-readable
+`extracted_<slug>.json` (one row per field, keyed by workbook header —
+`escalate._write_readable_extraction`) for analyst inspection.
+
+**Scratch cleanup (`llm.scratch_cleanup_*`, DEFAULT ON).** A run can escalate
+thousands of memos, each leaving a `<run>/llm/<memo_id>/` working dir holding the
+biggest disk hogs — copied source PDFs (`direct_document_read`), rendered page
+images/text, the Claude Code `.claude/` session dir, prompts and response
+schemas. `escalate.LlmScratchReaper` (one per run, thread-safe, shared across
+`process_deals`/`process_memos` and the rescue wave) prunes these as the run
+progresses: each memo's dir is recorded the moment its escalation finishes
+(`_escalate_memo` calls `reaper.on_memo_done(payload.directory)` after the merged
+hits are on the in-memory `MemoResult`), and once more than `scratch_cleanup_retain`
+(default 50) dirs have finished the oldest is pruned — so peak disk stays bounded
+regardless of run size rather than peaking at N dirs at the end of the phased LLM
+pass. With `scratch_cleanup_keep_data` (default True) the small data JSONs
+(`extracted_*.json` / `answers_*.json` / `manifest.json`) are preserved and only
+the heavy scratch is deleted; False does a full `rmtree`. Pruning is best-effort
+(a failure never aborts a run) and a containment guard confines deletion to
+`<run>/llm/` (never `pv_root`, reusing `io_guard.is_under_pv_root`). The
+authoritative extracted data is untouched — it lives in the workbook +
+`audit/<memo_id>.json`, written in the later write phase. A pruned dir is
+harmlessly rebuilt if the rescue wave re-escalates that memo (payload assembly
+recreates it). Exposed via `/config` and the Settings → LLM routing card.
+
+**Confidence selection (`llm.confidence_selection`, DEFAULT ON, GUI toggle).**
+When ON, `_merge_field` quote-grounds + arbitration-gates each LLM value
+(ungrounded ones capped at `ungrounded_confidence_cap` + flagged). When OFF the
+candidate is accepted at the model's own self-reported confidence — no grounding
+cap, no arbitration rejection, no UNGROUNDED flag — while `_qualifying_assets`
+still prevents overwriting a confident deterministic value. Exposed via GET/PUT
+`/config` (auto-serialized from `config.llm`) and the Settings → LLM routing
+toggle.
+
+The **per-memo** path (`combine_deal_documents: false`): each memo
 whose `EscalationPlan` has fields goes through the worker queue (`llm.workers`
 hidden local provider sessions). The plan is built in `run._build_escalation`:
 normal mode includes only low-confidence hits, required empty fields, and fields
@@ -925,14 +1104,20 @@ not retryable. Timeout handling kills the subprocess tree on supported OSes.
 Answers are quote-grounded against local page text using centralized
 normalization (Unicode spaces/dashes/quotes, ligatures, line wrapping, thousands
 separators, currency/percent spacing, case) plus token-window alignment. The
-grounding result carries status, score, matched text, page and reason. Values are
-type/vocab-checked, then
+grounding floor is per page-kind: image/OCR pages use `llm.quote_match_threshold`,
+native TEXT pages use `llm.text_quote_match_threshold` (default 85 — relaxed from
+a hardcoded 0.98 that silently rejected ~75% of correct values the model lightly
+reworded under `direct_document_read`). The grounding result carries status,
+score, matched text, page and reason. Values are type/vocab-checked, then
 merged: fill empty fields, replace only below-threshold deterministic values
 (loser kept as conflict), never touch confident/computed/metadata hits. A value
 that parses but whose quote can't be matched on the page (common on SCANNED/OCR
 pages) is SHOWN as a low-confidence `UNGROUNDED_LLM_VALUE` hit for review by
 default (`llm.surface_ungrounded_values`) — filling only EMPTY fields, never
-overwriting a deterministic value (it rides along as a conflict). When EVERY
+overwriting a deterministic value (it rides along as a conflict). NB: when
+surfacing is on, `_merge_field` relaxes arbitration's `require_grounded_evidence`
+gate for the ungrounded candidate so it is no longer hard-rejected
+(`rejected:arbitration`) before it can surface. When EVERY
 call for a memo fails, ONE `LLM_PASS_FAILED` flag carries the CLI's real error
 instead of a per-field flag. A field the model answers `not_found` is RESOLVED
 (`llm.retry_not_found=False` default):
@@ -957,11 +1142,14 @@ text; the full prompt is written under the run's `llm/` payload directory and
 referenced by path so analysts can inspect it locally without turning
 `jobs.sqlite` into a document-content store.
 
-`LLM_VERSION` 4.2.0 (cache key). NB: `claude --json-schema` takes the schema
-JSON **inline** (a string), not a file path — `claude_code_client` reads the
-compiled schema and passes its content; a non-zero CLI exit records the CLI's
-own stderr (or, when stderr is empty, the error from the stdout JSON envelope)
-in the result error (no more bare "exit N").
+`LLM_VERSION` 5.3.0 (cache key). NB: under the default file-based output the
+`claude` call no longer passes `--json-schema` at all — the model WRITES
+`answers.json` and the client reads it (see the file-based output section above).
+On the retained `--json-schema` path (`codex`, deal-discovery, intent), the
+schema travels **inline** (a string), not a file path — `claude_code_client`
+reads the compiled schema and passes its content; a non-zero CLI exit records the
+CLI's own stderr (or, when stderr is empty, the error from the stdout JSON
+envelope) in the result error (no more bare "exit N").
 
 ---
 
@@ -971,14 +1159,18 @@ in the result error (no more bare "exit N").
   by bootstrap; add new tunables to both). Every tunable: paths (`pv_root`,
   `output_dir`, `db_path`),
   per-client `period_style`, `extraction` (incl. `confidence_threshold` default
-  0.75), `peek_verify`, `validation`, `deal_discovery` (weights +
+  0.75, `profile` [null = auto-detect a deterministic profile for custom
+  workbooks, e.g. `hl_gedp`], `top_k_pages_per_band_overrides` [per-band top-K,
+  e.g. `REFERENCE: 24`], and `band_anchor_overrides` [HL section anchors under
+  `REFERENCE`]), `peek_verify`, `validation`, `deal_discovery` (weights +
   `review_confidence` + `enabled`; plus the revamp's `learning`
   [`enabled`/`prior_bump`], `layout_priors` [manual-override default `{}` — LIVE
   priors live in the index DB], `shared_bucket_*`/`cluster_ratio_threshold`, and
   `weights.{admin_container, shared_bucket}`), the new `smart_search` and
   `multi_search` sections, `locator` (incl. `auto_select_best_on_ambiguous`),
   `selection` (`min_confidence` — the Confirm-documents auto-select floor),
-  `llm` (provider, workers, `budget_usd` default $25, routing,
+  `llm` (provider, workers, `budget_usd` default $25 [the GUI pauses at the cap
+  and prompts to raise/remove/cancel; the CLI keeps the hard-cap defer], routing,
   `combine_deal_documents`, `allow_fable`), `claude_code`, `codex_cli`, `gui`.
   Nothing magic inline.
 - **`config/models.yaml`** — provider model menu: aliases/full ids + **editable**

@@ -21,6 +21,8 @@ from pv_extractor.api import (
 )
 from pv_extractor.api.jobs import JobConflict, JobManager
 from pv_extractor.api.schemas import (
+    AddDealRequest,
+    BudgetControlRequest,
     BulkAcceptRequest,
     LocateRequest,
     MultiSearchRunRequest,
@@ -66,10 +68,29 @@ def list_runs(request: Request) -> dict:
     return {"runs": runs_service.list_run_summaries(_config(request))}
 
 
+@router.get("/runs/find-by-file")
+def runs_for_file(request: Request, path: str) -> dict:
+    """Prior runs that extracted this exact document (Direct Run prompt)."""
+    return {"runs": runs_service.find_runs_for_file(_config(request), path)}
+
+
 @router.get("/runs/{run_id}")
 def run_detail(run_id: str, request: Request) -> dict:
     run_dir = _run_dir(_config(request), run_id)
     return runs_service.run_summary(run_dir)
+
+
+@router.delete("/runs/{run_id}")
+def delete_run(run_id: str, request: Request) -> dict:
+    """Delete a run from history (output dir) and forget its cached extractions
+    so the same document re-extracts on a future run."""
+    _run_dir(_config(request), run_id)  # validate + 404
+    try:
+        return runs_service.delete_run(_config(request), run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, detail=f"no run {run_id!r}") from exc
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
 
 
 @router.get("/runs/{run_id}/flags")
@@ -153,7 +174,9 @@ def review_queue(run_id: str, request: Request) -> dict:
     items, memo_issues = review_service.build_review(run_dir, config)
     return {"items": [i.model_dump() for i in items],
             "memo_issues": [i.model_dump() for i in memo_issues],
-            "confidence_threshold": config.extraction.confidence_threshold}
+            "confidence_threshold": config.extraction.confidence_threshold,
+            "auto_approve_enabled": bool(config.llm.auto_approve_enabled),
+            "auto_approve_confidence": float(config.llm.auto_approve_confidence)}
 
 
 def _find_item(run_dir: Path, config: Config, item_id: str) -> review_service.ReviewItem:
@@ -193,6 +216,8 @@ def review_bulk_accept(run_id: str, body: BulkAcceptRequest, request: Request) -
     )
     for item in review_service.build_queue(run_dir, config):
         if item.resolved or (body.category is not None and item.category != body.category):
+            continue
+        if body.needs_approval_only and not item.needs_approval:
             continue
         try:
             applied.append(
@@ -242,9 +267,14 @@ def page_words(run_id: str, memo_id: str, request: Request, page: int) -> dict:
 
 @router.post("/jobs/run")
 def start_run(body: RunRequest, request: Request) -> dict:
-    if body.scope in ("deal",) and (not body.client or not body.deal):
+    # Direct Run targets explicit file(s) and bypasses scope/client/deal entirely.
+    direct_paths = [p for p in ([*body.direct_files, body.direct_file] if body.direct_file else body.direct_files) if p and str(p).strip()]
+    if body.direct_files or body.direct_file:
+        if not direct_paths:
+            raise HTTPException(400, detail="no document paths provided")
+    elif body.scope in ("deal",) and (not body.client or not body.deal):
         raise HTTPException(400, detail="scope=deal requires client and deal")
-    if body.scope == "client" and not body.client:
+    elif body.scope == "client" and not body.client:
         raise HTTPException(400, detail="scope=client requires client")
     try:
         job = _manager(request).start_run(body)
@@ -277,6 +307,21 @@ def job_events(job_id: str, request: Request, since: int = 0) -> dict:
 @router.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: str, request: Request) -> dict:
     job = _manager(request).cancel(job_id)
+    if job is None:
+        raise HTTPException(404, detail=f"unknown job {job_id!r}")
+    return job.model_dump()
+
+
+@router.post("/jobs/{job_id}/budget")
+def resolve_budget(job_id: str, body: BudgetControlRequest, request: Request) -> dict:
+    """Resolve a run paused at its LLM budget cap: raise the cap, remove it
+    (unlimited), or cancel the run. Paused provider agents resume on raise/remove."""
+    if body.action not in ("raise", "remove", "cancel"):
+        raise HTTPException(400, detail=f"unknown budget action {body.action!r}")
+    try:
+        job = _manager(request).resolve_budget(job_id, body.action, body.amount_usd)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc))
     if job is None:
         raise HTTPException(404, detail=f"unknown job {job_id!r}")
     return job.model_dump()
@@ -345,6 +390,23 @@ def job_selection_slot(
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc)) from exc
     return slot.model_dump()
+
+
+@router.post("/jobs/{job_id}/add-deal")
+def job_add_deal(job_id: str, body: AddDealRequest, request: Request) -> dict:
+    """Add a deal the locator missed (Confirm-documents "Add a missed deal").
+    Records the picked folder as a persisted deal-discovery correction,
+    re-discovers the client's deals, and auto-searches the run's periods ×
+    doc-types for the new deal — returning the SlotSelection rows to append."""
+    config = _config(request)
+    manager = _manager(request)
+    if manager.get(job_id) is None:
+        raise HTTPException(404, detail=f"unknown job {job_id!r}")
+    try:
+        result = selection_service.add_deal_slots(manager, job_id, config, body.deal_folder_path)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    return result.model_dump()
 
 
 @router.websocket("/ws/jobs/{job_id}")
@@ -548,11 +610,18 @@ def verify_locator_file(body: VerifyFileRequest, request: Request) -> dict:
         aliases = load_aliases(config.aliases_path_resolved())
         from pv_extractor.models import LocateQuery
 
+        # Match the run's source-preference so the preview verdict agrees with
+        # the run-time peek-verifier (the bug was that this always defaulted to
+        # "client" and rejected HL work product regardless of the run toggle).
+        mode = body.source_mode or (
+            "client" if (body.restrict_to_client_sourced is None or body.restrict_to_client_sourced) else "any"
+        )
         verdict = verify_candidate(
             body.file_path, config,
             query=LocateQuery(
                 client=client, deal=deal, period=body.period,
                 doc_type=body.doc_type, as_of_date=target,
+                source_mode=mode,
             ),
             expected_names=expansions_for(deal, aliases.deals),
         )
@@ -650,12 +719,15 @@ def open_document(body: OpenFolderRequest, request: Request) -> dict:
 
 
 @router.get("/locator/preview")
-def candidate_preview(request: Request, file_path: str, page: int = 1) -> FileResponse:
+def candidate_preview(
+    request: Request, file_path: str, page: int = 1, dpi: int | None = None
+) -> FileResponse:
     """Render a candidate document page (default page 1) to PNG so the analyst
-    can eyeball it in Confirm documents before picking. PDF + pv_root only."""
+    can eyeball it in Confirm documents before picking. PDF + pv_root only. An
+    optional `dpi` (clamped 72..400) gives a crisp magnifier-lens render."""
     config = _config(request)
     try:
-        path = evidence_service.render_file_page(config, file_path, page)
+        path = evidence_service.render_file_page(config, file_path, page, dpi=dpi)
     except evidence_service.EvidenceError as exc:
         raise HTTPException(404, detail=str(exc)) from exc
     return FileResponse(path, media_type="image/png")

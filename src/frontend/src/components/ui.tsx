@@ -239,16 +239,16 @@ export function Toggle({
     <button
       type="button"
       onClick={() => onChange(!checked)}
-      className="flex items-center gap-2 text-[13px] text-ink-800"
+      className="flex items-start gap-2 text-[13px] text-ink-800 text-left"
     >
       <span
-        className={`w-8 h-4.5 rounded-full p-0.5 transition-colors duration-150 ${checked ? "bg-navy" : "bg-ink-300"}`}
+        className={`mt-0.5 shrink-0 w-8 h-4.5 rounded-full p-0.5 transition-colors duration-150 ${checked ? "bg-navy" : "bg-ink-300"}`}
       >
         <span
           className={`block w-3.5 h-3.5 bg-paper rounded-full transition-transform duration-150 ${checked ? "translate-x-3.5" : ""}`}
         />
       </span>
-      {label}
+      <span className="leading-snug">{label}</span>
     </button>
   );
 }

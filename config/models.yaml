@@ -28,7 +28,7 @@
 #   extraction_profile       editable operational thresholds for choosing
 #                            whole-deal vs per-document extraction
 
-last_reviewed: "2026-06-11"
+last_reviewed: "2026-06-25"
 
 models:
   - alias: fable

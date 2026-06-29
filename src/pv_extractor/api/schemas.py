@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from pv_extractor.models import DocType, DocTypeSpec
+from pv_extractor.models import DocType, DocTypeSpec, SourceMode
 
 
 class LlmRunOptions(BaseModel):
@@ -26,6 +26,51 @@ class LlmRunOptions(BaseModel):
     # bypasses the deterministic result cache).
     force_llm_assist: bool = False
     allow_fable: bool | None = None
+
+
+class TemplateInspectRequest(BaseModel):
+    """Inspect a candidate reference workbook before launching a run."""
+
+    path: str
+    sheet: str | None = None  # override the autodetected worksheet
+
+
+class FieldEdit(BaseModel):
+    """One field the analyst added to a reference workbook's column set."""
+
+    header: str
+    dtype: str | None = None  # None -> inferred from the header text
+
+
+class FieldRename(BaseModel):
+    """Rename a detected/added field to a new header."""
+
+    from_: str = Field(alias="from")
+    to: str
+
+    model_config = {"populate_by_name": True}
+
+
+class FieldEdits(BaseModel):
+    """Sparse edits applied to a reference workbook's compiled field set before
+    a run. `added` appends new REFERENCE (LLM-extracted) columns; `renamed`
+    changes a column header; `removed` drops a column from extraction + output.
+    Any non-empty edit forces the run onto the custom / LLM-first path."""
+
+    added: list[FieldEdit] = Field(default_factory=list)
+    renamed: list[FieldRename] = Field(default_factory=list)
+    removed: list[str] = Field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not (self.added or self.renamed or self.removed)
+
+
+class BudgetControlRequest(BaseModel):
+    """Resolve a paused run's budget (GUI). `raise` requires amount_usd; `remove`
+    lifts the cap (unlimited); `cancel` force-stops the run."""
+
+    action: str  # raise | remove | cancel
+    amount_usd: float | None = None
 
 
 class SlotRef(BaseModel):
@@ -51,6 +96,7 @@ class MultiSearchFirm(BaseModel):
     doc_types: list[str] = Field(default_factory=list)  # builtin enums and/or profile slugs
     llm_assist: bool = False  # run the deal-discovery Claude Code assist first
     enhanced_period_check: bool = False  # surface misfiled docs (stricter in-file period check)
+    source_mode: SourceMode = "client"  # per-firm source preference (see models.SourceMode)
     deal_search_model: str | None = None  # alias/id for the discovery assist; None = config default
     added_folders: list[str] = Field(default_factory=list)  # analyst add_folder corrections (persisted + learned)
     removed_deals: list[str] = Field(default_factory=list)  # analyst remove_folder corrections (persisted + learned)
@@ -73,6 +119,8 @@ class MultiSearchRunRequest(MultiSearchSelectionRequest):
     dry_run: bool = False
     force: bool = False  # bypass the deterministic result cache
     llm: LlmRunOptions = Field(default_factory=LlmRunOptions)
+    # Analyst edits to the reference workbook's field set (see FieldEdits).
+    field_edits: FieldEdits | None = None
 
 
 class RunRequest(BaseModel):
@@ -85,8 +133,11 @@ class RunRequest(BaseModel):
     # (pair × doc type × period). Empty/single -> the legacy single path.
     doc_types: list[str] = Field(default_factory=list)  # profile slugs or enum values
     periods: list[str] = Field(default_factory=list)  # explicit period list (incl. expanded ranges)
-    # When False, drop the client-source restriction: HL work product is not
-    # rejected and report/analysis folders are not penalized (rank-only).
+    # Source-preference mode (see models.SourceMode): "client" (default) only
+    # client docs; "any" no source preference (rank-only); "hl" prefer HL work
+    # product. restrict_to_client_sourced is the legacy boolean kept for
+    # backward compat (mapped when source_mode is omitted).
+    source_mode: SourceMode | None = None
     restrict_to_client_sourced: bool = True
     template: str | None = None  # workbook to copy (None = reference template)
     dry_run: bool = False
@@ -95,6 +146,16 @@ class RunRequest(BaseModel):
     # the run scope. Empty = every in-scope pair (exact CLI behavior).
     exclude: list[SlotRef] = Field(default_factory=list)
     llm: LlmRunOptions = Field(default_factory=LlmRunOptions)
+    # Direct Run: extract explicit document(s), bypassing the locator / deal
+    # selection entirely. When set, scope/client/deal/exclude are ignored for
+    # pairing; direct_client/direct_deal are optional batch row labels.
+    # direct_files is the batch list; direct_file is the legacy single-file form.
+    direct_file: str | None = None
+    direct_files: list[str] = Field(default_factory=list)
+    direct_client: str | None = None
+    direct_deal: str | None = None
+    # Analyst edits to the reference workbook's field set (see FieldEdits).
+    field_edits: FieldEdits | None = None
 
 
 class JobInfo(BaseModel):
@@ -137,6 +198,19 @@ class VerifyFileRequest(LocateRequest):
     file' / swap-to-arbitrary preview in the Confirm-documents step."""
 
     file_path: str
+    # Mirror the run's source-preference so the preview verdict matches what the
+    # run-time peek-verifier would do. "client" (default) rejects HL work
+    # product; "any"/"hl" do not. Mapped from the legacy bool when omitted.
+    source_mode: SourceMode | None = None
+    restrict_to_client_sourced: bool | None = None
+
+
+class AddDealRequest(BaseModel):
+    """Add a deal the locator missed to a preflight job's selection (the
+    Confirm-documents "Add a missed deal" action). The picked folder is recorded
+    as a deal-discovery correction; periods/doc-types/source come from the job."""
+
+    deal_folder_path: str
 
 
 class SourceDocsRequest(LocateRequest):
@@ -165,6 +239,7 @@ class ReviewActionRequest(BaseModel):
 class BulkAcceptRequest(BaseModel):
     category: str | None = None  # None = accept ALL pending items
     note: str | None = None
+    needs_approval_only: bool = False  # True = accept only items flagged "needs approval"
 
 
 class PricingUpdate(BaseModel):

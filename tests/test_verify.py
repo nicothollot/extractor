@@ -80,6 +80,20 @@ def test_hl_work_product_not_rejected_when_unrestricted(tmp_path: Path, default_
     assert verify_candidate(path, default_config, query=strict).status is VerifyStatus.REJECTED
 
 
+def test_hl_work_product_source_modes(tmp_path: Path, default_config) -> None:
+    """The three-valued source_mode controls the HL-work REJECT: 'client'
+    rejects, 'any' and 'hl' allow HL work product (the bool maps True->client /
+    False->any so legacy callers are unchanged)."""
+    path = _pdf(tmp_path, "report.pdf", HL_REPORT_LINES)
+    base = dict(client="Client", deal="Deal", period="2025-01-31")
+    assert verify_candidate(path, default_config, query=LocateQuery(**base, source_mode="client")).status is VerifyStatus.REJECTED
+    assert verify_candidate(path, default_config, query=LocateQuery(**base, source_mode="any")).status is not VerifyStatus.REJECTED
+    assert verify_candidate(path, default_config, query=LocateQuery(**base, source_mode="hl")).status is not VerifyStatus.REJECTED
+    # legacy bool maps consistently
+    assert LocateQuery(**base, restrict_to_client_sourced=False).source_mode == "any"
+    assert LocateQuery(**base, source_mode="hl").restrict_to_client_sourced is False
+
+
 def test_addressed_to_hl_is_not_work_product(tmp_path: Path, default_config) -> None:
     lines = CLIENT_MEMO_LINES + ["Prepared for Houlihan Lokey at the request of the manager."]
     path = _pdf(tmp_path, "memo.pdf", lines)

@@ -201,8 +201,13 @@ def extract_memo(
     config: Config,
     schema_fields: list[SchemaField],
     routing_table: dict[str, list[str]] | None = None,
+    *,
+    extra_extractors: list | None = None,
 ) -> EngineResult:
-    """Run the full deterministic extraction pipeline on one document."""
+    """Run the full deterministic extraction pipeline on one document.
+    extra_extractors are profile-specific band extractors (e.g. the HL/GEDP
+    profile) appended to ALL_EXTRACTORS — they run on band-targeted pages just
+    like the built-in band extractors."""
     result = EngineResult()
     extension = Path(path).suffix.lower()
     reader = reader_for_extension(extension, config.extraction.page_classification)
@@ -273,7 +278,7 @@ def extract_memo(
         hits.extend(routing_hits)
         allowed = _allowed_methodology_bands(routing_hits, routing)
 
-        for extractor in ALL_EXTRACTORS:
+        for extractor in (*ALL_EXTRACTORS, *(extra_extractors or [])):
             if extractor is routing_extractor:
                 continue
             if allowed is not None and extractor.band in routed_universe and extractor.band not in allowed:

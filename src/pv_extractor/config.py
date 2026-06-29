@@ -64,6 +64,10 @@ class GuiConfig(BaseModel):
     open_browser: bool = True  # `pv-extractor gui` opens the default browser
     evidence_dpi: int = 144  # review-queue page renders (pymupdf)
     frontend_dist: str | None = None  # default: <repo>/src/frontend/dist
+    # Analyst's preferred reference workbook (template). When set, the New Run /
+    # Direct Run "Use local default" button and the empty-state prefill use this
+    # instead of the system master index. null = fall back to the master.
+    default_reference_workbook: str | None = None
 
     @field_validator("host")
     @classmethod
@@ -292,7 +296,7 @@ class DealDiscoveryConfig(BaseModel):
     )
     min_confidence: float = 0.0  # deals below this are dropped entirely (0 = keep all, rank by confidence)
     review_confidence: float = 0.45  # below this a deal is flagged low-confidence in CLI/GUI
-    display_min_confidence: float = 0.70  # GUI only: hide discovered deals below this (storage keeps all)
+    display_min_confidence: float = 0.6  # GUI only: hide discovered deals below this (storage keeps all)
     # Shared mixed-investment bucket (one neutral folder directly holding memo
     # files for several DIFFERENT investments, no per-deal subfolder). Off-able.
     shared_bucket_enabled: bool = True  # master gate for the shared-bucket branch
@@ -418,11 +422,19 @@ class ConfidenceConfig(BaseModel):
 class ExtractionConfig(BaseModel):
     workers: int = 4  # network share: do not hammer it
     top_k_pages_per_band: int = 4
+    # Per-band top-K page overrides (band name -> K). A profile band like the
+    # HL/GEDP "REFERENCE" spans many sections of a long memo, so it needs more
+    # than the default top_k_pages_per_band. Bands not listed use the default.
+    top_k_pages_per_band_overrides: dict[str, int] = Field(default_factory=dict)
     summary_pages: int = 3  # pages 1..N always handed to every band extractor
     confidence_threshold: float = 0.75  # Phase-3 escalation seam
     vocab_fuzzy_threshold: int = 90  # below this a vocab field stays empty + flag
     max_evidence_chars: int = 200
     cache_enabled: bool = True
+    # Deterministic extraction profile for custom reference workbooks (e.g.
+    # "hl_gedp"). None = auto-detect by header signature (the default); a value
+    # forces that profile when the workbook is custom.
+    profile: str | None = None
     ocr: OcrConfig = Field(default_factory=OcrConfig)
     page_classification: PageClassificationConfig = Field(default_factory=PageClassificationConfig)
     confidence: ConfidenceConfig = Field(default_factory=ConfidenceConfig)
@@ -641,13 +653,17 @@ class LlmConfig(BaseModel):
     # alwaysThinkingEnabled setting), so the reasoning is always produced and
     # visible. The thinking budget still scales with the chosen effort.
     always_enable_thinking: bool = True
-    timeout_seconds: int = 600  # per bounded provider extraction task (large
-    #                             field sets in one call can take many minutes)
+    timeout_seconds: int = 0  # per provider extraction call. 0 (default) = NO
+    #                           wall-clock kill: wait for the CLI to finish on its
+    #                           own so a call that's about to complete is never
+    #                           cut off; the call only fails when the CLI itself
+    #                           errors/exits (and a live heartbeat shows progress).
+    #                           Set a positive value to restore a hard ceiling.
     max_pages_per_memo: int = 20  # payload page cap (candidate pages + pages 1-3)
     # Group a deal-period's source documents into a combined LLM payload.
     # This never broadens the field set and never bypasses deterministic cache;
     # force_assist is the only option that makes the LLM primary.
-    combine_deal_documents: bool = False
+    combine_deal_documents: bool = True
     # Deprecated legacy spelling. load_config maps it to combine_deal_documents
     # when the new key is absent, then emits a warning.
     one_call_per_deal: bool = False
@@ -656,7 +672,60 @@ class LlmConfig(BaseModel):
     # stays feasible; documents contribute their summary pages first.
     max_pages_per_deal: int = 40
     image_max_long_edge: int = 1080  # SCANNED/IMAGE_TABLE page render cap, PNG
-    quote_match_threshold: int = 85  # fuzzy quote-grounding floor on OCR pages
+    quote_match_threshold: int = 85  # fuzzy quote-grounding floor on OCR/image pages
+    # Fuzzy quote-grounding floor on native TEXT pages. The model reads the source
+    # PDF itself (direct_document_read) and lightly paraphrases/re-flows its
+    # quotes, so a near-exact 0.98 match silently rejected ~75% of correct values.
+    # 85 lets close paraphrases ground while still catching genuine mismatches.
+    text_quote_match_threshold: int = 85
+    # File-based LLM output: the model WRITES its answer JSON to `answers.json`
+    # in its working directory (which the run gives it Read+Write+Edit access to)
+    # instead of returning it through the --json-schema StructuredOutput tool.
+    # The algorithm then reads + validates that file. This removes the Windows
+    # ~32 KB inline-schema cap (so the full field set fits one call) and lets the
+    # model work iteratively. On a missing/malformed/invalid file the call is
+    # reprompted IN THE SAME provider session up to answer_file_repair_rounds.
+    file_based_output: bool = True
+    answer_file_repair_rounds: int = 2
+    # Auto-cleanup of per-memo LLM working dirs (output_dir/<run_id>/llm/<memo_id>/)
+    # to bound peak disk on large runs. These dirs hold the biggest disk hogs —
+    # copied source PDFs (direct_document_read), rendered page images/text, the
+    # Claude Code .claude/ session dir, prompts and response schemas — none of
+    # which is needed once a memo's merged hits are on the in-memory MemoResult.
+    # As each memo's escalation finishes, dirs OLDER than the retention window are
+    # pruned; the most-recent N stay intact for debugging. Pruning is best-effort
+    # (a failure never aborts a run) and confined to output_dir/<run_id>/llm/
+    # (never pv_root). The authoritative extracted data is unaffected — it lives in
+    # the workbook + audit/<memo_id>.json, written after escalation.
+    scratch_cleanup_enabled: bool = True
+    # Keep the N most-recently-finished memo working dirs fully intact; prune older
+    # ones. 0 = prune every memo dir as soon as it finishes (max disk savings).
+    scratch_cleanup_retain: int = 50
+    # When pruning, keep the small data JSONs (extracted_*.json / answers_*.json /
+    # manifest.json) so an analyst can still eyeball raw model output; delete only
+    # the heavy scratch. False = full rmtree of the memo dir (no raw LLM output).
+    scratch_cleanup_keep_data: bool = True
+    # Confidence selection: the arbitration + quote-grounding machinery that gates
+    # LLM values (rejects ungrounded/low-confidence candidates and CAPS ungrounded
+    # values at ungrounded_confidence_cap). When False the run TRUSTS the model:
+    # every extracted value is accepted at the model's OWN self-reported
+    # confidence — no arbitration rejection, no ungrounded cap (a confident
+    # deterministic value is still never overwritten). Turn this off when the
+    # grounding heuristic is mis-scoring the model and stamping everything at the
+    # ungrounded cap (e.g. 0.20 across the board). Default OFF: native PDF reading
+    # (direct_document_read) makes local-text quote grounding unreliable, so
+    # grounding tended to cap most correct values at ~0.20 and discard the
+    # model's own confidence.
+    confidence_selection: bool = False
+    # Review-queue auto-approval. When enabled, an extracted value whose
+    # confidence is >= auto_approve_confidence is AUTO-APPROVED in the review
+    # queue (shown, but not flagged for manual approval); everything below the
+    # bar — plus any reviewer-attention flag — is surfaced as "needs approval".
+    # When disabled, every extracted value needs manual approval. The review
+    # queue always shows ALL extracted values; this only sets which ones are
+    # pre-approved vs. await a banker's sign-off.
+    auto_approve_enabled: bool = True
+    auto_approve_confidence: float = 0.80
     # Legacy band batching knobs are retained for old configs. The normal path
     # now plans one deal pass or one document pass; these values are used only
     # by compatibility helpers/tests and oversized fallback.

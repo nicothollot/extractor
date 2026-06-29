@@ -23,6 +23,7 @@ from pv_extractor.api.schemas import (
     ScanRequest,
     SearchFeedbackRequest,
     SearchPreviewRequest,
+    TemplateInspectRequest,
 )
 from pv_extractor.api.yaml_edit import (
     YamlEditError,
@@ -1080,13 +1081,100 @@ def templates(request: Request) -> dict:
     from pv_extractor.api import runs_service
 
     config = _config(request)
-    default = Path(__file__).resolve().parents[3] / "reference" / "master_index_v4.xlsx"
+    master = Path(__file__).resolve().parents[3] / "reference" / "master_index_v4.xlsx"
+    # The analyst's configured default reference workbook wins when it exists;
+    # otherwise fall back to the system master index.
+    configured = config.gui.default_reference_workbook
+    default = master
+    if configured:
+        cand = Path(configured)
+        if cand.is_file():
+            default = cand
     outputs = []
     for run_dir in runs_service.run_dirs(config):
         wb = runs_service.workbook_path(run_dir)
         if wb is not None:
             outputs.append({"run_id": run_dir.name, "path": str(wb)})
-    return {"default_template": str(default), "previous_outputs": outputs}
+    return {
+        "default_template": str(default),
+        "master_template": str(master),
+        "configured_default": configured,
+        "previous_outputs": outputs,
+    }
+
+
+@router.post("/templates/inspect")
+def inspect_template(request: Request, body: TemplateInspectRequest) -> dict:
+    """Autodetect the schema of a candidate reference workbook so the wizard can
+    show the detected worksheet, the fields it will populate, the identity
+    columns it will prepend, and whether it is ready for the next step.
+
+    A workbook whose "Index" row-2 headers match the committed master schema is
+    reported as the deterministic master template (LLM optional). Any other
+    workbook is a *custom* reference: its headers are autodetected into fields,
+    missing identity columns (Memo ID, ...) are prepended, and it is extracted
+    LLM-first (so the LLM must be enabled to run it)."""
+    from pv_extractor.schema.dynamic_schema import (
+        compile_schema_from_workbook,
+        workbook_matches_master,
+    )
+
+    schema_dir = Path(__file__).resolve().parents[3] / "schema"
+    path = Path(body.path)
+    if not path.is_file():
+        raise HTTPException(404, detail=f"workbook not found: {body.path}")
+
+    try:
+        if workbook_matches_master(path, schema_dir):
+            from pv_extractor.extract.engine import load_schema_fields
+
+            fields = load_schema_fields()
+            return {
+                "ready": True,
+                "is_custom": False,
+                "sheet_name": "Index",
+                "sheets": ["Index"],
+                "header_row": 2,
+                "description_row_detected": True,
+                "field_count": len(fields),
+                "fields": [
+                    {"header": f.header, "dtype": f.dtype, "band": f.band}
+                    for f in fields
+                ],
+                "prepended_admin": [],
+                "messages": [
+                    "Master index template — the deterministic engine extracts "
+                    f"all {len(fields)} fields; LLM assist is optional.",
+                ],
+            }
+        fields, layout = compile_schema_from_workbook(path, sheet=body.sheet)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, detail=f"could not inspect workbook: {exc}") from exc
+
+    user_fields = [f for f in fields if f.band == "REFERENCE"]
+    messages = [
+        f"Custom reference: {len(user_fields)} field(s) detected on sheet "
+        f"{layout.sheet_name!r} — extracted LLM-first (enable LLM assist).",
+    ]
+    if layout.prepended_admin:
+        messages.append(
+            "Identity columns prepended at the front: "
+            + ", ".join(layout.prepended_admin)
+        )
+    return {
+        "ready": bool(user_fields),
+        "is_custom": True,
+        "sheet_name": layout.sheet_name,
+        "sheets": layout.sheets,
+        "header_row": layout.header_row,
+        "description_row_detected": layout.data_start_row > layout.header_row + 1,
+        "field_count": len(fields),
+        "fields": [
+            {"header": f.header, "dtype": f.dtype, "band": f.band} for f in fields
+        ],
+        "prepended_admin": layout.prepended_admin,
+        "messages": messages,
+    }
 
 
 # ---------------------------------------------------------------------------

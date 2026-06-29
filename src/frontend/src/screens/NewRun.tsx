@@ -6,12 +6,16 @@ import { DataTable } from "../components/DataTable";
 import { FirmRegion } from "../components/FirmRegion";
 import { DocTypeListBuilder } from "../components/DocTypeListBuilder";
 import { FolderPicker } from "../components/FolderPicker";
+import { DocPagePreview } from "../components/DocPagePreview";
 import { ModelEffortPicker } from "../components/ModelEffortPicker";
 import { ModelPricingTable } from "../components/ModelPricingTable";
 import { PeriodMultiPicker } from "../components/PeriodMultiPicker";
 import { Stepper } from "../components/Stepper";
+import { TemplatePicker } from "../components/TemplatePicker";
+import { getLastTemplate, setLastTemplate } from "../lib/lastTemplate";
 import { Button, Card, CardHeader, Field, Panel, StatusChip, Toggle, inputCls } from "../components/ui";
 import {
+  AddDealResult,
   ConfigResponse,
   CoverageEntry,
   ApiError,
@@ -28,7 +32,6 @@ import {
   SelectionResponse,
   SelectionSlot,
   VerifyFileResponse,
-  candidatePreviewUrl,
   get,
   post,
   put,
@@ -105,6 +108,14 @@ const slotKeyParts = (key: string): { client: string; deal: string } => {
   return { client: parts[0] ?? "", deal: parts[1] ?? "" };
 };
 
+// Directory of a file path (handles both \\UNC\ and / separators), for opening
+// the file picker near the current document.
+const parentDir = (p: string | null | undefined): string => {
+  if (!p) return "";
+  const idx = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
+  return idx > 0 ? p.slice(0, idx) : "";
+};
+
 const ACTIVE_JOB_STATUSES = new Set(["queued", "running", "cancelling"]);
 const TERMINAL_PROBLEM_STATUSES = new Set(["failed", "cancelled", "interrupted"]);
 
@@ -174,7 +185,7 @@ export default function NewRun() {
   const { state, patch } = useWizard();
   const mode = state.searchMode;
   return (
-    <div className="space-y-3 max-w-6xl">
+    <div className="space-y-3 max-w-[1600px]">
       <div className="flex gap-1 bg-surface border border-line rounded-[var(--hl-radius)] p-1 w-fit">
         {(
           [
@@ -203,8 +214,8 @@ function SingleRun() {
   const navigate = useNavigate();
   const { state, patch, reset } = useWizard();
   const {
-    step, scope, client, deal, period, periods, docType, docTypes, restrictClientSourced, discoveryMode, llmDiscoverModel, llmDiscoverEffort,
-    template, dryRunOnly, llmEnabled, mode, manualModel, manualEffort, budget,
+    step, scope, client, deal, period, periods, docType, docTypes, sourceMode, discoveryMode, llmDiscoverModel, llmDiscoverEffort,
+    template, fieldEdits, dryRunOnly, llmEnabled, mode, manualModel, manualEffort, budget,
     forceLlmAssist,
     preflightJobId, estimate, removedSlots, docsConfirmed, runJobId, runId,
   } = state;
@@ -232,7 +243,6 @@ function SingleRun() {
   const [activeConflict, setActiveConflict] = useState<JobConflictDetail | null>(null);
   const [preflightSubmitting, setPreflightSubmitting] = useState(false);
   const preflightSubmitRef = useRef(false);
-  const [templatePicker, setTemplatePicker] = useState(false);
 
   const clients = useLoad<{ clients: string[] }>("/api/index/clients");
   const deals = useLoad<{
@@ -340,10 +350,12 @@ function SingleRun() {
 
   useEffect(() => {
     if (templates.data && !state.templateInitialized) {
-      // Default to the reference master index (master_index_v4); the analyst
-      // Browses to a previous output only when they want a cumulative run.
+      // Prefill precedence: the analyst's last-used workbook (persisted across
+      // reloads) → the configured default reference workbook / master index
+      // (default_template). They Browse only to a previous output for a
+      // cumulative run.
       patch({
-        template: templates.data.default_template,
+        template: getLastTemplate() || templates.data.default_template,
         templateInitialized: true,
       });
     }
@@ -397,8 +409,9 @@ function SingleRun() {
     doc_type: ENUM_DOC_TYPES.has(docTypes[0]) ? docTypes[0] : docType,
     doc_types: docTypes,
     periods,
-    restrict_to_client_sourced: restrictClientSourced,
+    source_mode: sourceMode,
     template,
+    field_edits: fieldEdits,
     dry_run: dryRun,
     exclude: removedSlots.map(slotKeyParts),
     llm: {
@@ -466,7 +479,7 @@ function SingleRun() {
   const auto = models.data?.llm.auto;
 
   return (
-    <Panel className="space-y-4 max-w-6xl">
+    <Panel className="space-y-4 max-w-[1600px]">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-ink-900">New Run</h1>
         {(state.step > 0 || preflightJobId || runJobId) && (
@@ -503,15 +516,35 @@ function SingleRun() {
                 </div>
 
                 <div className="bg-surface border border-line rounded-[var(--hl-radius)] px-3 py-2">
-                  <Toggle
-                    checked={restrictClientSourced}
-                    onChange={(v) => patchScope({ restrictClientSourced: v })}
-                    label="Restrict to client-sourced documents"
-                  />
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[12px] font-medium text-ink-700">Document source</span>
+                    <div className="inline-flex rounded-[var(--hl-radius)] border border-line overflow-hidden">
+                      {(
+                        [
+                          ["client", "Client only"],
+                          ["any", "Any source"],
+                          ["hl", "HL work product"],
+                        ] as const
+                      ).map(([m, label]) => (
+                        <button
+                          key={m}
+                          type="button"
+                          onClick={() => patchScope({ sourceMode: m })}
+                          className={`px-3 py-1 text-[12px] ${
+                            sourceMode === m ? "bg-[var(--hl-blue)] text-white" : "text-ink-600 hover:bg-paper"
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                   <p className="text-[12px] text-ink-500 mt-1">
-                    {restrictClientSourced
-                      ? "On: HL work product is rejected and HL report/analysis folders are penalized — only client-provided documents extract."
-                      : "Off: no source restriction — client, HL, or any document can be used. The document type still ranks matches; nothing is excluded for being HL-sourced."}
+                    {sourceMode === "client"
+                      ? "Client only: HL work product is rejected and HL report/analysis folders are penalized — only client-provided documents extract."
+                      : sourceMode === "any"
+                      ? "Any source: no source preference — client, HL, or any document can be used. The document type still ranks matches; nothing is excluded for being HL-sourced."
+                      : "HL work product: HL report/analysis folders are preferred and client-sourced docs are penalized; HL letterhead is never rejected. Use this to extract HL's own analysis (usually in an Analysis folder)."}
                   </p>
                 </div>
 
@@ -853,50 +886,22 @@ function SingleRun() {
 
           {step === 1 && (
             <Card>
-              <CardHeader title="Reference document" sub="the master workbook COPY this run appends to — defaults to the reference master index" />
+              <CardHeader title="Reference document" sub="the workbook COPY this run appends to — the master index, a previous output, or any custom sheet (autodetected)" />
               <div className="px-4 pb-4 space-y-3 max-w-3xl">
-                <Field label="Workbook">
-                  <div className="flex gap-2">
-                    <input
-                      className={`${inputCls} flex-1 font-mono text-[12px]`}
-                      value={template ?? ""}
-                      onChange={(e) => patch({ template: e.target.value })}
-                      placeholder="path to a master workbook"
-                    />
-                    <Button kind="secondary" onClick={() => setTemplatePicker(true)}>
-                      Browse…
-                    </Button>
-                  </div>
-                </Field>
-                <div className="flex items-center gap-3 text-[11.5px]">
-                  {templates.data && template !== templates.data.default_template && (
-                    <button
-                      className="text-info hover:underline"
-                      onClick={() => patch({ template: templates.data?.default_template ?? null })}
-                    >
-                      ↺ Reset to reference master index
-                    </button>
-                  )}
-                  {templates.data && template === templates.data.default_template && (
-                    <span className="text-ink-400">Using the reference master index (master_index_v4).</span>
-                  )}
-                </div>
+                <TemplatePicker
+                  value={template ?? ""}
+                  defaultTemplate={templates.data?.default_template ?? null}
+                  llmEnabled={llmEnabled}
+                  onChange={(path) =>
+                    patch({ template: path, fieldEdits: { added: [], renamed: [], removed: [] } })
+                  }
+                  fieldEdits={fieldEdits}
+                  onFieldEdits={(edits) => patch({ fieldEdits: edits })}
+                />
                 <div className="pt-2 border-t border-line">
                   <Toggle checked={dryRunOnly} onChange={(v) => patch({ dryRunOnly: v })} label="Dry run only (locate + verify; nothing written)" />
                 </div>
               </div>
-              {templatePicker && (
-                <FolderPicker
-                  title="Choose a reference workbook"
-                  initial={template || templates.data?.default_template || ""}
-                  pickFiles
-                  onSelect={(path) => {
-                    patch({ template: path });
-                    setTemplatePicker(false);
-                  }}
-                  onClose={() => setTemplatePicker(false)}
-                />
-              )}
             </Card>
           )}
 
@@ -1121,6 +1126,7 @@ function SingleRun() {
               preflightReady={preflightDone}
               period={period}
               docType={docType}
+              sourceMode={sourceMode}
               removedSlots={removedSlots}
               docsConfirmed={docsConfirmed}
               patch={patch}
@@ -1207,6 +1213,7 @@ const newFirm = (client: string): FirmEntry => ({
   docTypes: [],
   llmAssist: false,
   enhancedPeriodCheck: false,
+  sourceMode: "client",
   dealSearchModel: "sonnet",
   addedFolders: [],
   removedDeals: [],
@@ -1219,6 +1226,7 @@ const firmToApi = (f: FirmEntry): MultiSearchFirm => ({
   doc_types: f.docTypes,
   llm_assist: f.llmAssist,
   enhanced_period_check: f.enhancedPeriodCheck,
+  source_mode: f.sourceMode,
   deal_search_model: f.llmAssist ? f.dealSearchModel : null,
   added_folders: f.addedFolders,
   removed_deals: f.removedDeals,
@@ -1251,7 +1259,7 @@ function MultiRun() {
 
   useEffect(() => {
     if (templates.data && multiTemplate === null) {
-      patch({ multiTemplate: templates.data.default_template });
+      patch({ multiTemplate: getLastTemplate() || templates.data.default_template });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [templates.data]);
@@ -1454,7 +1462,7 @@ function MultiRun() {
                   className="mt-1.5 text-[11.5px] text-info hover:underline"
                   onClick={() => patch({ multiTemplate: templates.data?.default_template ?? null })}
                 >
-                  ↺ Reset to reference master index
+                  ↺ Use local default
                 </button>
               )}
             </Field>
@@ -1464,6 +1472,7 @@ function MultiRun() {
                 initial={multiTemplate || templates.data?.default_template || ""}
                 pickFiles
                 onSelect={(path) => {
+                  setLastTemplate(path);
                   patch({ multiTemplate: path });
                   setMultiTemplatePicker(false);
                 }}
@@ -1769,6 +1778,7 @@ function ConfirmDocuments({
   preflightReady,
   period,
   docType,
+  sourceMode,
   removedSlots,
   docsConfirmed,
   patch,
@@ -1777,6 +1787,7 @@ function ConfirmDocuments({
   preflightReady: boolean;
   period: string;
   docType: string;
+  sourceMode: "client" | "any" | "hl";
   removedSlots: string[];
   docsConfirmed: boolean;
   patch: (p: Partial<WizardState>) => void;
@@ -1799,14 +1810,24 @@ function ConfirmDocuments({
   // Confirm-documents layout: a tab per period, collapsible section per client.
   const [activePeriod, setActivePeriod] = useState<string | null>(null);
   const [collapsedClients, setCollapsedClients] = useState<Set<string>>(new Set());
+  // Deals the locator missed that the analyst added by browsing to a folder.
+  // Their slots are auto-searched per period and merged into the table; the
+  // folder is remembered per deal so "Auto-search files" can re-run.
+  const [addedSlots, setAddedSlots] = useState<SelectionSlot[]>([]);
+  const [addedDealFolders, setAddedDealFolders] = useState<Record<string, string>>({});
+  const [dealPicker, setDealPicker] = useState(false);
+  const [addingDeal, setAddingDeal] = useState<string | null>(null); // deal name or "*" while picking
 
   // A fresh selection load (preflight re-run) supersedes any local patches.
   useEffect(() => {
     setSlotPatches({});
+    setAddedSlots([]);
+    setAddedDealFolders({});
   }, [preflightJobId, preflightReady]);
 
   const removed = useMemo(() => new Set(removedSlots), [removedSlots]);
-  const allSlots = (selection.data?.slots ?? []).map((s) => slotPatches[s.slot_key] ?? s);
+  const allSlots = [...(selection.data?.slots ?? []), ...addedSlots].map((s) => slotPatches[s.slot_key] ?? s);
+  const addedDealNames = useMemo(() => new Set(Object.keys(addedDealFolders)), [addedDealFolders]);
   const selectedSlot = allSlots.find((s) => s.slot_key === selectedKey) ?? null;
   // Overrides MUST be keyed on the doc type the run/selection actually resolves
   // (the effective doc type — `docTypes[0]` when a list was built, else the base
@@ -1839,6 +1860,36 @@ function ConfirmDocuments({
   // LINKED to Settings — changing it here persists back to the same config key.
   const cfg = useLoad<ConfigResponse>("/api/config", []);
   const pvRoot = cfg.data?.pv_root ?? "";
+
+  // Add-a-missed-deal: record the picked folder as a deal-discovery correction,
+  // re-discover the client's deals, and auto-search the run's periods × doc
+  // types for it. The run client is shared across slots in a client/all run.
+  const runClient = selectedSlot?.client ?? (selection.data?.slots ?? [])[0]?.client ?? addedSlots[0]?.client ?? "";
+  const sep = pvRoot.includes("\\") ? "\\" : "/";
+  const clientFolder = runClient ? `${pvRoot}${sep}${runClient}` : pvRoot;
+  const addMissedDeal = async (folderPath: string, label: string) => {
+    if (!preflightJobId) return;
+    setAddingDeal(label);
+    setActionError(null);
+    try {
+      const res = await post<AddDealResult>(`/api/jobs/${preflightJobId}/add-deal`, {
+        deal_folder_path: folderPath,
+      });
+      if (!res.deal) {
+        setActionError(res.detail || "No deal could be discovered under that folder.");
+        return;
+      }
+      const deal = res.deal;
+      // Replace any prior slots for this deal, then append the fresh set.
+      setAddedSlots((prev) => [...prev.filter((s) => s.deal !== deal), ...res.slots]);
+      setAddedDealFolders((m) => ({ ...m, [deal]: folderPath }));
+      patch({ docsConfirmed: false });
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setAddingDeal(null);
+    }
+  };
   const [thresholdPct, setThresholdPct] = useState<number>(0);
   const [thresholdInit, setThresholdInit] = useState(false);
   useEffect(() => {
@@ -1848,14 +1899,8 @@ function ConfirmDocuments({
     }
   }, [cfg.data, thresholdInit]);
   const [previewPath, setPreviewPath] = useState<string | null>(null);
-  // First-few-pages preview: step through pages; previewMax is discovered when a
-  // page render 404s (we don't know a candidate's page count up front).
-  const [previewPage, setPreviewPage] = useState(1);
-  const [previewMax, setPreviewMax] = useState<number | null>(null);
   const togglePreview = (path: string) => {
     setPreviewPath((cur) => (cur === path ? null : path));
-    setPreviewPage(1);
-    setPreviewMax(null);
   };
 
   // "Refresh": keep slots whose auto-selected doc is at/above the threshold,
@@ -1962,6 +2007,7 @@ function ConfirmDocuments({
     try {
       const v = await post<VerifyFileResponse>("/api/locator/verify-file", {
         client: slot.client, deal: slot.deal, period: slotPeriod(slot), doc_type: slotDocType(slot), file_path: filePath,
+        source_mode: sourceMode,
       });
       setVerifyResult(v);
     } catch (e) {
@@ -2100,41 +2146,7 @@ function ConfirmDocuments({
             )}
           </div>
           {previewPath === c.file_path && (
-            <div className="mt-2 border-t border-line pt-2">
-              <div className="flex items-center justify-center gap-3 pb-2 text-[12px] text-ink-600">
-                <Button
-                  kind="ghost"
-                  disabled={previewPage <= 1}
-                  onClick={() => setPreviewPage((p) => Math.max(1, p - 1))}
-                  title="Previous page"
-                >
-                  ◀
-                </Button>
-                <span className="font-mono">page {previewPage}</span>
-                <Button
-                  kind="ghost"
-                  disabled={previewMax != null && previewPage >= previewMax}
-                  onClick={() => setPreviewPage((p) => p + 1)}
-                  title="Next page"
-                >
-                  ▶
-                </Button>
-              </div>
-              <img
-                key={previewPage}
-                src={candidatePreviewUrl(c.file_path, previewPage)}
-                alt={`Page ${previewPage} of ${c.file_name}`}
-                className="max-h-[420px] w-auto mx-auto border border-line rounded shadow-sm"
-                onError={() => {
-                  // Stepped past the last page (render 404): remember the max and
-                  // step back so the view stays on a real page.
-                  if (previewPage > 1) {
-                    setPreviewMax(previewPage - 1);
-                    setPreviewPage((p) => Math.max(1, p - 1));
-                  }
-                }}
-              />
-            </div>
+            <DocPagePreview filePath={c.file_path} fileName={c.file_name} />
           )}
         </div>
       ))}
@@ -2148,13 +2160,23 @@ function ConfirmDocuments({
           title="Confirm documents"
           sub="exactly the files the locator auto-selected — flip through periods, expand a client to preview, swap, remove or add documents per deal"
           right={
-            <Button
-              kind="secondary"
-              disabled={periodSlots.length === 0}
-              onClick={() => setPicker({ slot: selectedSlot ?? periodSlots[0] })}
-            >
-              + Add a missed file
-            </Button>
+            <span className="flex gap-2">
+              <Button
+                kind="secondary"
+                disabled={!runClient || !!addingDeal}
+                onClick={() => setDealPicker(true)}
+                title="Add a deal the locator missed — browse to its folder; we auto-search each period for it"
+              >
+                {addingDeal === "*" ? "Adding…" : "+ Add a missed deal"}
+              </Button>
+              <Button
+                kind="secondary"
+                disabled={periodSlots.length === 0}
+                onClick={() => setPicker({ slot: selectedSlot ?? periodSlots[0] })}
+              >
+                + Add a missed file
+              </Button>
+            </span>
           }
         />
         {/* Feature 1: confidence threshold — keep only auto-picks at/above X% */}
@@ -2281,6 +2303,16 @@ function ConfirmDocuments({
                                   {gone ? <StatusChip value="DEFERRED" /> : <StatusChip value={s.status} />}
                                   {s.override_in_effect && <span className="text-[10px] text-info font-semibold">ovr</span>}
                                 </span>
+                                {addedDealNames.has(s.deal) && (
+                                  <Button
+                                    kind="ghost"
+                                    disabled={addingDeal === s.deal}
+                                    onClick={() => addMissedDeal(addedDealFolders[s.deal], s.deal)}
+                                    title="Re-run the locator across every period for this added deal"
+                                  >
+                                    {addingDeal === s.deal ? "searching…" : "↻ auto-search files"}
+                                  </Button>
+                                )}
                                 <Button
                                   kind="ghost"
                                   onClick={() => toggleRemove(s)}
@@ -2317,11 +2349,28 @@ function ConfirmDocuments({
         />
       </Card>
 
+      {/* add-a-missed-deal picker — opens at the client folder, picks a folder */}
+      {dealPicker && (
+        <FolderPicker
+          title={`Add a deal folder under ${runClient || "the client"}`}
+          initial={clientFolder}
+          onClose={() => setDealPicker(false)}
+          onSelect={(path) => {
+            setDealPicker(false);
+            setAddingDeal("*");
+            addMissedDeal(path, "*");
+          }}
+        />
+      )}
+
       {/* add-a-missed-file / swap-to-arbitrary picker + peek-verify preview */}
       {picker && (
         <FolderPicker
           title={`Pick a file for ${picker.slot.deal}`}
-          initial={pvRoot || picker.slot.file_path || ""}
+          // Open in the deal's folder when known, else the folder of the
+          // current file, else the share root — so swapping inside e.g. the LES
+          // deal opens in the LES folder, not the drive root.
+          initial={picker.slot.deal_folder || parentDir(picker.slot.file_path) || pvRoot || ""}
           pickFiles
           onClose={() => setPicker(null)}
           onSelect={(path) => {

@@ -191,6 +191,29 @@ export function FirmRegion({
               onChange={(v) => set({ enhancedPeriodCheck: v })}
               label="Enhanced period check (flag misfiled documents)"
             />
+            <div className="col-span-2 flex items-center gap-2 flex-wrap">
+              <span className="text-[12px] text-ink-600">Document source</span>
+              <div className="inline-flex rounded-[var(--hl-radius)] border border-line overflow-hidden">
+                {(
+                  [
+                    ["client", "Client only"],
+                    ["any", "Any source"],
+                    ["hl", "HL work product"],
+                  ] as const
+                ).map(([m, label]) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => set({ sourceMode: m })}
+                    className={`px-2.5 py-1 text-[12px] ${
+                      firm.sourceMode === m ? "bg-[var(--hl-blue)] text-white" : "text-ink-600 hover:bg-paper"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             {firm.llmAssist && (
               <ModelEffortPicker
                 models={models?.models}

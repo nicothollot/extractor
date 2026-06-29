@@ -41,7 +41,11 @@ from pv_extractor.io_guard import guarded_open_write
 from pv_extractor.logging_setup import log_event
 from pv_extractor.models import LlmUsage
 from pv_extractor.llm.provider import LlmCliResult, LlmProviderCapabilities
-from pv_extractor.llm.response_validation import StructuredResponseError, validate_structured_response
+from pv_extractor.llm.response_validation import (
+    StructuredResponseError,
+    parse_json_object,
+    validate_structured_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +352,104 @@ def _extract_structured(envelope: dict) -> dict | None:
     return None
 
 
+# File-based output: the model writes its answer here (in the call's cwd) with
+# the Write tool, and we read+validate it instead of the stdout envelope. The
+# default name is per-prefix; a per-call unique name (answers_<job>.json) avoids
+# collisions when concurrent field batches share one working directory.
+ANSWER_FILENAME = "answers.json"
+
+# Errors from reading/validating the answer file are prefixed with this marker so
+# the repair loop can tell a "bad file" (resume the SAME session and ask the model
+# to rewrite it) apart from a transport failure (retry a fresh call).
+_ANSWER_FILE_ERROR_PREFIX = "answer file"
+
+
+def answer_filename_for(job_id: str) -> str:
+    """Per-call answer filename — unique so concurrent batches in the same working
+    directory never clobber each other's `answers.json`."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", job_id or "").strip("_")[:120]
+    return f"answers_{safe}.json" if safe else ANSWER_FILENAME
+
+
+def build_answer_file_instruction(
+    *, filename: str = ANSWER_FILENAME, resume: bool = False, reason: str | None = None
+) -> str:
+    """The output-format override appended to a file-based-output prompt. It tells
+    the model to WRITE its answer file (in the schema_version=5 shape the prompt
+    already describes) instead of returning the answer through a tool. `resume`
+    builds the corrective version for a same-session repair round."""
+    if resume:
+        return (
+            f"The {filename} file you wrote {reason or 'was missing or invalid'}.\n"
+            f"Overwrite {filename} in your current working directory now with a "
+            "SINGLE valid JSON object exactly matching the required schema_version=5 "
+            "structure (keys: schema_version, scope, values, not_found, conflicts, "
+            "warnings). Do not print the JSON — only write the file. Then confirm it "
+            "parses as valid JSON."
+        )
+    return (
+        "== OUTPUT FORMAT (REQUIRED) ==\n"
+        "Do NOT print your answer to stdout. When you are done, use the Write tool to "
+        f"create a file named exactly `{filename}` in your current working "
+        "directory. The file must contain ONE JSON object and nothing else, exactly "
+        "matching the schema_version=5 structure described above (keys: schema_version, "
+        "scope, values, not_found, conflicts, warnings). Each entry in `values` is one "
+        "field: its field_id, the extracted value, unit, cited document_id + page, a "
+        "verbatim quote, and your model_confidence. Account for every requested field "
+        "exactly once across `values`, `not_found`, or `conflicts`. Write the JSON "
+        "pretty-printed (2-space indentation, one field object per array element) so it "
+        "is easy to read. After writing the file, read it back to confirm it parses as "
+        "valid JSON, then reply with ONLY the single word `done`. The file is the only "
+        "output that is read — do NOT restate, summarize, list, or print any of the "
+        "extracted values or the JSON in your text reply (doing so wastes tokens)."
+    )
+
+
+def _normalize_v5_answer(obj: dict) -> dict:
+    """Fill the optional v5 envelope keys when the model omits them, so a complete
+    `values`/`not_found` answer is not rejected over a missing `warnings`/`scope`.
+    Non-destructive: only absent keys are defaulted."""
+    out = dict(obj)
+    out.setdefault("schema_version", 5)
+    out.setdefault("scope", {"type": "deal", "id": ""})
+    out.setdefault("values", [])
+    out.setdefault("not_found", [])
+    out.setdefault("conflicts", [])
+    out.setdefault("warnings", [])
+    return out
+
+
+def _read_answer_file(
+    cwd: Path, schema_doc: dict, filename: str = ANSWER_FILENAME
+) -> tuple[dict | None, str | None]:
+    """Read + validate the model-written answer file. Returns (structured, None)
+    on success or (None, "answer file ...") describing why it is unusable (the
+    marker lets the caller decide between a same-session repair and a fresh retry)."""
+    path = cwd / filename
+    if not path.exists():
+        return None, f"{_ANSWER_FILE_ERROR_PREFIX} {filename} was not created"
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return None, f"{_ANSWER_FILE_ERROR_PREFIX} {filename} could not be read: {exc}"
+    if not raw.strip():
+        return None, f"{_ANSWER_FILE_ERROR_PREFIX} {filename} is empty"
+    try:
+        parsed = parse_json_object(raw)
+    except StructuredResponseError as exc:
+        return None, f"{_ANSWER_FILE_ERROR_PREFIX} {filename} is not valid JSON: {exc}"
+    normalized = _normalize_v5_answer(parsed)
+    try:
+        validate_structured_response(schema_doc, normalized)
+    except StructuredResponseError as exc:
+        return None, f"{_ANSWER_FILE_ERROR_PREFIX} {filename} failed schema validation: {exc}"
+    return normalized, None
+
+
+def _is_answer_file_error(error: str | None) -> bool:
+    return bool(error) and error.lstrip().lower().startswith(_ANSWER_FILE_ERROR_PREFIX)
+
+
 def _result_envelope(stdout: str) -> dict | None:
     """The final ``{"type":"result", ...}`` envelope from a print-mode call.
 
@@ -461,6 +563,9 @@ class ClaudeCodeClient:
         self._always_think = getattr(config.llm, "always_enable_thinking", True)
         self._launch_stagger = max(0.0, float(getattr(config.llm, "launch_stagger_seconds", 0.0) or 0.0))
         self._transient_retries = max(0, int(getattr(config.llm, "transient_retries", 0) or 0))
+        self._answer_file_repair_rounds = max(
+            0, int(getattr(config.llm, "answer_file_repair_rounds", 0) or 0)
+        )
         self._pv_root = config.pv_root
         self._help_text: str | None = None
 
@@ -574,6 +679,84 @@ class ClaudeCodeClient:
                 time.sleep(min(5.0, 1.0 * (index + 1)))
         return result  # type: ignore[return-value]
 
+    def extract_json_file(
+        self,
+        *,
+        job_id: str,
+        prompt: str,
+        schema_path: Path,
+        model: str,
+        effort: str,
+        cwd: Path,
+        timeout: int | None = None,
+        event_sink: Callable[[dict[str, object]], None] | None = None,
+    ) -> ClaudeCodeResult:
+        """File-based output: the model WRITES its answer to ``answers.json`` in
+        `cwd` (with the Write tool) instead of returning it through the
+        ``--json-schema`` StructuredOutput tool, and we read+validate that file.
+
+        Two retry kinds are layered:
+          * a missing/malformed/invalid answer file is REPAIRED by resuming the
+            SAME provider session (the model keeps the documents + its prior
+            answer in context) and asking it to rewrite the file, up to
+            ``answer_file_repair_rounds`` times;
+          * a TRANSIENT bridge failure (WSL drop / broken pipe / connection
+            timeout) before any session exists is retried with a FRESH call, up
+            to ``transient_retries`` times.
+        """
+        answer_filename = answer_filename_for(job_id)
+        output_instruction = build_answer_file_instruction(filename=answer_filename)
+        repair_left = self._answer_file_repair_rounds
+        transient_left = self._transient_retries
+        resume_session: str | None = None
+        corrective: str | None = None
+        result: ClaudeCodeResult | None = None
+        while True:
+            if _ABORT.is_set():
+                return ClaudeCodeResult(job_id=job_id, ok=False, error="cancelled")
+            instruction = (
+                build_answer_file_instruction(
+                    filename=answer_filename, resume=True, reason=corrective
+                )
+                if resume_session
+                else output_instruction
+            )
+            # On a resume round the documents are already in the session, so the
+            # base prompt is replaced by the short corrective instruction.
+            call_prompt = instruction if resume_session else prompt
+            result = self._extract_json_once(
+                job_id=job_id, prompt=call_prompt, schema_path=schema_path,
+                model=model, effort=effort, cwd=cwd, timeout=timeout,
+                event_sink=event_sink, file_output=True,
+                output_instruction=None if resume_session else output_instruction,
+                resume_session=resume_session,
+                answer_filename=answer_filename,
+            )
+            if result.ok or _ABORT.is_set():
+                return result
+            # A bad answer file with a live session -> repair IN that session.
+            if _is_answer_file_error(result.error) and result.session_id and repair_left > 0:
+                repair_left -= 1
+                resume_session = result.session_id
+                corrective = result.error
+                _emit_provider_event(
+                    event_sink, stream="stdout",
+                    message=f"answer file needs repair — reprompting same session "
+                    f"({self._answer_file_repair_rounds - repair_left}/"
+                    f"{self._answer_file_repair_rounds})",
+                )
+                continue
+            # A transient bridge error before any session -> fresh retry.
+            if _is_transient_launch_error(result.error) and not resume_session and transient_left > 0:
+                transient_left -= 1
+                _emit_provider_event(
+                    event_sink, stream="stdout",
+                    message="transient bridge error — retrying fresh call",
+                )
+                time.sleep(min(5.0, 1.0 * (self._transient_retries - transient_left)))
+                continue
+            return result
+
     def _extract_json_once(
         self,
         *,
@@ -586,6 +769,10 @@ class ClaudeCodeClient:
         allow_read_tool: bool = True,
         timeout: int | None = None,
         event_sink: Callable[[dict[str, object]], None] | None = None,
+        file_output: bool = False,
+        output_instruction: str | None = None,
+        resume_session: str | None = None,
+        answer_filename: str = ANSWER_FILENAME,
     ) -> ClaudeCodeResult:
         """One hidden `claude -p` extraction call. The prompt travels via
         stdin (never argv: no process-list leakage, no length limits); page
@@ -616,7 +803,21 @@ class ClaudeCodeClient:
         tail = ["--model", model]
         if self.supports("--effort"):
             tail += ["--effort", effort]
-        if allow_read_tool:
+        if file_output:
+            # The model READS the source documents and WRITES its answer to
+            # answers.json itself, so it needs Read + Write + Edit. acceptEdits
+            # pre-approves the file create/edit so the headless `-p` call never
+            # blocks on a permission prompt it cannot answer (listing the tools
+            # in --allowedTools already permits them; --permission-mode is the
+            # belt-and-suspenders so a Write is never silently denied).
+            tail += ["--allowedTools", "Read", "Write", "Edit"]
+            if self.supports("--permission-mode"):
+                tail += ["--permission-mode", "acceptEdits"]
+            if resume_session:
+                # Repair round: continue the SAME session so the model still has
+                # the documents and its prior answer in context.
+                tail += ["--resume", resume_session]
+        elif allow_read_tool:
             tail += ["--allowedTools", "Read"]
         if self._exclude_dynamic and self.supports("--exclude-dynamic-system-prompt-sections"):
             tail.append("--exclude-dynamic-system-prompt-sections")
@@ -634,16 +835,27 @@ class ClaudeCodeClient:
             # force extended thinking on regardless of model (budget scales with
             # --effort); one argv token, so safe across the WSL bridge
             stream_args += ["--settings", '{"alwaysThinkingEnabled":true}']
-        # exec_argv carries the inline schema; argv (stored/logged) redacts it to
-        # keep the audit pointer flags-only (the schema can be many KB).
-        exec_argv = [
-            self._command, *self._command_args, "-p",
-            *stream_args, "--json-schema", schema_arg, *tail,
-        ]
-        argv = [
-            self._command, *self._command_args, "-p",
-            *stream_args, "--json-schema", f"<inline schema:{len(schema_arg)} chars>", *tail,
-        ]
+        if file_output:
+            # No --json-schema (no StructuredOutput tool): the model writes the
+            # answer file instead. The required JSON shape rides in the prompt
+            # (output_instruction). No inline schema, so exec_argv == argv.
+            if output_instruction:
+                prompt = f"{prompt}\n\n{output_instruction}"
+            exec_argv = [
+                self._command, *self._command_args, "-p", *stream_args, *tail,
+            ]
+            argv = list(exec_argv)
+        else:
+            # exec_argv carries the inline schema; argv (stored/logged) redacts it
+            # to keep the audit pointer flags-only (the schema can be many KB).
+            exec_argv = [
+                self._command, *self._command_args, "-p",
+                *stream_args, "--json-schema", schema_arg, *tail,
+            ]
+            argv = [
+                self._command, *self._command_args, "-p",
+                *stream_args, "--json-schema", f"<inline schema:{len(schema_arg)} chars>", *tail,
+            ]
 
         if _ABORT.is_set():
             return ClaudeCodeResult(job_id=job_id, ok=False, error="cancelled", argv=argv)
@@ -792,11 +1004,17 @@ class ClaudeCodeClient:
 
             heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
             heartbeat_thread.start()
+            # No wall-clock kill by default: a timeout of 0/None means wait for
+            # the provider CLI to finish on its OWN (the heartbeat shows it is
+            # still alive). The call only fails when the CLI itself errors or
+            # exits — never because our timer fired while the model was about to
+            # finish. A positive llm.timeout_seconds restores a hard ceiling.
+            wait_timeout = (timeout or self._call_timeout) or None
             try:
                 if proc.stdin is not None:
                     proc.stdin.write(prompt)
                     proc.stdin.close()
-                proc.wait(timeout=timeout or self._call_timeout)
+                proc.wait(timeout=wait_timeout)
             except subprocess.TimeoutExpired:
                 if os.name == "nt":
                     subprocess.run(
@@ -818,7 +1036,7 @@ class ClaudeCodeClient:
                 stderr_thread.join(timeout=1)
                 result = ClaudeCodeResult(
                     job_id=job_id, ok=False, duration_seconds=duration,
-                    error=f"timed out after {timeout or self._call_timeout}s", argv=argv,
+                    error=f"timed out after {wait_timeout}s", argv=argv,
                 )
                 self._log(result, model, effort)
                 return result
@@ -829,7 +1047,7 @@ class ClaudeCodeClient:
                     message=f"prompt write failed: {exc}",
                 )
                 try:
-                    proc.wait(timeout=timeout or self._call_timeout)
+                    proc.wait(timeout=wait_timeout)
                 except subprocess.TimeoutExpired:
                     if os.name == "nt":
                         subprocess.run(
@@ -849,7 +1067,7 @@ class ClaudeCodeClient:
                     duration = round(time.perf_counter() - started, 2)
                     result = ClaudeCodeResult(
                         job_id=job_id, ok=False, duration_seconds=duration,
-                        error=f"timed out after {timeout or self._call_timeout}s", argv=argv,
+                        error=f"timed out after {wait_timeout}s", argv=argv,
                     )
                     self._log(result, model, effort)
                     return result
@@ -914,6 +1132,20 @@ class ClaudeCodeClient:
         result.usage = _parse_usage(envelope)
         cost = envelope.get("total_cost_usd", envelope.get("cost_usd"))
         result.total_cost_usd = float(cost) if isinstance(cost, (int, float)) else None
+
+        if file_output:
+            # The answer is in answers.json (written by the model), NOT the stdout
+            # envelope. session_id/usage/cost above stay valid so a bad file can be
+            # repaired in this SAME session (extract_json_file resumes on it).
+            structured, file_error = _read_answer_file(cwd, schema_doc, answer_filename)
+            if structured is None:
+                result.error = file_error
+                self._log(result, model, effort)
+                return result
+            result.structured = structured
+            result.ok = True
+            self._log(result, model, effort)
+            return result
 
         structured = _extract_structured(envelope)
         if structured is None:

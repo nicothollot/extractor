@@ -428,6 +428,20 @@ def deal_folders_for_client(conn: sqlite3.Connection, client: str) -> list[DealF
     ]
 
 
+def deal_folder_path(conn: sqlite3.Connection, client: str, deal: str) -> str | None:
+    """First discovered folder path for a (client, deal), or None. Used by the
+    GUI so the swap/add-file picker can open in the deal folder."""
+    row = conn.execute(
+        "SELECT folder_paths FROM deal_folders WHERE client = ? AND deal = ? "
+        "ORDER BY confidence DESC LIMIT 1",
+        (client, deal),
+    ).fetchone()
+    if row is None:
+        return None
+    paths = json.loads(row["folder_paths"])
+    return paths[0] if paths else None
+
+
 def _llm_discovery_meta_key(client: str) -> str:
     return f"llm_discovery:{client}"
 

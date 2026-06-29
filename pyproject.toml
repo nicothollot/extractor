@@ -6,7 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "pv-extractor"
 version = "0.1.0"
 description = "Locate client-provided valuation documents on the PV share and extract structured fields into a master Excel index. Phase 1: schema compiler, file index, document locator."
-requires-python = ">=3.12"
+# Pinned to 3.12.x for the beta: the native deps below (pymupdf, onnxruntime,
+# rapidocr) are validated on 3.12 and may lack prebuilt wheels on 3.13/3.14.
+# setup.sh / setup.bat provision an isolated 3.12 automatically.
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "openpyxl==3.1.5",
     "pymupdf==1.27.2.3",

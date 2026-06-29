@@ -11,3 +11,17 @@ __pycache__/
 # Local test artifacts (client data — never commit)
 /*.pdf
 /MEMO_*.json
+
+# Local-only sample/index exports (machine-specific; never commit)
+/ares_index.xlsx
+
+# Per-developer Claude Code project settings + runtime locks
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/*.lock
+
+# setup transcript (local troubleshooting artifact)
+setup_log.txt
+
+# Generated synthetic PV tree (tests build it via tests/fixtures/build_fixture.py)
+tests/fixtures/pv_root/

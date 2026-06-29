@@ -196,6 +196,10 @@ class JobManager:
         self._listeners: dict[str, set[asyncio.Queue]] = {}
         self._listeners_lock = threading.Lock()
         self._cancel_events: dict[str, threading.Event] = {}
+        # Live BudgetTracker per active run (set the moment the LLM pass builds
+        # it) so a paused run's budget can be resolved by the API. Symmetric to
+        # _cancel_events; popped in the run's finally.
+        self._budget_trackers: dict[str, object] = {}
         # One slot: at most one pipeline run at a time (share + CPU contention).
         self._pipeline_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pv-gui-run")
         self._utility_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pv-gui-util")
@@ -490,6 +494,14 @@ class JobManager:
         event = self._cancel_events.get(job_id)
         if event is not None:
             event.set()
+            # Wake any agents parked at a budget pause so their reserve() raises
+            # and the run unwinds (the cancel_event also makes new reserves raise).
+            tracker = self._budget_trackers.get(job_id)
+            if tracker is not None:
+                try:
+                    tracker.cancel()
+                except Exception:  # noqa: BLE001 — cancel must never raise
+                    logger.exception("force-cancel: budget tracker cancel failed for %s", job_id)
             # FORCE cancel: kill every running provider subprocess (and its WSL/
             # CLI children) immediately — don't wait for in-flight agents to
             # finish. The cooperative flag above still stops new work.
@@ -505,6 +517,54 @@ class JobManager:
         else:
             self._update(job_id, status="cancelled", finished_at=_now())
         return self.get(job_id)
+
+    def resolve_budget(
+        self, job_id: str, action: str, amount_usd: float | None = None
+    ) -> JobInfo | None:
+        """Resolve a paused run's budget (GUI). raise -> lift the cap and resume;
+        remove -> uncap and resume; cancel -> force-cancel the run."""
+        job = self.get(job_id)
+        if job is None:
+            return None
+        if action == "cancel":
+            return self.cancel(job_id)
+        tracker = self._budget_trackers.get(job_id)
+        if tracker is None:
+            # No active LLM pass / not paused — nothing to resolve.
+            return job
+        if action == "raise":
+            if amount_usd is None:
+                raise ValueError("raise requires amount_usd")
+            tracker.raise_budget(float(amount_usd))
+            self.emit_event(job_id, "budget_updated", {
+                "budget_usd": float(amount_usd), "committed_usd": tracker.committed_usd,
+            })
+        elif action == "remove":
+            tracker.remove_cap()
+            self.emit_event(job_id, "budget_updated", {
+                "budget_usd": None, "committed_usd": tracker.committed_usd,
+            })
+        else:
+            raise ValueError(f"unknown budget action {action!r}")
+        self.emit_event(job_id, "budget_resumed", {"committed_usd": tracker.committed_usd})
+        return job
+
+    def _budget_control(self, job_id: str):
+        """Build (on_pause, budget_sink) callbacks for a run. on_pause emits a
+        budget_paused event once the LLM budget is first reached; budget_sink
+        registers the live tracker so resolve_budget()/cancel() can reach it."""
+
+        def on_pause(committed_usd: float, budget_usd: float | None) -> None:
+            self.emit_event(job_id, "budget_paused", {
+                "run_id": self.get(job_id).run_id if self.get(job_id) else None,
+                "committed_usd": committed_usd,
+                "budget_usd": budget_usd,
+            })
+
+        def budget_sink(tracker) -> None:
+            self._budget_trackers[job_id] = tracker
+
+        return on_pause, budget_sink
 
     # ------------------------------------------------------------------
     # execution (worker threads)
@@ -540,6 +600,7 @@ class JobManager:
             })
         finally:
             self._cancel_events.pop(job_id, None)
+            self._budget_trackers.pop(job_id, None)
 
     def _execute_run(self, job_id: str, request: RunRequest, cancel: threading.Event) -> None:
         from pv_extractor.llm.claude_code_client import reset_abort
@@ -559,7 +620,11 @@ class JobManager:
             last_context = _safe_event_context(event, dict(fields))
             self.emit_event(job_id, event, dict(fields))
 
-        control = RunControl(on_event=on_event, cancel_event=cancel)
+        pause_cb, budget_sink = self._budget_control(job_id)
+        control = RunControl(
+            on_event=on_event, cancel_event=cancel,
+            budget_pause_cb=pause_cb, budget_sink=budget_sink,
+        )
         bridge = _JobLogBridge(self, job_id, run_dir)
         pv_logger = logging.getLogger("pv_extractor")
         pv_logger.addHandler(bridge)
@@ -587,8 +652,20 @@ class JobManager:
             # behaves exactly like `period=X`.
             eff_periods = _rs.effective_periods(request.period, request.periods)
             effective_period = eff_periods[0] if eff_periods else request.period
+            req_mode = request.source_mode or ("client" if request.restrict_to_client_sourced else "any")
 
-            if _rs.needs_expansion(request.doc_type, request.doc_types, request.period, request.periods):
+            if request.direct_files or request.direct_file:
+                report = run_pipeline(
+                    run_config, scope="deal", period=request.period,
+                    doc_type=request.doc_type,
+                    template=request.template, dry_run=request.dry_run, force=request.force,
+                    now=now, llm_settings=settings, control=control,
+                    direct_files=request.direct_files or None,
+                    direct_file=request.direct_file,
+                    direct_client=request.direct_client, direct_deal=request.direct_deal,
+                    field_edits=request.field_edits,
+                )
+            elif _rs.needs_expansion(request.doc_type, request.doc_types, request.period, request.periods):
                 conn = db.open_db(run_config.db_path, run_config.pv_root)
                 try:
                     slots = _rs.build_run_slots(
@@ -596,7 +673,7 @@ class JobManager:
                         scope=request.scope, client=request.client, deal=request.deal,
                         exclude=exclude, doc_type=request.doc_type, doc_types=request.doc_types,
                         period=request.period, periods=request.periods,
-                        restrict_to_client_sourced=request.restrict_to_client_sourced,
+                        source_mode=req_mode,
                     )
                 finally:
                     conn.close()
@@ -604,15 +681,17 @@ class JobManager:
                     run_config, scope=request.scope, period=effective_period,
                     template=request.template, dry_run=request.dry_run, force=request.force,
                     now=now, llm_settings=settings, control=control, slots=slots,
+                    field_edits=request.field_edits,
                 )
             else:
                 report = run_pipeline(
                     run_config,
                     scope=request.scope, period=effective_period,
                     client=request.client, deal=request.deal, doc_type=request.doc_type,
-                    restrict_to_client_sourced=request.restrict_to_client_sourced,
+                    source_mode=req_mode,
                     template=request.template, dry_run=request.dry_run, force=request.force,
                     now=now, llm_settings=settings, control=control, exclude=exclude,
+                    field_edits=request.field_edits,
                 )
             result = _report_summary(report, request)
             if not request.dry_run and report.run_dir is not None:
@@ -636,6 +715,7 @@ class JobManager:
         finally:
             pv_logger.removeHandler(bridge)
             self._cancel_events.pop(job_id, None)
+            self._budget_trackers.pop(job_id, None)
 
     def _execute_multi_run(
         self, job_id: str, request: MultiSearchRunRequest, cancel: threading.Event
@@ -661,7 +741,11 @@ class JobManager:
             last_context = _safe_event_context(event, dict(fields))
             self.emit_event(job_id, event, dict(fields))
 
-        control = RunControl(on_event=on_event, cancel_event=cancel)
+        pause_cb, budget_sink = self._budget_control(job_id)
+        control = RunControl(
+            on_event=on_event, cancel_event=cancel,
+            budget_pause_cb=pause_cb, budget_sink=budget_sink,
+        )
         bridge = _JobLogBridge(self, job_id, run_dir)
         pv_logger = logging.getLogger("pv_extractor")
         pv_logger.addHandler(bridge)
@@ -687,6 +771,7 @@ class JobManager:
                 scope="all", period="",
                 template=request.template, dry_run=request.dry_run, force=request.force,
                 now=now, llm_settings=settings, control=control, slots=slots,
+                field_edits=getattr(request, "field_edits", None),
             )
             result = _multi_report_summary(report, request, len(slots))
             if not request.dry_run and report.run_dir is not None:
@@ -710,6 +795,7 @@ class JobManager:
         finally:
             pv_logger.removeHandler(bridge)
             self._cancel_events.pop(job_id, None)
+            self._budget_trackers.pop(job_id, None)
 
 
 class JobConflict(RuntimeError):

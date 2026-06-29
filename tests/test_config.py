@@ -8,8 +8,13 @@ from pv_extractor.llm.escalate import resolve_settings
 
 def test_llm_grouping_defaults_are_not_force_assist():
     config = LlmConfig()
-    assert config.combine_deal_documents is False
-    assert config.one_call_per_deal is False
+    # combine_deal_documents now defaults ON: one call per deal/period over all
+    # the deal's documents combined. This is a GROUPING choice only — it never
+    # broadens the field set and never makes the LLM the primary extractor
+    # (force_assist is the only thing that does), so the deterministic engine
+    # still runs first and the result cache is still honored.
+    assert config.combine_deal_documents is True
+    assert config.one_call_per_deal is False  # deprecated legacy spelling stays off
 
 
 def test_legacy_one_call_per_deal_maps_to_combine_with_warning(tmp_path):
